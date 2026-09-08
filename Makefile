@@ -3,7 +3,9 @@ DETECTED_ARCH := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheade
 CUDA_ARCH ?= $(if $(DETECTED_ARCH),$(DETECTED_ARCH),sm_89)
 HOST_CXX ?= $(shell command -v g++-13 2>/dev/null || command -v g++)
 CUDA_MAX_REGISTERS ?= 128
-CUDA_ATTEMPTS_PER_THREAD ?= 512
+CUDA_ATTEMPTS_PER_THREAD ?= 4096
+CUDA_THREADS ?= 128
+CUDA_BLOCKS_PER_SM ?= 16
 
 .PHONY: all clean test test-cpu test-gpu
 
@@ -11,7 +13,9 @@ all: meshcore_cuda_vanity
 
 meshcore_cuda_vanity: cuda_vanity.cu vendor/cuda-ed25519/common.cu vendor/cuda-ed25519/fe.cu vendor/cuda-ed25519/ge.cu vendor/cuda-ed25519/sha512.cu
 	$(NVCC) -O3 -arch=$(CUDA_ARCH) -ccbin $(HOST_CXX) --maxrregcount=$(CUDA_MAX_REGISTERS) \
-		-DMC_ATTEMPTS_PER_THREAD=$(CUDA_ATTEMPTS_PER_THREAD) -Ivendor/cuda-ed25519 cuda_vanity.cu -o $@
+		-DMC_ATTEMPTS_PER_THREAD=$(CUDA_ATTEMPTS_PER_THREAD) -DMC_THREADS=$(CUDA_THREADS) \
+		-DMC_BLOCKS_PER_SM=$(CUDA_BLOCKS_PER_SM) \
+		-Ivendor/cuda-ed25519 cuda_vanity.cu -o $@
 
 test: test-cpu
 

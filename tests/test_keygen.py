@@ -67,9 +67,9 @@ class KeygenTests(unittest.TestCase):
             # exercising repeated point addition rather than only initialization.
             result = vanity.search_cuda("abc1234", "", "",
                                         watch_path=Path(directory) / "rare.jsonl",
-                                        engine="incremental")
+                                        engine="optimized")
         self.assertTrue(result.public_key.startswith("abc1234"))
-        self.assertEqual(result.engine, "incremental")
+        self.assertEqual(result.engine, "optimized")
         self.assertEqual(vanity.SODIUM.derive_public(bytes.fromhex(result.private_key)[:32]).hex(),
                          result.public_key)
         self.assertTrue(vanity.verify_expanded_key(
@@ -89,6 +89,23 @@ class KeygenTests(unittest.TestCase):
         self.assertTrue(vanity.verify_expanded_key(
             bytes.fromhex(result.private_key), bytes.fromhex(result.public_key)
         ))
+
+    @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
+    def test_optimized_cuda_suffix_and_substring_modes(self):
+        if not vanity.cuda_available():
+            self.skipTest("CUDA engine/device unavailable")
+        cases = (("", "abcde", ""), ("", "", "abcde"))
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (prefix, suffix, contains) in enumerate(cases):
+                result = vanity.search_cuda(
+                    prefix, suffix, contains,
+                    watch_path=Path(directory) / f"rare-{index}.jsonl",
+                    engine="optimized",
+                )
+                self.assertTrue(vanity.matches(result.public_key, prefix, suffix, contains))
+                self.assertTrue(vanity.verify_expanded_key(
+                    bytes.fromhex(result.private_key), bytes.fromhex(result.public_key)
+                ))
 
     @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
     def test_cuda_search_can_be_cancelled_without_orphaning_process(self):

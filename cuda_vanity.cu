@@ -22,12 +22,24 @@
 
 namespace {
 constexpr int kMaxPattern = 60;
-constexpr int kThreads = 256;
+#ifndef MC_THREADS
+#define MC_THREADS 256
+#endif
+constexpr int kThreads = MC_THREADS;
+#ifndef MC_BLOCKS_PER_SM
+#define MC_BLOCKS_PER_SM 8
+#endif
+constexpr int kBlocksPerSm = MC_BLOCKS_PER_SM;
 #ifndef MC_ATTEMPTS_PER_THREAD
 #define MC_ATTEMPTS_PER_THREAD 256
 #endif
 constexpr int kAttemptsPerThread = MC_ATTEMPTS_PER_THREAD;
+constexpr int kResultCheckInterval = 32;
 constexpr int kWatchRules = 18;
+static_assert(kThreads > 0 && kThreads <= 1024 && kThreads % 32 == 0,
+              "MC_THREADS must be a positive warp multiple no greater than 1024");
+static_assert(kAttemptsPerThread > 0 && kAttemptsPerThread % 32 == 0,
+              "MC_ATTEMPTS_PER_THREAD must be a positive multiple of 32");
 
 __constant__ char gpu_prefix[kMaxPattern + 1];
 __constant__ char gpu_suffix[kMaxPattern + 1];
@@ -155,7 +167,8 @@ __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResul
     for (int i = 0; i < 32; ++i) seed[i] = base_seed[i];
     increment_seed(seed, lane * kAttemptsPerThread);
 
-    for (int attempt = 0; attempt < kAttemptsPerThread && !result->found; ++attempt) {
+    for (int attempt = 0; attempt < kAttemptsPerThread; ++attempt) {
+        if ((attempt % kResultCheckInterval) == 0 && result->found) return;
         sha512(seed, 32, private_key);
         private_key[0] &= 248;
         private_key[31] &= 63;
@@ -167,25 +180,59 @@ __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResul
     }
 }
 
-__global__ void scan_kernel_incremental(const unsigned char *base_scalar, DeviceResult *result,
-                                        unsigned long long *watch_mask, WatchBatch *watch_batch) {
+__device__ void encode_with_inverse(unsigned char *encoded, const ge_p3 *point,
+                                    const fe inverse) {
+    fe x;
+    fe y;
+    fe_mul(x, point->X, inverse);
+    fe_mul(y, point->Y, inverse);
+    fe_tobytes(encoded, y);
+    encoded[31] ^= fe_isnegative(x) << 7;
+}
+
+template<int BatchSize>
+__device__ void encode_batch(unsigned char encoded[BatchSize][32],
+                             const ge_p3 points[BatchSize]) {
+    fe prefixes[BatchSize];
+    fe running_inverse;
+    fe inverse;
+    fe_copy(prefixes[0], points[0].Z);
+    for (int i = 1; i < BatchSize; ++i) fe_mul(prefixes[i], prefixes[i - 1], points[i].Z);
+    fe_invert(running_inverse, prefixes[BatchSize - 1]);
+    for (int i = BatchSize - 1; i > 0; --i) {
+        fe_mul(inverse, running_inverse, prefixes[i - 1]);
+        encode_with_inverse(encoded[i], &points[i], inverse);
+        fe_mul(running_inverse, running_inverse, points[i].Z);
+    }
+    encode_with_inverse(encoded[0], &points[0], running_inverse);
+}
+
+__global__ void scan_kernel_optimized(const unsigned char *base_scalar,
+                                                DeviceResult *result,
+                                                unsigned long long *watch_mask,
+                                                WatchBatch *watch_batch) {
     unsigned char private_key[64]{};
-    unsigned char public_key[32];
-    ge_p3 point;
+    unsigned char public_keys[32][32];
+    ge_p3 points[32];
     ge_p1p1 next;
     const unsigned long long lane = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     for (int i = 0; i < 32; ++i) private_key[i] = base_scalar[i];
     increment_seed(private_key, lane * kAttemptsPerThread * 8ULL);
-    ge_scalarmult_base(&point, private_key);
+    ge_scalarmult_base(&points[0], private_key);
 
-    for (int attempt = 0; attempt < kAttemptsPerThread && !result->found; ++attempt) {
-        ge_p3_tobytes(public_key, &point);
-        if (inspect_candidate(private_key, public_key, result, watch_mask, watch_batch)) return;
-        // base[0][7] is the precomputed point 8B. Adding it preserves the
-        // low-three-zero-bit requirement of an expanded Ed25519 scalar.
-        ge_madd(&next, &point, &base[0][7]);
-        ge_p1p1_to_p3(&point, &next);
-        increment_seed(private_key, 8);
+    for (int attempt = 0; attempt < kAttemptsPerThread; attempt += 32) {
+        if (result->found) return;
+        for (int i = 1; i < 32; ++i) {
+            ge_madd(&next, &points[i - 1], &base[0][7]);
+            ge_p1p1_to_p3(&points[i], &next);
+        }
+        encode_batch<32>(public_keys, points);
+        for (int i = 0; i < 32; ++i) {
+            if (inspect_candidate(private_key, public_keys[i], result, watch_mask, watch_batch)) return;
+            increment_seed(private_key, 8);
+        }
+        ge_madd(&next, &points[31], &base[0][7]);
+        ge_p1p1_to_p3(&points[0], &next);
     }
 }
 
@@ -259,13 +306,13 @@ void random_bytes(unsigned char *destination, size_t length) {
 }
 
 void usage(const char *program) {
-    std::fprintf(stderr, "Usage: %s [--engine incremental|baseline] [--device N] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
+    std::fprintf(stderr, "Usage: %s [--engine optimized|baseline] [--device N] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
 }
 }  // namespace
 
 int main(int argc, char **argv) {
     std::string prefix, suffix, contains;
-    std::string engine = "incremental";
+    std::string engine = "optimized";
     int selected_device = 0;
     for (int i = 1; i < argc; ++i) {
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
@@ -279,7 +326,8 @@ int main(int argc, char **argv) {
             continue;
         }
         if (option == "--engine") {
-            if (value != "incremental" && value != "baseline") { usage(argv[0]); return 2; }
+            if (value == "incremental") value = "optimized";  // pre-batching compatibility alias
+            if (value != "optimized" && value != "baseline") { usage(argv[0]); return 2; }
             engine = value;
             continue;
         }
@@ -319,7 +367,7 @@ int main(int argc, char **argv) {
     cuda_check(cudaMemcpyToSymbol(gpu_suffix_len, &suffix_len, sizeof(int)), "copy suffix length");
     cuda_check(cudaMemcpyToSymbol(gpu_contains_len, &contains_len, sizeof(int)), "copy contains length");
 
-    int blocks = properties.multiProcessorCount * 8;
+    int blocks = properties.multiProcessorCount * kBlocksPerSm;
     unsigned char *device_seed = nullptr;
     DeviceResult *device_result = nullptr;
     WatchBatch *device_watch = nullptr;
@@ -339,7 +387,7 @@ int main(int argc, char **argv) {
         DeviceResult result{};
         WatchBatch watch{};
         random_bytes(seed.data(), seed.size());
-        if (engine == "incremental") {
+        if (engine != "baseline") {
             seed[0] &= 248;
             seed[31] &= 31;  // retain ample headroom for the per-lane offsets
             seed[31] |= 64;
@@ -347,15 +395,15 @@ int main(int argc, char **argv) {
         cuda_check(cudaMemcpy(device_seed, seed.data(), 32, cudaMemcpyHostToDevice), "copy seed");
         cuda_check(cudaMemset(device_result, 0, sizeof(DeviceResult)), "clear result");
         cuda_check(cudaMemset(device_watch, 0, sizeof(WatchBatch)), "clear watch results");
-        if (engine == "incremental")
-            scan_kernel_incremental<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
+        if (engine == "optimized")
+            scan_kernel_optimized<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
         else
             scan_kernel_baseline<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
         cuda_check(cudaGetLastError(), "launch scan kernel");
         cuda_check(cudaMemcpy(&result, device_result, sizeof(result), cudaMemcpyDeviceToHost), "copy result");
         cuda_check(cudaMemcpy(&watch, device_watch, sizeof(watch), cudaMemcpyDeviceToHost), "copy watch results");
         for (int i = 0; i < watch.count && i < kWatchRules; ++i) {
-            if (engine == "incremental") random_bytes(&watch.results[i].private_key[32], 32);
+            if (engine != "baseline") random_bytes(&watch.results[i].private_key[32], 32);
             std::fprintf(stderr, "WATCH %d %s %s\n", watch.results[i].rule,
                          hex(watch.results[i].public_key, 32).c_str(),
                          hex(watch.results[i].private_key, 64).c_str());
@@ -364,7 +412,7 @@ int main(int argc, char **argv) {
         attempts += static_cast<unsigned long long>(blocks) * kThreads * kAttemptsPerThread;
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (result.found) {
-            if (engine == "incremental") random_bytes(&result.private_key[32], 32);
+            if (engine != "baseline") random_bytes(&result.private_key[32], 32);
             std::printf("{\"public_key\":\"%s\",\"private_key\":\"%s\",\"engine\":\"%s\",\"attempts\":%llu,\"elapsed_seconds\":%.6f}\n",
                         hex(result.public_key, 32).c_str(), hex(result.private_key, 64).c_str(),
                         engine.c_str(), attempts, elapsed);

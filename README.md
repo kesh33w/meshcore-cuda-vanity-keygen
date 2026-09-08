@@ -43,14 +43,17 @@ select a GPU when more than one is installed:
 python3 meshcore_vanity.py --backend cuda --device 1 --suffix 1337
 ```
 
-The default incremental engine starts every batch from a securely random,
-clamped scalar. Each GPU thread calculates one full public point and then walks
-forward with the much cheaper `scalar += 8` and `point += 8B` operations. The
-second half of the expanded private key (the Ed25519 nonce prefix) is generated
-independently from `/dev/urandom` only when a key is retained, so it is never
-reused between saved identities. The older full-SHA-512/full-multiplication
-implementation remains available for comparison with `--cuda-engine baseline`
-or from the GUI's CUDA engine selector.
+The default optimized engine starts every batch from a securely random, clamped
+scalar. Each GPU thread calculates one full public point and then walks forward
+with the much cheaper `scalar += 8` and `point += 8B` operations. It compresses
+32 projective public points together using Montgomery's batch-inversion trick,
+sharing one expensive field inversion across the entire group. The second half
+of the expanded private key (the Ed25519 nonce prefix) is generated independently
+from `/dev/urandom` only when a key is retained, so it is never reused between
+saved identities. The older full-SHA-512/full-multiplication implementation
+remains available for comparison with `--cuda-engine baseline` or from the GUI's
+CUDA engine selector. The former `incremental` CLI name remains an alias for
+`optimized`.
 
 Every retained GPU key is re-derived, pattern-checked, used to create a test
 signature, and signature-verified independently on the CPU before it is
@@ -60,17 +63,17 @@ The Cancel button, window close action, and `Ctrl+C` stop the CUDA process.
 
 ### Measured performance
 
-On the development RTX 4070 Ti, the tuned incremental engine processes about
-110 million keys per second, compared with about 29 million for the retained
-baseline: roughly a 3.8× speedup. Approximate average search times at 110M/s are:
+On the development RTX 4070 Ti, the optimized engine processes about 880 million
+keys per second, compared with about 29 million for the retained baseline:
+roughly a 30× speedup. Approximate average search times at 880M/s are:
 
 | Hex characters | Possibilities | Average time |
 | ---: | ---: | ---: |
-| 7 | 268 million | 2.4 seconds |
-| 8 | 4.3 billion | 39 seconds |
-| 9 | 68.7 billion | 10.4 minutes |
-| 10 | 1.1 trillion | 2.8 hours |
-| 11 | 17.6 trillion | 44 hours |
+| 7 | 268 million | 0.3 seconds |
+| 8 | 4.3 billion | 4.9 seconds |
+| 9 | 68.7 billion | 1.3 minutes |
+| 10 | 1.1 trillion | 20.8 minutes |
+| 11 | 17.6 trillion | 5.6 hours |
 
 These are probabilistic averages, not maximums. GPU model, cooling, power
 limits, and other workloads affect actual throughput.
@@ -96,15 +99,15 @@ trillion possibilities:
   `deadbeef00`, `facebabe00`, `babecafe00`, `f00df00d00`, `1337133713`, or
   `fadefade00`.
 
-At the measured 110M keys/s, one specific ten-character rule averages roughly
-2.8 hours. Because all 18 rules are checked together, some incidental match is
-expected approximately every nine minutes. Random search times vary widely,
+At the measured 880M keys/s, one specific ten-character rule averages roughly
+20.8 minutes. Because all 18 rules are checked together, some incidental match
+is expected approximately every 70 seconds. Random search times vary widely,
 and a short run may still find none.
 
 Each JSONL record keeps the matching pair together:
 
 ```json
-{"found_at":"2026-09-08T12:34:56Z","reason":"prefix-deadbeef00","public_key":"...","private_key":"...","backend":"cuda","engine":"incremental"}
+{"found_at":"2026-09-08T12:34:56Z","reason":"prefix-deadbeef00","public_key":"...","private_key":"...","backend":"cuda","engine":"optimized"}
 ```
 
 The file is created with owner-only permissions (`0600`) when the search starts;

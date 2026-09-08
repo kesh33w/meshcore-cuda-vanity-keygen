@@ -240,13 +240,15 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 cancel: Optional[threading.Event] = None,
                 watch_update: Optional[Callable[[int, str, str, Path], None]] = None,
                 device: int = 0,
-                engine: str = "incremental",
+                engine: str = "optimized",
                 process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
         raise RuntimeError("CUDA engine is not built; run 'make'")
-    if engine not in ("incremental", "baseline"):
-        raise ValueError("CUDA engine must be incremental or baseline")
+    if engine == "incremental":
+        engine = "optimized"
+    if engine not in ("optimized", "baseline"):
+        raise ValueError("CUDA engine must be optimized or baseline")
     command = [str(executable), "--device", str(device), "--engine", engine]
     for option, value in (("--prefix", prefix), ("--suffix", suffix), ("--contains", contains)):
         if value:
@@ -376,7 +378,7 @@ def interesting_rule(public_hex: str) -> int:
 
 
 def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
-                       engine: str = "incremental") -> bool:
+                       engine: str = "optimized") -> bool:
     private = bytes.fromhex(private_hex)
     public = bytes.fromhex(public_hex)
     if (rule < 0 or rule >= len(WATCH_REASONS) or interesting_rule(public_hex) != rule
@@ -451,10 +453,10 @@ def run_gui() -> int:
     device_box.grid(row=4, column=1, sticky="w")
     if not gpu_count:
         device_box.current(0)
-    cuda_engine = tk.StringVar(value="incremental")
+    cuda_engine = tk.StringVar(value="optimized")
     ttk.Label(frame, text="CUDA engine").grid(row=5, column=0, sticky="w", pady=3)
     ttk.Combobox(frame, width=12, state="readonly", textvariable=cuda_engine,
-                 values=("incremental", "baseline")).grid(row=5, column=1, sticky="w")
+                 values=("optimized", "baseline")).grid(row=5, column=1, sticky="w")
     status = tk.StringVar(value=f"CUDA devices visible: {gpu_count} ({'CUDA' if cuda_available() else 'CPU'} backend)")
     ttk.Label(frame, textvariable=status).grid(row=6, column=0, columnspan=2, sticky="w", pady=(9, 3))
     incidental = tk.StringVar(value="Rare incidental keys found: 0")
@@ -623,8 +625,8 @@ def main() -> int:
     parser.add_argument("--watch-output", type=Path, default=DEFAULT_WATCH_PATH,
                         help="append incidental interesting keys here")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index (default: 0)")
-    parser.add_argument("--cuda-engine", choices=("incremental", "baseline"),
-                        default="incremental", help="CUDA implementation (default: incremental)")
+    parser.add_argument("--cuda-engine", choices=("optimized", "baseline", "incremental"),
+                        default="optimized", help="CUDA implementation (default: optimized)")
     parser.add_argument("--show-private", action="store_true",
                         help="print the private key to the terminal")
     parser.add_argument("--gui", action="store_true", help="open the small desktop GUI")
