@@ -53,3 +53,9 @@ python3 meshcore_vanity.py --self-test
 
 The test derives the public key from the MeshCore firmware's known-good private
 key test vector.
+
+## Publish your fork
+
+`./publish_to_github.sh` installs GitHub CLI when needed, opens browser login,
+checks that generated secrets are not tracked, and creates/pushes a public
+repository.
