@@ -32,6 +32,10 @@ __constant__ char gpu_contains[kMaxPattern + 1];
 __constant__ int gpu_prefix_len;
 __constant__ int gpu_suffix_len;
 __constant__ int gpu_contains_len;
+__constant__ char gpu_watch_words[8][11] = {
+    "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
+    "babecafe00", "f00df00d00", "1337133713", "fadefade00"
+};
 
 struct DeviceResult {
     int found;
@@ -93,13 +97,9 @@ __device__ int interesting_rule(const unsigned char *key) {
     }
     if (bookend) return 0;
     if (mirror) return 1;
-    const char words[8][11] = {
-        "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
-        "babecafe00", "f00df00d00", "1337133713", "fadefade00"
-    };
     for (int word = 0; word < 8; ++word) {
-        if (equal_at(key, words[word], 10, 0)) return 2 + word;
-        if (equal_at(key, words[word], 10, 54)) return 10 + word;
+        if (equal_at(key, gpu_watch_words[word], 10, 0)) return 2 + word;
+        if (equal_at(key, gpu_watch_words[word], 10, 54)) return 10 + word;
     }
     return -1;
 }
@@ -133,7 +133,8 @@ __global__ void scan_kernel(const unsigned char *base_seed, DeviceResult *result
         private_key[31] |= 64;
         ge_scalarmult_base(&point, private_key);
         ge_p3_tobytes(public_key, &point);
-        int rule = interesting_rule(public_key);
+        const bool meshcore_valid = public_key[0] != 0 && public_key[0] != 255;
+        int rule = meshcore_valid ? interesting_rule(public_key) : -1;
         if (rule >= 0) {
             unsigned long long bit = 1ULL << rule;
             if (!(atomicOr(watch_mask, bit) & bit)) {
@@ -162,6 +163,39 @@ bool valid_hex(const std::string &value) {
     if (value.size() > kMaxPattern) return false;
     for (char ch : value)
         if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+    return true;
+}
+
+bool feasible(const std::string &prefix, const std::string &suffix,
+              const std::string &contains, std::string &error) {
+    if (prefix.size() >= 2 && (prefix.substr(0, 2) == "00" || prefix.substr(0, 2) == "ff")) {
+        error = "prefix begins with a byte MeshCore rejects (00 or ff)";
+        return false;
+    }
+    std::array<char, 64> assigned{};
+    auto place = [&assigned](const std::string &value, size_t offset) {
+        for (size_t i = 0; i < value.size(); ++i)
+            if (assigned[offset + i] && assigned[offset + i] != value[i]) return false;
+        for (size_t i = 0; i < value.size(); ++i) assigned[offset + i] = value[i];
+        return true;
+    };
+    if (!place(prefix, 0) || !place(suffix, 64 - suffix.size())) {
+        error = "prefix and suffix conflict where they overlap";
+        return false;
+    }
+    if (!contains.empty()) {
+        bool possible = false;
+        for (size_t offset = 0; offset + contains.size() <= 64; ++offset) {
+            bool fits = true;
+            for (size_t i = 0; i < contains.size(); ++i)
+                if (assigned[offset + i] && assigned[offset + i] != contains[i]) fits = false;
+            if (fits) { possible = true; break; }
+        }
+        if (!possible) {
+            error = "substring conflicts with the prefix and suffix";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -195,16 +229,24 @@ void random_bytes(unsigned char *destination, size_t length) {
 }
 
 void usage(const char *program) {
-    std::fprintf(stderr, "Usage: %s [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
+    std::fprintf(stderr, "Usage: %s [--device N] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
 }
 }  // namespace
 
 int main(int argc, char **argv) {
     std::string prefix, suffix, contains;
+    int selected_device = 0;
     for (int i = 1; i < argc; ++i) {
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
         std::string option = argv[i];
         std::string value = argv[++i];
+        if (option == "--device") {
+            char *end = nullptr;
+            long parsed = std::strtol(value.c_str(), &end, 10);
+            if (!end || *end || parsed < 0 || parsed > 1024) { usage(argv[0]); return 2; }
+            selected_device = static_cast<int>(parsed);
+            continue;
+        }
         for (char &ch : value) if (ch >= 'A' && ch <= 'F') ch += 'a' - 'A';
         if (option == "--prefix") prefix = value;
         else if (option == "--suffix") suffix = value;
@@ -216,13 +258,23 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
+    std::string feasibility_error;
+    if (!feasible(prefix, suffix, contains, feasibility_error)) {
+        std::fprintf(stderr, "%s\n", feasibility_error.c_str());
+        return 2;
+    }
 
     int device_count = 0;
     cuda_check(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
     if (!device_count) { std::fprintf(stderr, "No CUDA device found\n"); return 2; }
+    if (selected_device >= device_count) {
+        std::fprintf(stderr, "CUDA device %d is unavailable; detected %d device(s)\n",
+                     selected_device, device_count);
+        return 2;
+    }
     cudaDeviceProp properties{};
-    cuda_check(cudaGetDeviceProperties(&properties, 0), "cudaGetDeviceProperties");
-    cuda_check(cudaSetDevice(0), "cudaSetDevice");
+    cuda_check(cudaGetDeviceProperties(&properties, selected_device), "cudaGetDeviceProperties");
+    cuda_check(cudaSetDevice(selected_device), "cudaSetDevice");
     cuda_check(cudaMemcpyToSymbol(gpu_prefix, prefix.c_str(), prefix.size() + 1), "copy prefix");
     cuda_check(cudaMemcpyToSymbol(gpu_suffix, suffix.c_str(), suffix.size() + 1), "copy suffix");
     cuda_check(cudaMemcpyToSymbol(gpu_contains, contains.c_str(), contains.size() + 1), "copy contains");
@@ -243,7 +295,8 @@ int main(int argc, char **argv) {
     cuda_check(cudaMemset(device_watch_mask, 0, sizeof(unsigned long long)), "clear watch mask");
     unsigned long long attempts = 0;
     auto started = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "GPU: %s, %d blocks x %d threads\n", properties.name, blocks, kThreads);
+    std::fprintf(stderr, "GPU %d: %s, %d blocks x %d threads\n",
+                 selected_device, properties.name, blocks, kThreads);
 
     for (;;) {
         std::array<unsigned char, 32> seed{};

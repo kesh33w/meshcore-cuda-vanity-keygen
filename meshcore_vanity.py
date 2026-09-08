@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import queue
 import re
 import secrets
 import subprocess
+import stat
 import sys
 import threading
 import time
@@ -23,6 +25,7 @@ from typing import Callable, Optional
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_WATCH_PATH = APP_DIR / "results" / "rare-keys.jsonl"
+DEFAULT_RESULTS_DIR = APP_DIR / "results"
 
 
 class Sodium:
@@ -95,6 +98,34 @@ def valid_pattern(value: str, label: str) -> str:
     return value
 
 
+def validate_constraints(prefix: str, suffix: str, contains: str) -> None:
+    """Reject constraints for which no MeshCore-valid 64-nibble key can exist."""
+    assigned: list[Optional[str]] = [None] * 64
+
+    def place(value: str, offset: int) -> bool:
+        for index, character in enumerate(value):
+            position = offset + index
+            if assigned[position] is not None and assigned[position] != character:
+                return False
+        for index, character in enumerate(value):
+            assigned[offset + index] = character
+        return True
+
+    if len(prefix) >= 2 and prefix[:2] in ("00", "ff"):
+        raise ValueError("prefix begins with a byte MeshCore rejects (00 or ff)")
+    if not place(prefix, 0) or not place(suffix, 64 - len(suffix)):
+        raise ValueError("prefix and suffix conflict where they overlap")
+    if contains:
+        possible = False
+        for offset in range(65 - len(contains)):
+            if all(assigned[offset + index] in (None, character)
+                   for index, character in enumerate(contains)):
+                possible = True
+                break
+        if not possible:
+            raise ValueError("substring conflicts with the prefix and suffix")
+
+
 def matches(key: str, prefix: str, suffix: str, contains: str) -> bool:
     return ((not prefix or key.startswith(prefix)) and
             (not suffix or key.endswith(suffix)) and
@@ -102,7 +133,8 @@ def matches(key: str, prefix: str, suffix: str, contains: str) -> bool:
 
 
 def search(prefix: str, suffix: str, contains: str, workers: int,
-           update: Optional[Callable[[int, float], None]] = None) -> Result:
+           update: Optional[Callable[[int, float], None]] = None,
+           cancel: Optional[threading.Event] = None) -> Result:
     stop = threading.Event()
     found: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=1)
     counts = [0] * workers
@@ -110,7 +142,7 @@ def search(prefix: str, suffix: str, contains: str, workers: int,
 
     def worker(index: int) -> None:
         local_count = 0
-        while not stop.is_set():
+        while not stop.is_set() and not (cancel and cancel.is_set()):
             public, private = meshcore_keypair()
             local_count += 1
             public_hex = public.hex()
@@ -131,6 +163,9 @@ def search(prefix: str, suffix: str, contains: str, workers: int,
         thread.start()
     last = 0.0
     while not stop.wait(0.1):
+        if cancel and cancel.is_set():
+            stop.set()
+            break
         elapsed = time.monotonic() - start
         if update and elapsed - last >= 0.25:
             update(sum(counts), elapsed)
@@ -139,6 +174,8 @@ def search(prefix: str, suffix: str, contains: str, workers: int,
         thread.join()
     elapsed = time.monotonic() - start
     attempts = sum(counts)
+    if found.empty():
+        raise SearchCancelled("Search cancelled")
     public_hex, private_hex = found.get_nowait()
     needle = ", ".join(part for part in (prefix and f"prefix {prefix}", suffix and f"suffix {suffix}", contains and f"contains {contains}") if part) or "any valid key"
     return Result(public_hex, private_hex, attempts, elapsed, needle, "cpu")
@@ -156,46 +193,65 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 update: Optional[Callable[[int, float], None]] = None,
                 watch_path: Optional[Path] = None,
                 cancel: Optional[threading.Event] = None,
-                watch_update: Optional[Callable[[int, str, str, Path], None]] = None) -> Result:
+                watch_update: Optional[Callable[[int, str, str, Path], None]] = None,
+                device: int = 0,
+                process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
         raise RuntimeError("CUDA engine is not built; run 'make'")
-    command = [str(executable)]
+    command = [str(executable), "--device", str(device)]
     for option, value in (("--prefix", prefix), ("--suffix", suffix), ("--contains", contains)):
         if value:
             command.extend((option, value))
     if update:
         update(0, 0.0)
-    process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, bufsize=1)
-    assert process.stderr is not None
-    errors: list[str] = []
     watch_path = watch_path or DEFAULT_WATCH_PATH
     initialize_watch_file(watch_path)
-    for line in process.stderr:
-        if cancel and cancel.is_set():
+    process: Optional[subprocess.Popen[str]] = None
+    errors: list[str] = []
+    stdout = ""
+    try:
+        process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, bufsize=1)
+        if process_update:
+            process_update(process)
+        assert process.stderr is not None
+        for line in process.stderr:
+            if cancel and cancel.is_set():
+                raise SearchCancelled("Search cancelled")
+            progress = re.fullmatch(r"PROGRESS (\d+) ([0-9.]+) ([0-9.]+)\s*", line)
+            if progress:
+                if update:
+                    update(int(progress.group(1)), float(progress.group(2)))
+            elif line.startswith("WATCH "):
+                try:
+                    _, rule, public_hex, private_hex = line.strip().split()
+                    rule_number = int(rule)
+                    appended = append_interesting(watch_path, rule_number, public_hex, private_hex)
+                    if appended and watch_update:
+                        watch_update(rule_number, WATCH_REASONS[rule_number], public_hex, watch_path)
+                except (ValueError, RuntimeError) as error:
+                    raise RuntimeError(str(error)) from error
+            else:
+                errors.append(line.strip())
+        assert process.stdout is not None
+        stdout = process.stdout.read()
+        return_code = process.wait()
+    finally:
+        if process is not None and process.poll() is None:
             process.terminate()
-            process.wait()
-            raise SearchCancelled("Search cancelled")
-        progress = re.fullmatch(r"PROGRESS (\d+) ([0-9.]+) ([0-9.]+)\s*", line)
-        if progress:
-            if update:
-                update(int(progress.group(1)), float(progress.group(2)))
-        elif line.startswith("WATCH "):
             try:
-                _, rule, public_hex, private_hex = line.strip().split()
-                rule_number = int(rule)
-                append_interesting(watch_path, rule_number, public_hex, private_hex)
-                if watch_update:
-                    watch_update(rule_number, WATCH_REASONS[rule_number], public_hex, watch_path)
-            except (ValueError, RuntimeError) as error:
-                process.terminate()
-                raise RuntimeError(str(error)) from error
-        else:
-            errors.append(line.strip())
-    assert process.stdout is not None
-    stdout = process.stdout.read()
-    return_code = process.wait()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if process is not None:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        if process_update:
+            process_update(None)
     if return_code:
         detail = errors[-1] if errors else f"status {return_code}"
         raise RuntimeError(f"CUDA engine failed: {detail}")
@@ -219,10 +275,21 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                   float(payload["elapsed_seconds"]), needle, "cuda")
 
 
+def secure_open(path: Path, flags: int) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    os.fchmod(descriptor, 0o600)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError(f"refusing to write non-regular file: {path}")
+    return descriptor
+
+
 def save_result(result: Result, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = secure_open(path, flags)
     with os.fdopen(descriptor, "w", encoding="utf-8") as file:
         json.dump(asdict(result), file, indent=2)
         file.write("\n")
@@ -231,7 +298,7 @@ def save_result(result: Result, path: Path) -> None:
 def initialize_watch_file(path: Path) -> None:
     """Create the watch file up front so an empty file clearly means zero finds."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = secure_open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     os.close(descriptor)
 
 
@@ -242,13 +309,36 @@ WATCH_REASONS = (
 )
 
 
-def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str) -> None:
+def interesting_rule(public_hex: str) -> int:
+    """Classify a rare public key independently of the CUDA implementation."""
+    if len(public_hex) != 64 or not re.fullmatch(r"[0-9a-f]{64}", public_hex):
+        return -1
+    if public_hex[:10] == public_hex[-10:]:
+        return 0
+    if public_hex[:10] == public_hex[-10:][::-1]:
+        return 1
+    words = (
+        "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
+        "babecafe00", "f00df00d00", "1337133713", "fadefade00",
+    )
+    for index, word in enumerate(words):
+        if public_hex.startswith(word):
+            return 2 + index
+        if public_hex.endswith(word):
+            return 10 + index
+    return -1
+
+
+def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str) -> bool:
     private = bytes.fromhex(private_hex)
-    if (rule < 0 or rule >= len(WATCH_REASONS) or len(private) != 64
+    public = bytes.fromhex(public_hex)
+    if (rule < 0 or rule >= len(WATCH_REASONS) or interesting_rule(public_hex) != rule
+            or len(private) != 64 or len(public) != 32
+            or public[0] in (0, 255)
             or SODIUM.derive_public(private[:32]).hex() != public_hex):
         raise RuntimeError("An incidental CUDA result failed CPU verification")
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = secure_open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
     record = {
         "found_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "reason": WATCH_REASONS[rule],
@@ -256,10 +346,21 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str)
         "private_key": private_hex,
         "backend": "cuda",
     }
-    with os.fdopen(descriptor, "a", encoding="utf-8") as file:
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as file:
+        fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        file.seek(0)
+        for line in file:
+            try:
+                existing = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if existing.get("reason") == WATCH_REASONS[rule] or existing.get("public_key") == public_hex:
+                return False
+        file.seek(0, os.SEEK_END)
         file.write(json.dumps(record, separators=(",", ":")) + "\n")
         file.flush()
         os.fsync(file.fileno())
+    return True
 
 
 TEST_PRIVATE = bytes.fromhex(
@@ -294,13 +395,24 @@ def run_gui() -> int:
     workers = tk.IntVar(value=max(1, (os.cpu_count() or 2) - 1))
     ttk.Label(frame, text="CPU workers").grid(row=3, column=0, sticky="w", pady=3)
     ttk.Spinbox(frame, from_=1, to=max(1, os.cpu_count() or 1), width=8, textvariable=workers).grid(row=3, column=1, sticky="w")
-    status = tk.StringVar(value=f"CUDA devices visible: {cuda_device_count()} ({'CUDA' if cuda_available() else 'CPU'} backend)")
-    ttk.Label(frame, textvariable=status).grid(row=4, column=0, columnspan=2, sticky="w", pady=(9, 3))
+    gpu_count = cuda_device_count()
+    device = tk.IntVar(value=0)
+    ttk.Label(frame, text="CUDA device").grid(row=4, column=0, sticky="w", pady=3)
+    device_box = ttk.Combobox(frame, width=8, state="readonly", textvariable=device,
+                              values=tuple(range(gpu_count)) if gpu_count else ("None",))
+    device_box.grid(row=4, column=1, sticky="w")
+    if not gpu_count:
+        device_box.current(0)
+    status = tk.StringVar(value=f"CUDA devices visible: {gpu_count} ({'CUDA' if cuda_available() else 'CPU'} backend)")
+    ttk.Label(frame, textvariable=status).grid(row=5, column=0, columnspan=2, sticky="w", pady=(9, 3))
     incidental = tk.StringVar(value="Rare incidental keys found: 0")
-    ttk.Label(frame, textvariable=incidental).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 3))
+    ttk.Label(frame, textvariable=incidental).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 3))
     output = tk.Text(frame, width=80, height=8, state="disabled", wrap="word")
-    output.grid(row=6, column=0, columnspan=2, pady=5)
-    state: dict[str, object] = {"result": None, "cancel": threading.Event(), "searching": False, "incidental": 0}
+    output.grid(row=7, column=0, columnspan=2, pady=5)
+    state: dict[str, object] = {
+        "result": None, "cancel": threading.Event(), "searching": False,
+        "incidental": 0, "process": None, "closing": False,
+    }
 
     def show(text: str) -> None:
         output.configure(state="normal")
@@ -313,6 +425,7 @@ def run_gui() -> int:
             values = {name: valid_pattern(var.get(), name) for name, var in fields.items()}
             if not any(values.values()):
                 raise ValueError("Enter a prefix, suffix, or substring to search for")
+            validate_constraints(**values)
         except ValueError as error:
             messagebox.showerror("Invalid pattern", str(error))
             return
@@ -322,14 +435,21 @@ def run_gui() -> int:
         state["searching"] = True
         state["incidental"] = 0
         incidental.set("Rare incidental keys found: 0")
+        worker_count = workers.get()
+        selected_device = device.get() if gpu_count else 0
+        using_cuda = cuda_available()
         button.configure(state="disabled")
         cancel_button.configure(state="normal")
         activity.start(12)
-        status.set("Starting CUDA search…")
-        show("Search is active. Longer patterns may take minutes or hours.\nIncidental interesting keys are being saved while you wait.")
+        status.set("Starting CUDA search…" if using_cuda else "Starting CPU search…")
+        if using_cuda:
+            show("CUDA search is active. Longer patterns may take minutes or hours.\nRare incidental keys are being saved while you wait.")
+        else:
+            show("CPU fallback search is active. Automatic rare-key collection requires CUDA.")
 
         def progress(attempts: int, elapsed: float) -> None:
-            root.after(0, status.set, f"Searching: {attempts:,} keys, {attempts / max(elapsed, .001):,.0f} keys/s")
+            if not state["closing"]:
+                root.after(0, status.set, f"Searching: {attempts:,} keys, {attempts / max(elapsed, .001):,.0f} keys/s")
 
         def watch_progress(rule: int, reason: str, public_key: str, path: Path) -> None:
             def display() -> None:
@@ -339,22 +459,31 @@ def run_gui() -> int:
                     f"Rare incidental keys found: {count} | latest: {reason} | "
                     f"{public_key[:16]}… | saved: {path}"
                 )
-            root.after(0, display)
+            if not state["closing"]:
+                root.after(0, display)
+
+        def process_progress(process: Optional[subprocess.Popen[str]]) -> None:
+            state["process"] = process
 
         def job() -> None:
             try:
-                if cuda_available():
+                if using_cuda:
                     result = search_cuda(**values, update=progress, cancel=cancel_event,
-                                         watch_update=watch_progress)
+                                         watch_update=watch_progress, device=selected_device,
+                                         process_update=process_progress)
                 else:
-                    result = search(**values, workers=workers.get(), update=progress)
+                    result = search(**values, workers=worker_count, update=progress,
+                                    cancel=cancel_event)
                 state["result"] = result
-                root.after(0, complete, result)
+                if not state["closing"]:
+                    root.after(0, complete, result)
             except SearchCancelled:
-                root.after(0, stopped)
+                if not state["closing"]:
+                    root.after(0, stopped)
             except Exception as error:
                 error_text = str(error)
-                root.after(0, failed, error_text)
+                if not state["closing"]:
+                    root.after(0, failed, error_text)
 
         threading.Thread(target=job, daemon=True).start()
 
@@ -385,6 +514,9 @@ def run_gui() -> int:
         cancel_event = state["cancel"]
         assert isinstance(cancel_event, threading.Event)
         cancel_event.set()
+        process = state.get("process")
+        if isinstance(process, subprocess.Popen) and process.poll() is None:
+            process.terminate()
         status.set("Stopping search…")
         cancel_button.configure(state="disabled")
 
@@ -399,14 +531,29 @@ def run_gui() -> int:
             messagebox.showinfo("Saved", "Saved with owner-only permissions where supported.")
 
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
-    activity.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(7, 3))
+    activity.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
-    controls.grid(row=8, column=0, columnspan=2, sticky="ew")
+    controls.grid(row=9, column=0, columnspan=2, sticky="ew")
     button = ttk.Button(controls, text="Find vanity key", command=start_search)
     button.pack(side="left")
     cancel_button = ttk.Button(controls, text="Cancel", command=cancel_search, state="disabled")
     cancel_button.pack(side="left", padx=7)
     ttk.Button(controls, text="Save result", command=save).pack(side="right")
+    def close_window() -> None:
+        state["closing"] = True
+        cancel_event = state["cancel"]
+        assert isinstance(cancel_event, threading.Event)
+        cancel_event.set()
+        process = state.get("process")
+        if isinstance(process, subprocess.Popen) and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_window)
     root.mainloop()
     return 0
 
@@ -420,6 +567,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="write result JSON with mode 0600")
     parser.add_argument("--watch-output", type=Path, default=DEFAULT_WATCH_PATH,
                         help="append incidental interesting keys here")
+    parser.add_argument("--device", type=int, default=0, help="CUDA device index (default: 0)")
+    parser.add_argument("--show-private", action="store_true",
+                        help="print the private key to the terminal")
     parser.add_argument("--gui", action="store_true", help="open the small desktop GUI")
     parser.add_argument("--backend", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--self-test", action="store_true")
@@ -432,8 +582,11 @@ def main() -> int:
         prefix, suffix, contains = (valid_pattern(getattr(args, name), name) for name in ("prefix", "suffix", "contains"))
         if not any((prefix, suffix, contains)):
             raise ValueError("Specify --prefix, --suffix, or --contains (or use --gui)")
+        validate_constraints(prefix, suffix, contains)
         if args.workers < 1:
             raise ValueError("--workers must be at least 1")
+        if args.device < 0:
+            raise ValueError("--device must be zero or greater")
     except ValueError as error:
         parser.error(str(error))
     use_cuda = args.backend == "cuda" or (args.backend == "auto" and cuda_available())
@@ -442,17 +595,19 @@ def main() -> int:
             print("CUDA device or built engine unavailable; run 'make' and check nvidia-smi.", file=sys.stderr)
             return 2
         print("Using CUDA backend with independent CPU result verification.")
-        result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output)
+        result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output,
+                             device=args.device)
     else:
         print(f"Using verified CPU backend with {args.workers} workers.")
         result = search(prefix, suffix, contains, args.workers, lambda n, e: print(f"\r{n:,} keys | {n / max(e, .001):,.0f} keys/s", end="", flush=True))
     print(f"\nFound {result.public_key} after ≤{result.attempts:,} attempts ({result.elapsed_seconds:.3f}s, {result.backend.upper()}).")
-    print(f"Private key: {result.private_key}")
+    output_path = args.output or (DEFAULT_RESULTS_DIR / f"meshcore-identity-{result.public_key[:8]}.json")
+    save_result(result, output_path)
+    print(f"Saved identity: {output_path}")
+    if args.show_private:
+        print(f"Private key: {result.private_key}")
     if result.backend == "cuda":
         print(f"Interesting matches: {args.watch_output}")
-    if args.output:
-        save_result(result, args.output)
-        print(f"Saved to {args.output}")
     return 0
 
 
