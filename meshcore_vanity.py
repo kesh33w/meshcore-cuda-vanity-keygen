@@ -37,6 +37,10 @@ class Sodium:
             ctypes.c_void_p, ctypes.c_void_p
         ]
         self.lib.crypto_scalarmult_ed25519_base_noclamp.restype = ctypes.c_int
+        self.lib.crypto_sign_verify_detached.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_void_p
+        ]
+        self.lib.crypto_sign_verify_detached.restype = ctypes.c_int
         if self.lib.sodium_init() < 0:
             raise RuntimeError("libsodium initialization failed")
 
@@ -46,6 +50,16 @@ class Sodium:
         if self.lib.crypto_scalarmult_ed25519_base_noclamp(public, secret) != 0:
             raise RuntimeError("libsodium rejected the Ed25519 scalar")
         return bytes(public)
+
+    def verify(self, signature: bytes, message: bytes, public: bytes) -> bool:
+        if len(signature) != 64 or len(public) != 32:
+            return False
+        signature_buffer = (ctypes.c_ubyte * len(signature)).from_buffer_copy(signature)
+        message_buffer = (ctypes.c_ubyte * len(message)).from_buffer_copy(message)
+        public_buffer = (ctypes.c_ubyte * len(public)).from_buffer_copy(public)
+        return self.lib.crypto_sign_verify_detached(
+            signature_buffer, message_buffer, len(message), public_buffer
+        ) == 0
 
 
 SODIUM = Sodium()
@@ -79,6 +93,36 @@ def meshcore_keypair() -> tuple[bytes, bytes]:
     return SODIUM.derive_public(bytes(scalar)), private
 
 
+ED25519_ORDER = 2**252 + 27742317777372353535851937790883648493
+
+
+def sign_expanded(private: bytes, public: bytes, message: bytes) -> bytes:
+    """Sign with MeshCore's expanded scalar || nonce-prefix private format."""
+    if len(private) != 64 or len(public) != 32:
+        raise ValueError("invalid expanded Ed25519 key length")
+    scalar = int.from_bytes(private[:32], "little")
+    nonce = int.from_bytes(hashlib.sha512(private[32:] + message).digest(), "little") % ED25519_ORDER
+    encoded_nonce = SODIUM.derive_public(nonce.to_bytes(32, "little"))
+    challenge = int.from_bytes(
+        hashlib.sha512(encoded_nonce + public + message).digest(), "little"
+    ) % ED25519_ORDER
+    response = (nonce + challenge * scalar) % ED25519_ORDER
+    return encoded_nonce + response.to_bytes(32, "little")
+
+
+def verify_expanded_key(private: bytes, public: bytes) -> bool:
+    if (len(private) != 64 or len(public) != 32 or private[0] & 7
+            or private[31] & 128 or not private[31] & 64):
+        return False
+    message = b"MeshCore vanity key compatibility test"
+    try:
+        return SODIUM.derive_public(private[:32]) == public and SODIUM.verify(
+            sign_expanded(private, public, message), message, public
+        )
+    except (ValueError, RuntimeError):
+        return False
+
+
 @dataclass(frozen=True)
 class Result:
     public_key: str
@@ -87,6 +131,7 @@ class Result:
     elapsed_seconds: float
     match: str
     backend: str = "cpu"
+    engine: Optional[str] = None
 
 
 def valid_pattern(value: str, label: str) -> str:
@@ -195,11 +240,14 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 cancel: Optional[threading.Event] = None,
                 watch_update: Optional[Callable[[int, str, str, Path], None]] = None,
                 device: int = 0,
+                engine: str = "incremental",
                 process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
         raise RuntimeError("CUDA engine is not built; run 'make'")
-    command = [str(executable), "--device", str(device)]
+    if engine not in ("incremental", "baseline"):
+        raise ValueError("CUDA engine must be incremental or baseline")
+    command = [str(executable), "--device", str(device), "--engine", engine]
     for option, value in (("--prefix", prefix), ("--suffix", suffix), ("--contains", contains)):
         if value:
             command.extend((option, value))
@@ -227,7 +275,9 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 try:
                     _, rule, public_hex, private_hex = line.strip().split()
                     rule_number = int(rule)
-                    appended = append_interesting(watch_path, rule_number, public_hex, private_hex)
+                    appended = append_interesting(
+                        watch_path, rule_number, public_hex, private_hex, engine
+                    )
                     if appended and watch_update:
                         watch_update(rule_number, WATCH_REASONS[rule_number], public_hex, watch_path)
                 except (ValueError, RuntimeError) as error:
@@ -259,20 +309,16 @@ def search_cuda(prefix: str, suffix: str, contains: str,
         payload = json.loads(stdout.strip().splitlines()[-1])
         public_hex = payload["public_key"]
         private_hex = payload["private_key"]
-        seed = bytes.fromhex(payload["seed"])
+        public = bytes.fromhex(public_hex)
         private = bytes.fromhex(private_hex)
     except (KeyError, ValueError, IndexError, json.JSONDecodeError) as error:
         raise RuntimeError("CUDA engine returned an invalid result") from error
-    digest = bytearray(hashlib.sha512(seed).digest())
-    digest[0] &= 248
-    digest[31] &= 63
-    digest[31] |= 64
-    if (bytes(digest) != private or SODIUM.derive_public(private[:32]).hex() != public_hex
+    if (payload.get("engine") != engine or not verify_expanded_key(private, public)
             or not matches(public_hex, prefix, suffix, contains)):
         raise RuntimeError("CUDA result failed independent CPU verification")
     needle = ", ".join(part for part in (prefix and f"prefix {prefix}", suffix and f"suffix {suffix}", contains and f"contains {contains}") if part)
     return Result(public_hex, private_hex, int(payload["attempts"]),
-                  float(payload["elapsed_seconds"]), needle, "cuda")
+                  float(payload["elapsed_seconds"]), needle, "cuda", engine)
 
 
 def secure_open(path: Path, flags: int) -> int:
@@ -329,13 +375,14 @@ def interesting_rule(public_hex: str) -> int:
     return -1
 
 
-def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str) -> bool:
+def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
+                       engine: str = "incremental") -> bool:
     private = bytes.fromhex(private_hex)
     public = bytes.fromhex(public_hex)
     if (rule < 0 or rule >= len(WATCH_REASONS) or interesting_rule(public_hex) != rule
             or len(private) != 64 or len(public) != 32
             or public[0] in (0, 255)
-            or SODIUM.derive_public(private[:32]).hex() != public_hex):
+            or not verify_expanded_key(private, public)):
         raise RuntimeError("An incidental CUDA result failed CPU verification")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = secure_open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
@@ -345,6 +392,7 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str)
         "public_key": public_hex,
         "private_key": private_hex,
         "backend": "cuda",
+        "engine": engine,
     }
     with os.fdopen(descriptor, "a+", encoding="utf-8") as file:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX)
@@ -403,12 +451,16 @@ def run_gui() -> int:
     device_box.grid(row=4, column=1, sticky="w")
     if not gpu_count:
         device_box.current(0)
+    cuda_engine = tk.StringVar(value="incremental")
+    ttk.Label(frame, text="CUDA engine").grid(row=5, column=0, sticky="w", pady=3)
+    ttk.Combobox(frame, width=12, state="readonly", textvariable=cuda_engine,
+                 values=("incremental", "baseline")).grid(row=5, column=1, sticky="w")
     status = tk.StringVar(value=f"CUDA devices visible: {gpu_count} ({'CUDA' if cuda_available() else 'CPU'} backend)")
-    ttk.Label(frame, textvariable=status).grid(row=5, column=0, columnspan=2, sticky="w", pady=(9, 3))
+    ttk.Label(frame, textvariable=status).grid(row=6, column=0, columnspan=2, sticky="w", pady=(9, 3))
     incidental = tk.StringVar(value="Rare incidental keys found: 0")
-    ttk.Label(frame, textvariable=incidental).grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 3))
+    ttk.Label(frame, textvariable=incidental).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 3))
     output = tk.Text(frame, width=80, height=8, state="disabled", wrap="word")
-    output.grid(row=7, column=0, columnspan=2, pady=5)
+    output.grid(row=8, column=0, columnspan=2, pady=5)
     state: dict[str, object] = {
         "result": None, "cancel": threading.Event(), "searching": False,
         "incidental": 0, "process": None, "closing": False,
@@ -437,6 +489,7 @@ def run_gui() -> int:
         incidental.set("Rare incidental keys found: 0")
         worker_count = workers.get()
         selected_device = device.get() if gpu_count else 0
+        selected_engine = cuda_engine.get()
         using_cuda = cuda_available()
         button.configure(state="disabled")
         cancel_button.configure(state="normal")
@@ -470,6 +523,7 @@ def run_gui() -> int:
                 if using_cuda:
                     result = search_cuda(**values, update=progress, cancel=cancel_event,
                                          watch_update=watch_progress, device=selected_device,
+                                         engine=selected_engine,
                                          process_update=process_progress)
                 else:
                     result = search(**values, workers=worker_count, update=progress,
@@ -490,7 +544,8 @@ def run_gui() -> int:
     def complete(result: Result) -> None:
         state["searching"] = False
         activity.stop()
-        status.set(f"Found with {result.backend.upper()} after ≤{result.attempts:,} attempts in {result.elapsed_seconds:.3f}s")
+        backend_label = result.backend.upper() + (f"/{result.engine}" if result.engine else "")
+        status.set(f"Found with {backend_label} after ≤{result.attempts:,} attempts in {result.elapsed_seconds:.3f}s")
         show(f"PUBLIC KEY (64 hex characters):\n{result.public_key}\n\nPRIVATE KEY — keep secret (128 hex characters):\n{result.private_key}\n\nImport the private key as MeshCore prv.key, then reboot.\n\nRare incidental matches are saved to results/rare-keys.jsonl.")
         button.configure(state="normal")
         cancel_button.configure(state="disabled")
@@ -531,9 +586,9 @@ def run_gui() -> int:
             messagebox.showinfo("Saved", "Saved with owner-only permissions where supported.")
 
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
-    activity.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(7, 3))
+    activity.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
-    controls.grid(row=9, column=0, columnspan=2, sticky="ew")
+    controls.grid(row=10, column=0, columnspan=2, sticky="ew")
     button = ttk.Button(controls, text="Find vanity key", command=start_search)
     button.pack(side="left")
     cancel_button = ttk.Button(controls, text="Cancel", command=cancel_search, state="disabled")
@@ -568,6 +623,8 @@ def main() -> int:
     parser.add_argument("--watch-output", type=Path, default=DEFAULT_WATCH_PATH,
                         help="append incidental interesting keys here")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index (default: 0)")
+    parser.add_argument("--cuda-engine", choices=("incremental", "baseline"),
+                        default="incremental", help="CUDA implementation (default: incremental)")
     parser.add_argument("--show-private", action="store_true",
                         help="print the private key to the terminal")
     parser.add_argument("--gui", action="store_true", help="open the small desktop GUI")
@@ -596,11 +653,12 @@ def main() -> int:
             return 2
         print("Using CUDA backend with independent CPU result verification.")
         result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output,
-                             device=args.device)
+                             device=args.device, engine=args.cuda_engine)
     else:
         print(f"Using verified CPU backend with {args.workers} workers.")
         result = search(prefix, suffix, contains, args.workers, lambda n, e: print(f"\r{n:,} keys | {n / max(e, .001):,.0f} keys/s", end="", flush=True))
-    print(f"\nFound {result.public_key} after ≤{result.attempts:,} attempts ({result.elapsed_seconds:.3f}s, {result.backend.upper()}).")
+    backend_label = result.backend.upper() + (f"/{result.engine}" if result.engine else "")
+    print(f"\nFound {result.public_key} after ≤{result.attempts:,} attempts ({result.elapsed_seconds:.3f}s, {backend_label}).")
     output_path = args.output or (DEFAULT_RESULTS_DIR / f"meshcore-identity-{result.public_key[:8]}.json")
     save_result(result, output_path)
     print(f"Saved identity: {output_path}")

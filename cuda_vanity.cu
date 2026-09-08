@@ -23,7 +23,10 @@
 namespace {
 constexpr int kMaxPattern = 60;
 constexpr int kThreads = 256;
-constexpr int kAttemptsPerThread = 256;
+#ifndef MC_ATTEMPTS_PER_THREAD
+#define MC_ATTEMPTS_PER_THREAD 256
+#endif
+constexpr int kAttemptsPerThread = MC_ATTEMPTS_PER_THREAD;
 constexpr int kWatchRules = 18;
 
 __constant__ char gpu_prefix[kMaxPattern + 1];
@@ -39,7 +42,6 @@ __constant__ char gpu_watch_words[8][11] = {
 
 struct DeviceResult {
     int found;
-    unsigned char seed[32];
     unsigned char private_key[64];
     unsigned char public_key[32];
 };
@@ -116,8 +118,35 @@ __device__ void increment_seed(unsigned char *seed, unsigned long long amount) {
     }
 }
 
-__global__ void scan_kernel(const unsigned char *base_seed, DeviceResult *result,
-                            unsigned long long *watch_mask, WatchBatch *watch_batch) {
+__device__ bool inspect_candidate(const unsigned char *private_key,
+                                  const unsigned char *public_key,
+                                  DeviceResult *result,
+                                  unsigned long long *watch_mask,
+                                  WatchBatch *watch_batch) {
+    const bool meshcore_valid = public_key[0] != 0 && public_key[0] != 255;
+    int rule = meshcore_valid ? interesting_rule(public_key) : -1;
+    if (rule >= 0) {
+        unsigned long long bit = 1ULL << rule;
+        if (!(atomicOr(watch_mask, bit) & bit)) {
+            int slot = atomicAdd(&watch_batch->count, 1);
+            if (slot < kWatchRules) {
+                watch_batch->results[slot].rule = rule;
+                for (int i = 0; i < 32; ++i) watch_batch->results[slot].public_key[i] = public_key[i];
+                for (int i = 0; i < 64; ++i) watch_batch->results[slot].private_key[i] = private_key[i];
+            }
+        }
+    }
+    if (key_matches(public_key) && atomicCAS(&result->found, 0, 1) == 0) {
+        for (int i = 0; i < 32; ++i) result->public_key[i] = public_key[i];
+        for (int i = 0; i < 64; ++i) result->private_key[i] = private_key[i];
+        __threadfence_system();
+        return true;
+    }
+    return false;
+}
+
+__global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResult *result,
+                                     unsigned long long *watch_mask, WatchBatch *watch_batch) {
     unsigned char seed[32];
     unsigned char private_key[64];
     unsigned char public_key[32];
@@ -133,29 +162,30 @@ __global__ void scan_kernel(const unsigned char *base_seed, DeviceResult *result
         private_key[31] |= 64;
         ge_scalarmult_base(&point, private_key);
         ge_p3_tobytes(public_key, &point);
-        const bool meshcore_valid = public_key[0] != 0 && public_key[0] != 255;
-        int rule = meshcore_valid ? interesting_rule(public_key) : -1;
-        if (rule >= 0) {
-            unsigned long long bit = 1ULL << rule;
-            if (!(atomicOr(watch_mask, bit) & bit)) {
-                int slot = atomicAdd(&watch_batch->count, 1);
-                if (slot < kWatchRules) {
-                    watch_batch->results[slot].rule = rule;
-                    for (int i = 0; i < 32; ++i) watch_batch->results[slot].public_key[i] = public_key[i];
-                    for (int i = 0; i < 64; ++i) watch_batch->results[slot].private_key[i] = private_key[i];
-                }
-            }
-        }
-        if (key_matches(public_key) && atomicCAS(&result->found, 0, 1) == 0) {
-            for (int i = 0; i < 32; ++i) {
-                result->seed[i] = seed[i];
-                result->public_key[i] = public_key[i];
-            }
-            for (int i = 0; i < 64; ++i) result->private_key[i] = private_key[i];
-            __threadfence_system();
-            return;
-        }
+        if (inspect_candidate(private_key, public_key, result, watch_mask, watch_batch)) return;
         increment_seed(seed, 1);
+    }
+}
+
+__global__ void scan_kernel_incremental(const unsigned char *base_scalar, DeviceResult *result,
+                                        unsigned long long *watch_mask, WatchBatch *watch_batch) {
+    unsigned char private_key[64]{};
+    unsigned char public_key[32];
+    ge_p3 point;
+    ge_p1p1 next;
+    const unsigned long long lane = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (int i = 0; i < 32; ++i) private_key[i] = base_scalar[i];
+    increment_seed(private_key, lane * kAttemptsPerThread * 8ULL);
+    ge_scalarmult_base(&point, private_key);
+
+    for (int attempt = 0; attempt < kAttemptsPerThread && !result->found; ++attempt) {
+        ge_p3_tobytes(public_key, &point);
+        if (inspect_candidate(private_key, public_key, result, watch_mask, watch_batch)) return;
+        // base[0][7] is the precomputed point 8B. Adding it preserves the
+        // low-three-zero-bit requirement of an expanded Ed25519 scalar.
+        ge_madd(&next, &point, &base[0][7]);
+        ge_p1p1_to_p3(&point, &next);
+        increment_seed(private_key, 8);
     }
 }
 
@@ -229,12 +259,13 @@ void random_bytes(unsigned char *destination, size_t length) {
 }
 
 void usage(const char *program) {
-    std::fprintf(stderr, "Usage: %s [--device N] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
+    std::fprintf(stderr, "Usage: %s [--engine incremental|baseline] [--device N] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
 }
 }  // namespace
 
 int main(int argc, char **argv) {
     std::string prefix, suffix, contains;
+    std::string engine = "incremental";
     int selected_device = 0;
     for (int i = 1; i < argc; ++i) {
         if (i + 1 >= argc) { usage(argv[0]); return 2; }
@@ -245,6 +276,11 @@ int main(int argc, char **argv) {
             long parsed = std::strtol(value.c_str(), &end, 10);
             if (!end || *end || parsed < 0 || parsed > 1024) { usage(argv[0]); return 2; }
             selected_device = static_cast<int>(parsed);
+            continue;
+        }
+        if (option == "--engine") {
+            if (value != "incremental" && value != "baseline") { usage(argv[0]); return 2; }
+            engine = value;
             continue;
         }
         for (char &ch : value) if (ch >= 'A' && ch <= 'F') ch += 'a' - 'A';
@@ -295,22 +331,31 @@ int main(int argc, char **argv) {
     cuda_check(cudaMemset(device_watch_mask, 0, sizeof(unsigned long long)), "clear watch mask");
     unsigned long long attempts = 0;
     auto started = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "GPU %d: %s, %d blocks x %d threads\n",
-                 selected_device, properties.name, blocks, kThreads);
+    std::fprintf(stderr, "GPU %d: %s, engine %s, %d blocks x %d threads\n",
+                 selected_device, properties.name, engine.c_str(), blocks, kThreads);
 
     for (;;) {
         std::array<unsigned char, 32> seed{};
         DeviceResult result{};
         WatchBatch watch{};
         random_bytes(seed.data(), seed.size());
+        if (engine == "incremental") {
+            seed[0] &= 248;
+            seed[31] &= 31;  // retain ample headroom for the per-lane offsets
+            seed[31] |= 64;
+        }
         cuda_check(cudaMemcpy(device_seed, seed.data(), 32, cudaMemcpyHostToDevice), "copy seed");
         cuda_check(cudaMemset(device_result, 0, sizeof(DeviceResult)), "clear result");
         cuda_check(cudaMemset(device_watch, 0, sizeof(WatchBatch)), "clear watch results");
-        scan_kernel<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
-        cuda_check(cudaGetLastError(), "launch scan_kernel");
+        if (engine == "incremental")
+            scan_kernel_incremental<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
+        else
+            scan_kernel_baseline<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
+        cuda_check(cudaGetLastError(), "launch scan kernel");
         cuda_check(cudaMemcpy(&result, device_result, sizeof(result), cudaMemcpyDeviceToHost), "copy result");
         cuda_check(cudaMemcpy(&watch, device_watch, sizeof(watch), cudaMemcpyDeviceToHost), "copy watch results");
         for (int i = 0; i < watch.count && i < kWatchRules; ++i) {
+            if (engine == "incremental") random_bytes(&watch.results[i].private_key[32], 32);
             std::fprintf(stderr, "WATCH %d %s %s\n", watch.results[i].rule,
                          hex(watch.results[i].public_key, 32).c_str(),
                          hex(watch.results[i].private_key, 64).c_str());
@@ -319,9 +364,10 @@ int main(int argc, char **argv) {
         attempts += static_cast<unsigned long long>(blocks) * kThreads * kAttemptsPerThread;
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (result.found) {
-            std::printf("{\"public_key\":\"%s\",\"private_key\":\"%s\",\"seed\":\"%s\",\"attempts\":%llu,\"elapsed_seconds\":%.6f}\n",
+            if (engine == "incremental") random_bytes(&result.private_key[32], 32);
+            std::printf("{\"public_key\":\"%s\",\"private_key\":\"%s\",\"engine\":\"%s\",\"attempts\":%llu,\"elapsed_seconds\":%.6f}\n",
                         hex(result.public_key, 32).c_str(), hex(result.private_key, 64).c_str(),
-                        hex(result.seed, 32).c_str(), attempts, elapsed);
+                        engine.c_str(), attempts, elapsed);
             break;
         }
         std::fprintf(stderr, "PROGRESS %llu %.6f %.0f\n", attempts, elapsed, attempts / elapsed);

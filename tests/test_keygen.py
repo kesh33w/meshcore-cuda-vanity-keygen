@@ -15,6 +15,13 @@ class KeygenTests(unittest.TestCase):
             vanity.SODIUM.derive_public(vanity.TEST_PRIVATE[:32]).hex(),
             vanity.TEST_PUBLIC,
         )
+        self.assertTrue(vanity.verify_expanded_key(
+            vanity.TEST_PRIVATE, bytes.fromhex(vanity.TEST_PUBLIC)
+        ))
+        self.assertFalse(vanity.verify_expanded_key(b"short", bytes.fromhex(vanity.TEST_PUBLIC)))
+        malformed = bytearray(vanity.TEST_PRIVATE)
+        malformed[0] |= 1
+        self.assertFalse(vanity.verify_expanded_key(bytes(malformed), bytes.fromhex(vanity.TEST_PUBLIC)))
 
     def test_constraint_validation(self):
         for prefix in ("00", "ff1234"):
@@ -56,10 +63,32 @@ class KeygenTests(unittest.TestCase):
         if not vanity.cuda_available():
             self.skipTest("CUDA engine/device unavailable")
         with tempfile.TemporaryDirectory() as directory:
-            result = vanity.search_cuda("a", "", "", watch_path=Path(directory) / "rare.jsonl")
-        self.assertTrue(result.public_key.startswith("a"))
+            # Seven nibbles makes an attempt-zero hit extraordinarily unlikely,
+            # exercising repeated point addition rather than only initialization.
+            result = vanity.search_cuda("abc1234", "", "",
+                                        watch_path=Path(directory) / "rare.jsonl",
+                                        engine="incremental")
+        self.assertTrue(result.public_key.startswith("abc1234"))
+        self.assertEqual(result.engine, "incremental")
         self.assertEqual(vanity.SODIUM.derive_public(bytes.fromhex(result.private_key)[:32]).hex(),
                          result.public_key)
+        self.assertTrue(vanity.verify_expanded_key(
+            bytes.fromhex(result.private_key), bytes.fromhex(result.public_key)
+        ))
+
+    @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
+    def test_baseline_cuda_engine_remains_available(self):
+        if not vanity.cuda_available():
+            self.skipTest("CUDA engine/device unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            result = vanity.search_cuda("a", "", "",
+                                        watch_path=Path(directory) / "rare.jsonl",
+                                        engine="baseline")
+        self.assertTrue(result.public_key.startswith("a"))
+        self.assertEqual(result.engine, "baseline")
+        self.assertTrue(vanity.verify_expanded_key(
+            bytes.fromhex(result.private_key), bytes.fromhex(result.public_key)
+        ))
 
     @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
     def test_cuda_search_can_be_cancelled_without_orphaning_process(self):
