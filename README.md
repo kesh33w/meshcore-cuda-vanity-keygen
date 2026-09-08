@@ -30,17 +30,48 @@ a backend. The engine seeds each search batch with 256 bits from `/dev/urandom`.
 Every GPU result is re-derived and pattern-checked independently on the CPU
 before it is displayed or saved.
 
-During a CUDA search, the first match for each built-in rare-key rule is also
-CPU-verified and immediately appended to `results/rare-keys.jsonl`. Every rule
-has ten hex characters of effective difficulty (about 1.1 trillion possibilities):
-ten-character bookends, mirrored endcaps, and ten-character phrases such
-as `cafecafe00`, `deadbeef00`, and `f00df00d00` at either end. Use
-`--watch-output PATH` to choose another file. At most 18 incidental records are
-retained per run.
+## Automatic rare-key collection
 
-The default path is anchored to the application directory, regardless of the
-directory from which the GUI is launched. The file is created when a CUDA
-search starts; an empty file means no rare match has been found yet.
+Every CUDA search performs two checks on each generated public key:
+
+1. Does it match the prefix, suffix, or substring you requested?
+2. Does it match one of the built-in rare-key rules?
+
+The second check is automatic; no extra option is required. It does not replace
+or interrupt the requested search. When an incidental rare match appears, its
+public and private key are independently verified on the CPU and immediately
+appended to `results/rare-keys.jsonl`. The GUI shows a live count, the latest
+rule matched, and a public-key preview.
+
+The built-in rules are deliberately much harder than four-character vanity
+patterns. Each has ten hex characters of effective difficulty, or about 1.1
+trillion possibilities:
+
+- First ten characters equal the last ten (`bookend-10`).
+- First ten characters equal the reverse of the last ten (`mirror-10`).
+- One of eight exact phrases appears at either end: `cafecafe00`, `beefbeef00`,
+  `deadbeef00`, `facebabe00`, `babecafe00`, `f00df00d00`, `1337133713`, or
+  `fadefade00`.
+
+On the RTX 4070 Ti used during development, one specific rule averages roughly
+ten hours. Because all 18 rules are checked together, some incidental match is
+expected approximately every 30–40 minutes. Random search times vary widely,
+and a short run may find none.
+
+Each JSONL record keeps the matching pair together:
+
+```json
+{"found_at":"2026-09-08T12:34:56Z","reason":"prefix-deadbeef00","public_key":"...","private_key":"...","backend":"cuda"}
+```
+
+The file is created with owner-only permissions (`0600`) when the search starts;
+an empty file means no rare key has been found. Its default location is anchored
+to the application directory regardless of where the GUI is launched. Use
+`--watch-output PATH` to choose another location.
+
+Only the first key for each of the 18 rules is retained during one run, preventing
+duplicates or unbounded growth. Collection stops when the requested key is
+found or the search is cancelled; rare keys already written remain saved.
 
 The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
 `THIRD_PARTY_NOTICES.md`.
