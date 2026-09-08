@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+meshcore_cuda_vanity
+results/
