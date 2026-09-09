@@ -689,6 +689,7 @@ def self_test() -> bool:
 def run_gui() -> int:
     try:
         import tkinter as tk
+        import tkinter.font as tkfont
         from tkinter import filedialog, messagebox, ttk
     except ModuleNotFoundError:
         print("Tk is unavailable. Install python3-tk or use the command line.", file=sys.stderr)
@@ -1033,7 +1034,7 @@ def run_gui() -> int:
 
         browser = tk.Toplevel(root)
         browser.title("Saved Rare MeshCore Keys")
-        browser.geometry("1080x650")
+        browser.geometry("1180x680")
         browser.minsize(820, 500)
         browser.columnconfigure(0, weight=1)
         browser.rowconfigure(1, weight=1)
@@ -1056,8 +1057,19 @@ def run_gui() -> int:
         table_frame.grid(row=1, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
+        table_font = tkfont.nametofont("TkDefaultFont")
+        heading_font = tkfont.nametofont("TkHeadingFont")
+        row_height = max(30, table_font.metrics("linespace") + 12)
+        browser_style = ttk.Style(browser)
+        browser_style.configure("RareKeys.Treeview", font=table_font, rowheight=row_height)
+        browser_style.configure(
+            "RareKeys.Treeview.Heading", font=heading_font, padding=(8, 6)
+        )
         columns = ("found", "reason", "length", "rarity", "public")
-        tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        tree = ttk.Treeview(
+            table_frame, columns=columns, show="headings", selectmode="browse",
+            style="RareKeys.Treeview",
+        )
         tree.grid(row=0, column=0, sticky="nsew")
         vertical = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
         vertical.grid(row=0, column=1, sticky="ns")
@@ -1065,13 +1077,17 @@ def run_gui() -> int:
         horizontal.grid(row=1, column=0, sticky="ew")
         tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         headings = {
-            "found": "Found (UTC)", "reason": "Strongest match", "length": "Length",
+            "found": "Found UTC", "reason": "Strongest match", "length": "Chars",
             "rarity": "Rarity", "public": "Public key",
         }
-        widths = {"found": 165, "reason": 220, "length": 65, "rarity": 90, "public": 440}
+        widths = {"found": 185, "reason": 245, "length": 80, "rarity": 105, "public": 455}
         for column in columns:
-            tree.heading(column, text=headings[column])
-            tree.column(column, width=widths[column], minwidth=55, stretch=column == "public")
+            anchor = "center" if column in ("length", "rarity") else "w"
+            tree.heading(column, text=headings[column], anchor=anchor)
+            tree.column(
+                column, width=widths[column], minwidth=70, anchor=anchor,
+                stretch=column == "public",
+            )
 
         detail = tk.Text(browser, height=7, state="disabled", wrap="char")
         detail.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 5))
@@ -1153,7 +1169,7 @@ def run_gui() -> int:
             for index, record in enumerate(filtered):
                 item = f"record-{index}"
                 visible[item] = record
-                found_at = str(record.get("found_at", "")).replace("T", " ").replace("Z", "")
+                found_at = str(record.get("found_at", "")).replace("T", " ").replace("Z", "")[:19]
                 rarity = f"{float(record.get('rarity_bits', 0)):.1f} bits"
                 tree.insert("", "end", iid=item, values=(
                     found_at, record.get("reason", "unknown"),
@@ -1161,6 +1177,10 @@ def run_gui() -> int:
                 ))
             browser_state["visible"] = visible
             browser_state["private_visible"] = False
+            children = tree.get_children()
+            if children:
+                tree.selection_set(children[0])
+                tree.focus(children[0])
             skipped = int(browser_state["skipped"])
             note = f" • {skipped} malformed skipped" if skipped else ""
             limited = " • showing newest 10,000" if len(records) == RARE_BROWSER_LIMIT else ""

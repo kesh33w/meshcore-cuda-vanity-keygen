@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 1.3.1 — 2026-09-08
+
+- Make the rare-key table row height follow the active desktop font metrics so
+  records do not overlap on high-DPI or large-text desktops.
+- Improve column widths, alignment, headings, and timestamp formatting.
+- Automatically select the first visible record so its details are available
+  immediately when the browser opens or its filter changes.
+
 ## 1.3.0 — 2026-09-08
 
 - Preserve the strongest observed length for repeated prefixes, mirrors, pi
