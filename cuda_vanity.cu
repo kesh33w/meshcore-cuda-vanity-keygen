@@ -48,8 +48,8 @@ __constant__ int gpu_prefix_len;
 __constant__ int gpu_suffix_len;
 __constant__ int gpu_contains_len;
 __constant__ int gpu_collect_only;
-__constant__ char gpu_watch_words[3][11] = {
-    "f00df00d00", "1337133713", "fadefade00"
+__constant__ char gpu_watch_words[1][11] = {
+    "1337133713"
 };
 __constant__ char gpu_pi_prefix[11] = "3141592653";
 
@@ -116,10 +116,10 @@ __device__ int interesting_rule(const unsigned char *key) {
     for (int i = 1; i < 10; ++i)
         if (hex_at(key, i) != hex_at(key, 0)) repeated_prefix = false;
     if (repeated_prefix) return 2;
-    for (int word = 0; word < 3; ++word) {
+    for (int word = 0; word < 1; ++word) {
         if (equal_at(key, gpu_watch_words[word], 10, 0)) return 3 + word;
     }
-    if (equal_at(key, gpu_pi_prefix, 10, 0)) return 6;
+    if (equal_at(key, gpu_pi_prefix, 10, 0)) return 4;
     return -1;
 }
 

@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.5.1 — 2026-09-08
+
+- Stop collecting the `f00df00d00` and `fadefade00` phrase prefixes.
+- Keep historical records for both retired categories visible and unchanged.
+- Retain `1337133713` as the only canned phrase-prefix rule.
+
 ## 1.5.0 — 2026-09-08
 
 - Stop collecting the `cafecafe00`, `beefbeef00`, `deadbeef00`,
