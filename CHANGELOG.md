@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.1 — 2026-09-08
+
+- Fix a GUI cancellation race that could misreport the CUDA startup banner as
+  an engine failure when a search was stopped between progress updates.
+
 ## 1.2.0 — 2026-09-08
 
 - Log every independently verified rare-key discovery, including later matches

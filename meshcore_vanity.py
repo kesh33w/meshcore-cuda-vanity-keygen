@@ -373,6 +373,13 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 process.stderr.close()
         if process_update:
             process_update(None)
+    # The GUI terminates the CUDA child immediately for responsive cancellation.
+    # If that happens between progress lines, the stderr loop ends before its
+    # in-loop cancellation check can run. Treat the resulting SIGTERM as the
+    # requested cancellation rather than reporting the last startup banner as
+    # a CUDA failure.
+    if cancel and cancel.is_set():
+        raise SearchCancelled("Search cancelled")
     if return_code:
         detail = errors[-1] if errors else f"status {return_code}"
         raise RuntimeError(f"CUDA engine failed: {detail}")

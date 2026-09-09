@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.2.0**. Generated identities have been validated
+The current release is **v1.2.1**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)

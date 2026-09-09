@@ -138,6 +138,38 @@ class KeygenTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "invalid result"):
                     vanity.search_cuda("cafe", "", "", watch_path=Path(directory) / "rare.jsonl")
 
+    def test_cuda_gui_termination_is_reported_as_cancellation(self):
+        cancel = threading.Event()
+
+        class TerminatedProcess:
+            def __init__(self):
+                self.stderr = StringIO("GPU 0: NVIDIA GPU, engine optimized\n")
+                self.stdout = StringIO("")
+
+            def wait(self, timeout=None):
+                cancel.set()
+                return -15
+
+            def poll(self):
+                return -15
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch()
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(vanity.subprocess, "Popen", return_value=TerminatedProcess()):
+                with self.assertRaises(vanity.SearchCancelled):
+                    vanity.search_cuda(
+                        "cafe", "", "", cancel=cancel,
+                        watch_path=Path(directory) / "rare.jsonl",
+                    )
+
     def test_count_interesting_handles_missing_and_existing_files(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rare.jsonl"
