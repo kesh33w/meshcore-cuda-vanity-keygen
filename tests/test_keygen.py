@@ -66,6 +66,28 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(len(vanity.WATCH_REASONS), 12)
         self.assertFalse(any(reason.startswith("suffix-") for reason in vanity.WATCH_REASONS))
 
+    def test_rare_analysis_preserves_stronger_matches(self):
+        repeat_key = "a" * 13 + "1234567890abcdef" * 3 + "123"
+        repeat = vanity.interesting_matches(repeat_key)[0]
+        self.assertEqual((repeat.reason, repeat.length), ("repeat-prefix-13", 13))
+        self.assertAlmostEqual(repeat.rarity_bits, 13 * 4 - 3.807, places=3)
+
+        mirror_key = "123456789abcd" + "1" + "0" * 37 + "dcba987654321"
+        mirror = vanity.interesting_matches(mirror_key)[0]
+        self.assertEqual((mirror.reason, mirror.length), ("mirror-13", 13))
+
+        pi_key = vanity.PI_DIGITS[:15] + "a" * 49
+        pi = vanity.interesting_matches(pi_key)[0]
+        self.assertEqual((pi.reason, pi.length, pi.rarity_bits),
+                         ("prefix-pi-314159265358979", 15, 60.0))
+
+    def test_rare_analysis_keeps_all_matching_traits(self):
+        matches = vanity.interesting_matches("1" * 64)
+        self.assertEqual(matches[0].reason, "repeat-prefix-64")
+        self.assertEqual(
+            {match.kind for match in matches}, {"bookend", "mirror", "repeat-prefix"}
+        )
+
     def test_result_file_is_atomic_and_private(self):
         result = vanity.Result("11" * 32, "22" * 64, 1, 0.1, "test", "cpu")
         with tempfile.TemporaryDirectory() as directory:
@@ -180,16 +202,38 @@ class KeygenTests(unittest.TestCase):
     def test_every_interesting_discovery_is_appended(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rare.jsonl"
-            public = "11" * 32
+            public = "123456789a" + "b" * 44 + "123456789a"
             private = "22" * 64
-            with mock.patch.object(vanity, "interesting_rule", return_value=0), \
-                    mock.patch.object(vanity, "verify_expanded_key", return_value=True):
-                self.assertTrue(vanity.append_interesting(path, 0, public, private))
-                self.assertTrue(vanity.append_interesting(path, 0, public, private))
+            with mock.patch.object(vanity, "verify_expanded_key", return_value=True):
+                first = vanity.append_interesting(path, 0, public, private)
+                second = vanity.append_interesting(path, 0, public, private)
+                self.assertEqual(first["schema_version"], 2)
+                self.assertEqual(first["trigger"], "bookend-10")
+                self.assertEqual(second["match_length"], 10)
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(records), 2)
             self.assertEqual([record["reason"] for record in records], ["bookend-10"] * 2)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_rare_browser_loads_legacy_records_with_bounded_memory(self):
+        legacy_public = vanity.TEST_PUBLIC
+        records = [
+            {"found_at": f"2026-09-08T00:00:0{index}Z",
+             "reason": "suffix-deadbeef00", "public_key": legacy_public,
+             "private_key": f"{index + 1:x}" * 128}
+            for index in range(3)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rare.jsonl"
+            path.write_text(
+                "not json\n" + "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            loaded, skipped = vanity.load_interesting_records(path, limit=2)
+        self.assertEqual(skipped, 1)
+        self.assertEqual([record["found_at"] for record in loaded],
+                         ["2026-09-08T00:00:01Z", "2026-09-08T00:00:02Z"])
+        self.assertEqual((loaded[0]["match_length"], loaded[0]["rarity_bits"]), (10, 40.0))
 
     @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
     def test_cuda_result_is_independently_verified(self):

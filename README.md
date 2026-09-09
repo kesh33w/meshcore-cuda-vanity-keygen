@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.2.1**. Generated identities have been validated
+The current release is **v1.3.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -123,8 +123,11 @@ extra option is required and it does not interrupt the requested search. When
 an incidental rare match appears, its public/private relationship, rare rule,
 and MeshCore validity are independently verified on the CPU and it is
 immediately appended to `results/rare-keys.jsonl`. The GUI shows a live count,
-the latest rule matched, and a public-key preview. Incidental collection is a
-CUDA feature; the slower CPU fallback only searches for the requested pattern.
+the latest rule matched, and a public-key preview. Its **Rare keys…** browser can
+filter and sort the saved history by date, match, length, rarity, or public key.
+Private keys remain masked and are independently verified before reveal, copy,
+or owner-only export. Incidental collection is a CUDA feature; the slower CPU
+fallback only searches for the requested pattern.
 
 The built-in rules are deliberately much harder than four-character vanity
 patterns. Every individual pattern constrains ten hexadecimal characters:
@@ -150,8 +153,16 @@ find none.
 Each JSONL record keeps the matching pair together:
 
 ```json
-{"found_at":"2026-09-08T12:34:56Z","reason":"prefix-deadbeef00","public_key":"...","private_key":"...","backend":"cuda","engine":"optimized"}
+{"schema_version":2,"found_at":"2026-09-08T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized"}
 ```
+
+The ten-character GPU rules remain the collection threshold, but CPU analysis
+preserves stronger properties of a retained key. For example, a key beginning
+with 13 identical characters is labeled `repeat-prefix-13`, and a pi prefix
+continuing for 15 digits records all 15 rather than being flattened to ten.
+When one key has multiple interesting traits, the strongest becomes `reason`
+and every trait is retained under `matches`. Rarity is expressed as equivalent
+random-search bits, making unlike patterns sortable on one scale.
 
 The file is created with owner-only permissions (`0600`) when the search starts;
 an empty file means no rare key has been found. A source checkout stores it
@@ -164,8 +175,12 @@ File locking prevents concurrent searches from corrupting or interleaving
 records. Collection stops when the requested key is found or the search is
 cancelled; rare keys already written remain saved. At the measured rate and
 current criteria, continuous searching averages about 1,700 new records per
-day, or roughly 0.5 MB of JSONL data. Upgrading does not delete legacy suffix
-records created by v1.0.x, but new suffix matches are no longer collected.
+day. The GUI keeps its live count in memory and the browser bounds memory use to
+the newest 10,000 valid records. Upgrading does not rewrite or delete legacy
+records; their basic rarity metadata is inferred when displayed. Legacy suffix
+records created by v1.0.x remain visible, but new suffix matches are no longer
+collected. Version-2 records are larger than the original minimal records, so
+storage growth depends on how many traits each key matches.
 
 The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
 `THIRD_PARTY_NOTICES.md`.

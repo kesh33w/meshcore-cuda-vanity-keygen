@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 1.3.0 — 2026-09-08
+
+- Preserve the strongest observed length for repeated prefixes, mirrors, pi
+  prefixes, and other overlapping rare traits instead of flattening every find
+  to its ten-character trigger category.
+- Add versioned rare-log records with all matching traits, match length, rarity
+  in bits, and estimated mean work while retaining legacy JSONL compatibility.
+- Add a GUI rare-key browser with filtering, sortable rarity columns, masked
+  private keys, verification before sensitive actions, and secure export.
+- Keep the live rare-key count in memory during a search instead of rescanning
+  the complete JSONL history after every discovery.
+- Bound the browser to the newest 10,000 valid records and report malformed
+  lines without allowing them to break the rest of the history.
+
 ## 1.2.1 — 2026-09-08
 
 - Fix a GUI cancellation race that could misreport the CUDA startup banner as

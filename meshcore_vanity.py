@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import ctypes
 import ctypes.util
 import fcntl
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -32,6 +34,13 @@ DEFAULT_RESULTS_DIR = Path(
 DEFAULT_WATCH_PATH = DEFAULT_RESULTS_DIR / "rare-keys.jsonl"
 REFERENCE_CUDA_RATE = 880_000_000.0
 ICON_PATH = APP_DIR / "assets" / "meshcore-vanity-keygen.png"
+RARE_LOG_SCHEMA = 2
+RARE_BROWSER_LIMIT = 10_000
+WATCH_WORDS = (
+    "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
+    "babecafe00", "f00df00d00", "1337133713", "fadefade00",
+)
+PI_DIGITS = "3141592653589793238462643383279502884197169399375105820974944592"
 
 
 class Sodium:
@@ -138,6 +147,15 @@ class Result:
     match: str
     backend: str = "cpu"
     engine: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RareMatch:
+    reason: str
+    kind: str
+    length: int
+    rarity_bits: float
+    mean_attempts: str
 
 
 def valid_pattern(value: str, label: str) -> str:
@@ -346,11 +364,11 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 try:
                     _, rule, public_hex, private_hex = line.strip().split()
                     rule_number = int(rule)
-                    appended = append_interesting(
+                    record = append_interesting(
                         watch_path, rule_number, public_hex, private_hex, engine
                     )
-                    if appended and watch_update:
-                        watch_update(rule_number, WATCH_REASONS[rule_number], public_hex, watch_path)
+                    if watch_update:
+                        watch_update(rule_number, str(record["reason"]), public_hex, watch_path)
                 except (ValueError, RuntimeError) as error:
                     raise RuntimeError(str(error)) from error
             else:
@@ -476,7 +494,7 @@ def initialize_watch_file(path: Path) -> None:
 
 WATCH_REASONS = (
     "bookend-10", "mirror-10", "repeat-prefix-10",
-    *(f"prefix-{word}" for word in ("cafecafe00", "beefbeef00", "deadbeef00", "facebabe00", "babecafe00", "f00df00d00", "1337133713", "fadefade00")),
+    *(f"prefix-{word}" for word in WATCH_WORDS),
     "prefix-pi-3141592653",
 )
 
@@ -491,11 +509,7 @@ def interesting_rule(public_hex: str) -> int:
         return 1
     if public_hex[:10] == public_hex[0] * 10:
         return 2
-    words = (
-        "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
-        "babecafe00", "f00df00d00", "1337133713", "fadefade00",
-    )
-    for index, word in enumerate(words):
+    for index, word in enumerate(WATCH_WORDS):
         if public_hex.startswith(word):
             return 3 + index
     if public_hex.startswith("3141592653"):
@@ -503,8 +517,128 @@ def interesting_rule(public_hex: str) -> int:
     return -1
 
 
+def make_rare_match(reason: str, kind: str, length: int,
+                    alternatives: int = 1) -> RareMatch:
+    attempts = (16 ** length + alternatives - 1) // alternatives
+    rarity_bits = length * 4.0 - math.log2(alternatives)
+    return RareMatch(reason, kind, length, round(rarity_bits, 3), str(attempts))
+
+
+def interesting_matches(public_hex: str) -> list[RareMatch]:
+    """Describe every recognized rare property, strongest property first."""
+    if len(public_hex) != 64 or not re.fullmatch(r"[0-9a-f]{64}", public_hex):
+        return []
+    matches_found: list[RareMatch] = []
+
+    # Same-order bookends are not nested as their width changes, so inspect all
+    # meaningful widths and retain the strongest one that this key satisfies.
+    bookend_lengths = [
+        length for length in range(10, 33)
+        if public_hex[:length] == public_hex[-length:]
+    ]
+    if bookend_lengths:
+        length = max(bookend_lengths)
+        matches_found.append(make_rare_match(f"bookend-{length}", "bookend", length))
+
+    mirror_length = 0
+    for index in range(32):
+        if public_hex[index] != public_hex[63 - index]:
+            break
+        mirror_length += 1
+    if mirror_length >= 10:
+        matches_found.append(make_rare_match(
+            f"mirror-{mirror_length}", "mirror", mirror_length
+        ))
+
+    repeat_length = 1
+    while repeat_length < len(public_hex) and public_hex[repeat_length] == public_hex[0]:
+        repeat_length += 1
+    if repeat_length >= 10 and public_hex[0] not in "0f":
+        matches_found.append(make_rare_match(
+            f"repeat-prefix-{repeat_length}", "repeat-prefix", repeat_length, 14
+        ))
+
+    for word in WATCH_WORDS:
+        if public_hex.startswith(word):
+            matches_found.append(make_rare_match(f"prefix-{word}", "phrase-prefix", 10))
+
+    pi_length = 0
+    while (pi_length < len(public_hex) and pi_length < len(PI_DIGITS)
+           and public_hex[pi_length] == PI_DIGITS[pi_length]):
+        pi_length += 1
+    if pi_length >= 10:
+        matches_found.append(make_rare_match(
+            f"prefix-pi-{PI_DIGITS[:pi_length]}", "pi-prefix", pi_length
+        ))
+
+    return sorted(matches_found, key=lambda match: match.rarity_bits, reverse=True)
+
+
+def infer_legacy_rarity(record: dict[str, object]) -> tuple[int, float]:
+    """Infer basic sortable metadata for records written by older releases."""
+    reason = str(record.get("reason", ""))
+    numbered = re.fullmatch(r"(?:bookend|mirror|repeat-prefix)-(\d+)", reason)
+    if numbered:
+        length = int(numbered.group(1))
+        alternatives = 14 if reason.startswith("repeat-prefix-") else 1
+        return length, round(length * 4.0 - math.log2(alternatives), 3)
+    for marker in ("prefix-pi-", "prefix-", "suffix-"):
+        if reason.startswith(marker):
+            length = len(reason.removeprefix(marker))
+            return length, float(length * 4)
+    return 0, 0.0
+
+
+def normalize_interesting_record(record: object) -> Optional[dict[str, object]]:
+    """Validate a log record and add display metadata without exposing secrets."""
+    if not isinstance(record, dict):
+        return None
+    public_hex = record.get("public_key")
+    private_hex = record.get("private_key")
+    if (not isinstance(public_hex, str) or not isinstance(private_hex, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", public_hex)
+            or not re.fullmatch(r"[0-9a-f]{128}", private_hex)):
+        return None
+    normalized = dict(record)
+    analyzed = interesting_matches(public_hex)
+    if analyzed:
+        primary = analyzed[0]
+        normalized["reason"] = primary.reason
+        normalized["match_length"] = primary.length
+        normalized["rarity_bits"] = primary.rarity_bits
+        normalized["matches"] = [asdict(match) for match in analyzed]
+    else:
+        length, rarity_bits = infer_legacy_rarity(normalized)
+        normalized.setdefault("match_length", length)
+        normalized.setdefault("rarity_bits", rarity_bits)
+    return normalized
+
+
+def load_interesting_records(path: Path, limit: int = RARE_BROWSER_LIMIT
+                             ) -> tuple[list[dict[str, object]], int]:
+    """Load the most recent valid records with bounded memory use."""
+    records: deque[dict[str, object]] = deque(maxlen=max(1, limit))
+    skipped = 0
+    try:
+        with path.open(encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                try:
+                    normalized = normalize_interesting_record(json.loads(line))
+                except json.JSONDecodeError:
+                    normalized = None
+                if normalized is None:
+                    skipped += 1
+                else:
+                    records.append(normalized)
+    except FileNotFoundError:
+        pass
+    return list(records), skipped
+
+
 def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
-                       engine: str = "optimized") -> bool:
+                       engine: str = "optimized") -> dict[str, object]:
     private = bytes.fromhex(private_hex)
     public = bytes.fromhex(public_hex)
     if (rule < 0 or rule >= len(WATCH_REASONS) or interesting_rule(public_hex) != rule
@@ -512,11 +646,21 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
             or public[0] in (0, 255)
             or not verify_expanded_key(private, public)):
         raise RuntimeError("An incidental CUDA result failed CPU verification")
+    matches_found = interesting_matches(public_hex)
+    if not matches_found:
+        raise RuntimeError("An incidental CUDA result failed rarity analysis")
+    primary = matches_found[0]
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = secure_open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
     record = {
+        "schema_version": RARE_LOG_SCHEMA,
         "found_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "reason": WATCH_REASONS[rule],
+        "trigger": WATCH_REASONS[rule],
+        "reason": primary.reason,
+        "match_length": primary.length,
+        "rarity_bits": primary.rarity_bits,
+        "mean_attempts": primary.mean_attempts,
+        "matches": [asdict(match) for match in matches_found],
         "public_key": public_hex,
         "private_key": private_hex,
         "backend": "cuda",
@@ -527,7 +671,7 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
         file.write(json.dumps(record, separators=(",", ":")) + "\n")
         file.flush()
         os.fsync(file.fileno())
-    return True
+    return record
 
 
 TEST_PRIVATE = bytes.fromhex(
@@ -619,7 +763,8 @@ def run_gui() -> int:
     ttk.Label(frame, text=diagnostic_text).grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 3))
     status = tk.StringVar(value="Ready")
     ttk.Label(frame, textvariable=status).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
-    incidental = tk.StringVar(value=f"Saved rare incidental keys: {count_interesting(DEFAULT_WATCH_PATH)}")
+    initial_rare_count = count_interesting(DEFAULT_WATCH_PATH)
+    incidental = tk.StringVar(value=f"Saved rare incidental keys: {initial_rare_count}")
     ttk.Label(frame, textvariable=incidental).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 3))
     output = tk.Text(frame, width=86, height=10, state="disabled", wrap="word")
     output.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=5)
@@ -628,6 +773,7 @@ def run_gui() -> int:
         "result": None, "cancel": threading.Event(), "searching": False,
         "process": None, "closing": False, "saved_path": None,
         "reveal_private": False, "observed_rate": None,
+        "rare_count": initial_rare_count,
     }
 
     def show(text: str) -> None:
@@ -718,7 +864,8 @@ def run_gui() -> int:
             messagebox.showerror("Invalid results folder", str(error))
             return
         watch_path = result_directory / "rare-keys.jsonl"
-        incidental.set(f"Saved rare incidental keys: {count_interesting(watch_path)}")
+        state["rare_count"] = count_interesting(watch_path)
+        incidental.set(f"Saved rare incidental keys: {state['rare_count']}")
         button.configure(state="disabled")
         cancel_button.configure(state="normal")
         activity.start(12)
@@ -738,8 +885,9 @@ def run_gui() -> int:
 
         def watch_progress(rule: int, reason: str, public_key: str, path: Path) -> None:
             def display() -> None:
+                state["rare_count"] = int(state.get("rare_count", 0)) + 1
                 incidental.set(
-                    f"Saved rare incidental keys: {count_interesting(path)} | latest: {reason} | "
+                    f"Saved rare incidental keys: {state['rare_count']} | latest: {reason} | "
                     f"{public_key[:16]}… | saved: {path}"
                 )
             if not state["closing"]:
@@ -876,6 +1024,250 @@ def run_gui() -> int:
         except (OSError, ValueError) as error:
             messagebox.showerror("Cannot open results", str(error))
 
+    def open_rare_browser() -> None:
+        try:
+            path = selected_results_directory() / "rare-keys.jsonl"
+        except ValueError as error:
+            messagebox.showerror("Cannot open rare keys", str(error))
+            return
+
+        browser = tk.Toplevel(root)
+        browser.title("Saved Rare MeshCore Keys")
+        browser.geometry("1080x650")
+        browser.minsize(820, 500)
+        browser.columnconfigure(0, weight=1)
+        browser.rowconfigure(1, weight=1)
+        if ICON_PATH.is_file():
+            try:
+                browser.iconphoto(True, window_icon)
+            except (tk.TclError, UnboundLocalError):
+                pass
+
+        filter_value = tk.StringVar()
+        browser_status = tk.StringVar(value="Loading rare keys…")
+        toolbar = ttk.Frame(browser, padding=(10, 10, 10, 5))
+        toolbar.grid(row=0, column=0, sticky="ew")
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Filter").grid(row=0, column=0, padx=(0, 7))
+        ttk.Entry(toolbar, textvariable=filter_value).grid(row=0, column=1, sticky="ew")
+        ttk.Label(toolbar, textvariable=browser_status).grid(row=0, column=2, padx=(12, 0))
+
+        table_frame = ttk.Frame(browser, padding=(10, 5))
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        columns = ("found", "reason", "length", "rarity", "public")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        tree.grid(row=0, column=0, sticky="nsew")
+        vertical = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        headings = {
+            "found": "Found (UTC)", "reason": "Strongest match", "length": "Length",
+            "rarity": "Rarity", "public": "Public key",
+        }
+        widths = {"found": 165, "reason": 220, "length": 65, "rarity": 90, "public": 440}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], minwidth=55, stretch=column == "public")
+
+        detail = tk.Text(browser, height=7, state="disabled", wrap="char")
+        detail.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 5))
+        browser_state: dict[str, object] = {
+            "records": [], "visible": {}, "sort": "found", "reverse": True,
+            "private_visible": False, "skipped": 0,
+        }
+
+        def selected_record(require_valid_private: bool = False) -> Optional[dict[str, object]]:
+            selection = tree.selection()
+            visible = browser_state["visible"]
+            assert isinstance(visible, dict)
+            record = visible.get(selection[0]) if selection else None
+            if not isinstance(record, dict):
+                messagebox.showinfo("No selection", "Select a rare key first.", parent=browser)
+                return None
+            if require_valid_private:
+                private_hex = str(record["private_key"])
+                public_hex = str(record["public_key"])
+                if not verify_expanded_key(bytes.fromhex(private_hex), bytes.fromhex(public_hex)):
+                    messagebox.showerror(
+                        "Verification failed",
+                        "This saved record did not pass independent key verification.",
+                        parent=browser,
+                    )
+                    return None
+            return record
+
+        def render_selected(*_args: object) -> None:
+            selection = tree.selection()
+            visible = browser_state["visible"]
+            assert isinstance(visible, dict)
+            record = visible.get(selection[0]) if selection else None
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            if isinstance(record, dict):
+                private = (str(record["private_key"])
+                           if browser_state["private_visible"] else "•" * 32 + "  (hidden)")
+                match_items = record.get("matches", [])
+                match_names = [
+                    str(item.get("reason")) for item in match_items
+                    if isinstance(item, dict) and item.get("reason")
+                ]
+                detail.insert(
+                    "1.0",
+                    f"Public key: {record['public_key']}\n"
+                    f"Private key: {private}\n"
+                    f"Rarity: {float(record.get('rarity_bits', 0)):.1f} bits"
+                    f"  •  Match length: {record.get('match_length', 0)}"
+                    f"  •  All matches: {', '.join(match_names) or record.get('reason', 'unknown')}",
+                )
+            detail.configure(state="disabled")
+
+        def refresh_view(*_args: object) -> None:
+            query = filter_value.get().strip().lower()
+            records = browser_state["records"]
+            assert isinstance(records, list)
+            filtered = [
+                record for record in records
+                if not query or query in " ".join((
+                    str(record.get("found_at", "")), str(record.get("reason", "")),
+                    str(record.get("public_key", "")),
+                )).lower()
+            ]
+            sort_column = str(browser_state["sort"])
+            if sort_column == "length":
+                key = lambda record: int(record.get("match_length", 0))
+            elif sort_column == "rarity":
+                key = lambda record: float(record.get("rarity_bits", 0))
+            elif sort_column == "public":
+                key = lambda record: str(record.get("public_key", ""))
+            elif sort_column == "reason":
+                key = lambda record: str(record.get("reason", ""))
+            else:
+                key = lambda record: str(record.get("found_at", ""))
+            filtered.sort(key=key, reverse=bool(browser_state["reverse"]))
+            tree.delete(*tree.get_children())
+            visible: dict[str, dict[str, object]] = {}
+            for index, record in enumerate(filtered):
+                item = f"record-{index}"
+                visible[item] = record
+                found_at = str(record.get("found_at", "")).replace("T", " ").replace("Z", "")
+                rarity = f"{float(record.get('rarity_bits', 0)):.1f} bits"
+                tree.insert("", "end", iid=item, values=(
+                    found_at, record.get("reason", "unknown"),
+                    record.get("match_length", 0), rarity, record.get("public_key", ""),
+                ))
+            browser_state["visible"] = visible
+            browser_state["private_visible"] = False
+            skipped = int(browser_state["skipped"])
+            note = f" • {skipped} malformed skipped" if skipped else ""
+            limited = " • showing newest 10,000" if len(records) == RARE_BROWSER_LIMIT else ""
+            browser_status.set(f"{len(filtered):,} shown / {len(records):,} loaded{limited}{note}")
+            render_selected()
+
+        def sort_by(column: str) -> None:
+            if browser_state["sort"] == column:
+                browser_state["reverse"] = not bool(browser_state["reverse"])
+            else:
+                browser_state["sort"] = column
+                browser_state["reverse"] = column in ("found", "length", "rarity")
+            refresh_view()
+
+        for column in columns:
+            tree.heading(column, text=headings[column], command=lambda value=column: sort_by(value))
+
+        def reload_records() -> None:
+            records, skipped = load_interesting_records(path)
+            browser_state["records"] = records
+            browser_state["skipped"] = skipped
+            refresh_view()
+
+        def copy_selected(private: bool) -> None:
+            record = selected_record(require_valid_private=private)
+            if record is None:
+                return
+            if private and not messagebox.askyesno(
+                    "Copy private key?",
+                    "The private key grants control of this identity. Copy it to the clipboard?",
+                    parent=browser):
+                return
+            value = str(record["private_key"] if private else record["public_key"])
+            browser.clipboard_clear()
+            browser.clipboard_append(value)
+            browser_status.set("Private key copied; clipboard clears in 60 seconds"
+                               if private else "Public key copied")
+            if private:
+                def clear_if_unchanged() -> None:
+                    try:
+                        if browser.clipboard_get() == value:
+                            browser.clipboard_clear()
+                            browser_status.set("Private key cleared from clipboard")
+                    except tk.TclError:
+                        pass
+                browser.after(60_000, clear_if_unchanged)
+
+        def toggle_rare_private() -> None:
+            record = selected_record(require_valid_private=True)
+            if record is None:
+                return
+            showing = bool(browser_state["private_visible"])
+            if not showing and not messagebox.askyesno(
+                    "Reveal private key?",
+                    "Anyone who sees this private key can control the identity. Reveal it?",
+                    parent=browser):
+                return
+            browser_state["private_visible"] = not showing
+            rare_reveal.configure(text="Hide private" if not showing else "Reveal private")
+            render_selected()
+
+        def export_selected() -> None:
+            record = selected_record(require_valid_private=True)
+            if record is None:
+                return
+            filename = filedialog.asksaveasfilename(
+                parent=browser, defaultextension=".json", initialdir=str(path.parent),
+                initialfile=f"meshcore-rare-identity-{str(record['public_key'])[:12]}.json",
+            )
+            if not filename:
+                return
+            destination = Path(filename)
+            overwrite = False
+            if destination.exists() or destination.is_symlink():
+                overwrite = messagebox.askyesno(
+                    "Replace file?", f"Replace the existing file?\n\n{destination}", parent=browser
+                )
+                if not overwrite:
+                    return
+            try:
+                atomic_write_json(record, destination, overwrite=overwrite)
+                messagebox.showinfo(
+                    "Saved", "Rare identity exported with owner-only permissions.", parent=browser
+                )
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Export failed", str(error), parent=browser)
+
+        tree.bind("<<TreeviewSelect>>", lambda _event: (
+            browser_state.__setitem__("private_visible", False),
+            rare_reveal.configure(text="Reveal private"),
+            render_selected(),
+        ))
+        filter_value.trace_add("write", refresh_view)
+        browser_controls = ttk.Frame(browser, padding=(10, 5, 10, 10))
+        browser_controls.grid(row=3, column=0, sticky="ew")
+        ttk.Button(browser_controls, text="Refresh", command=reload_records).pack(side="left")
+        ttk.Button(browser_controls, text="Copy public",
+                   command=lambda: copy_selected(False)).pack(side="left", padx=6)
+        ttk.Button(browser_controls, text="Copy private",
+                   command=lambda: copy_selected(True)).pack(side="left")
+        rare_reveal = ttk.Button(browser_controls, text="Reveal private", command=toggle_rare_private)
+        rare_reveal.pack(side="left", padx=6)
+        ttk.Button(browser_controls, text="Export selected…",
+                   command=export_selected).pack(side="left")
+        ttk.Button(browser_controls, text="Close", command=browser.destroy).pack(side="right")
+        reload_records()
+
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
     activity.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
@@ -885,6 +1277,7 @@ def run_gui() -> int:
     cancel_button = ttk.Button(controls, text="Cancel", command=cancel_search, state="disabled")
     cancel_button.pack(side="left", padx=7)
     ttk.Button(controls, text="Open results", command=open_results).pack(side="left")
+    ttk.Button(controls, text="Rare keys…", command=open_rare_browser).pack(side="left", padx=7)
     save_button = ttk.Button(controls, text="Save a copy…", command=save_copy, state="disabled")
     save_button.pack(side="right")
     copy_private_button = ttk.Button(controls, text="Copy private", command=lambda: copy_value(True), state="disabled")
