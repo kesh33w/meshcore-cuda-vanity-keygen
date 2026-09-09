@@ -160,7 +160,7 @@ class KeygenTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "invalid result"):
                     vanity.search_cuda("cafe", "", "", watch_path=Path(directory) / "rare.jsonl")
 
-    def test_cuda_gui_termination_is_reported_as_cancellation(self):
+    def test_cuda_collector_termination_is_reported_as_cancellation(self):
         cancel = threading.Event()
 
         class TerminatedProcess:
@@ -185,10 +185,23 @@ class KeygenTests(unittest.TestCase):
             executable = Path(directory) / "engine"
             executable.touch()
             with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
-                    mock.patch.object(vanity.subprocess, "Popen", return_value=TerminatedProcess()):
+                    mock.patch.object(vanity.subprocess, "Popen",
+                                      return_value=TerminatedProcess()) as popen:
                 with self.assertRaises(vanity.SearchCancelled):
                     vanity.search_cuda(
-                        "cafe", "", "", cancel=cancel,
+                        "", "", "", cancel=cancel, collect_only=True,
+                        watch_path=Path(directory) / "rare.jsonl",
+                    )
+            self.assertIn("--collect-only", popen.call_args.args[0])
+
+    def test_cuda_collector_rejects_vanity_constraints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch()
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable):
+                with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                    vanity.search_cuda(
+                        "cafe", "", "", collect_only=True,
                         watch_path=Path(directory) / "rare.jsonl",
                     )
 
@@ -285,7 +298,7 @@ class KeygenTests(unittest.TestCase):
                 ))
 
     @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
-    def test_cuda_search_can_be_cancelled_without_orphaning_process(self):
+    def test_cuda_collector_can_be_cancelled_without_orphaning_process(self):
         if not vanity.cuda_available():
             self.skipTest("CUDA engine/device unavailable")
         cancel = threading.Event()
@@ -295,7 +308,7 @@ class KeygenTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 with self.assertRaises(vanity.SearchCancelled):
-                    vanity.search_cuda("123456789abc", "", "", cancel=cancel,
+                    vanity.search_cuda("", "", "", cancel=cancel, collect_only=True,
                                        watch_path=Path(directory) / "rare.jsonl",
                                        process_update=lambda process: child.append(process))
         finally:

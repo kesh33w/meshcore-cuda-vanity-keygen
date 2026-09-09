@@ -47,6 +47,7 @@ __constant__ char gpu_contains[kMaxPattern + 1];
 __constant__ int gpu_prefix_len;
 __constant__ int gpu_suffix_len;
 __constant__ int gpu_contains_len;
+__constant__ int gpu_collect_only;
 __constant__ char gpu_watch_words[8][11] = {
     "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
     "babecafe00", "f00df00d00", "1337133713", "fadefade00"
@@ -149,7 +150,8 @@ __device__ bool inspect_candidate(const unsigned char *private_key,
             for (int i = 0; i < 64; ++i) watch_batch->results[slot].private_key[i] = private_key[i];
         }
     }
-    if (key_matches(public_key) && atomicCAS(&result->found, 0, 1) == 0) {
+    if (!gpu_collect_only && key_matches(public_key)
+            && atomicCAS(&result->found, 0, 1) == 0) {
         for (int i = 0; i < 32; ++i) result->public_key[i] = public_key[i];
         for (int i = 0; i < 64; ++i) result->private_key[i] = private_key[i];
         __threadfence_system();
@@ -305,7 +307,7 @@ void random_bytes(unsigned char *destination, size_t length) {
 }
 
 void usage(const char *program) {
-    std::fprintf(stderr, "Usage: %s [--engine optimized|baseline] [--device N] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
+    std::fprintf(stderr, "Usage: %s [--engine optimized|baseline] [--device N] [--collect-only] [--prefix HEX] [--suffix HEX] [--contains HEX]\n", program);
 }
 }  // namespace
 
@@ -313,10 +315,15 @@ int main(int argc, char **argv) {
     std::string prefix, suffix, contains;
     std::string engine = "optimized";
     int selected_device = 0;
-    for (int i = 1; i < argc; ++i) {
-        if (i + 1 >= argc) { usage(argv[0]); return 2; }
-        std::string option = argv[i];
-        std::string value = argv[++i];
+    bool collect_only = false;
+    for (int i = 1; i < argc;) {
+        std::string option = argv[i++];
+        if (option == "--collect-only") {
+            collect_only = true;
+            continue;
+        }
+        if (i >= argc) { usage(argv[0]); return 2; }
+        std::string value = argv[i++];
         if (option == "--device") {
             char *end = nullptr;
             long parsed = std::strtol(value.c_str(), &end, 10);
@@ -336,7 +343,8 @@ int main(int argc, char **argv) {
         else if (option == "--contains") contains = value;
         else { usage(argv[0]); return 2; }
     }
-    if ((prefix.empty() && suffix.empty() && contains.empty()) ||
+    if ((!collect_only && prefix.empty() && suffix.empty() && contains.empty()) ||
+        (collect_only && (!prefix.empty() || !suffix.empty() || !contains.empty())) ||
         !valid_hex(prefix) || !valid_hex(suffix) || !valid_hex(contains)) {
         usage(argv[0]);
         return 2;
@@ -365,6 +373,9 @@ int main(int argc, char **argv) {
     cuda_check(cudaMemcpyToSymbol(gpu_prefix_len, &prefix_len, sizeof(int)), "copy prefix length");
     cuda_check(cudaMemcpyToSymbol(gpu_suffix_len, &suffix_len, sizeof(int)), "copy suffix length");
     cuda_check(cudaMemcpyToSymbol(gpu_contains_len, &contains_len, sizeof(int)), "copy contains length");
+    int collect_only_value = collect_only ? 1 : 0;
+    cuda_check(cudaMemcpyToSymbol(gpu_collect_only, &collect_only_value, sizeof(int)),
+               "copy collector mode");
 
     int blocks = properties.multiProcessorCount * kBlocksPerSm;
     unsigned char *device_seed = nullptr;
@@ -375,8 +386,9 @@ int main(int argc, char **argv) {
     cuda_check(cudaMalloc(&device_watch, sizeof(WatchBatch)), "cudaMalloc watch results");
     unsigned long long attempts = 0;
     auto started = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "GPU %d: %s, engine %s, %d blocks x %d threads\n",
-                 selected_device, properties.name, engine.c_str(), blocks, kThreads);
+    std::fprintf(stderr, "GPU %d: %s, engine %s, mode %s, %d blocks x %d threads\n",
+                 selected_device, properties.name, engine.c_str(),
+                 collect_only ? "collector" : "vanity", blocks, kThreads);
 
     for (;;) {
         std::array<unsigned char, 32> seed{};

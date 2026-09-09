@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## 1.4.0 — 2026-09-08
+
+- Add a native CUDA continuous collector that searches only for built-in rare
+  keys and runs until cancelled without requiring a fake vanity target.
+- Add a **Continuous rare collector** GUI mode with live attempts, runtime,
+  throughput, session discovery count, and best-session rarity.
+- Add the `--collect-rare` CLI mode with clean `Ctrl+C` shutdown and non-secret
+  progress output.
+- Disable incompatible vanity inputs while GUI collection is selected and
+  reject conflicting collector/vanity CLI options.
+- Add live-GPU coverage for collector operation, cancellation, and child-process
+  cleanup.
+
 ## 1.3.1 — 2026-09-08
 
 - Make the rare-key table row height follow the active desktop font metrics so

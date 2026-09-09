@@ -328,6 +328,7 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 watch_update: Optional[Callable[[int, str, str, Path], None]] = None,
                 device: int = 0,
                 engine: str = "optimized",
+                collect_only: bool = False,
                 process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
@@ -337,6 +338,10 @@ def search_cuda(prefix: str, suffix: str, contains: str,
     if engine not in ("optimized", "baseline"):
         raise ValueError("CUDA engine must be optimized or baseline")
     command = [str(executable), "--device", str(device), "--engine", engine]
+    if collect_only:
+        if any((prefix, suffix, contains)):
+            raise ValueError("Collector mode cannot be combined with a vanity pattern")
+        command.append("--collect-only")
     for option, value in (("--prefix", prefix), ("--suffix", suffix), ("--contains", contains)):
         if value:
             command.extend((option, value))
@@ -401,6 +406,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
     if return_code:
         detail = errors[-1] if errors else f"status {return_code}"
         raise RuntimeError(f"CUDA engine failed: {detail}")
+    if collect_only:
+        raise RuntimeError("CUDA collector stopped unexpectedly")
     try:
         payload = json.loads(stdout.strip().splitlines()[-1])
         public_hex = payload["public_key"]
@@ -716,10 +723,12 @@ def run_gui() -> int:
     fields: dict[str, tk.StringVar] = {
         name: tk.StringVar() for name in ("prefix", "suffix", "contains")
     }
+    field_entries: dict[str, ttk.Entry] = {}
     for row, (name, value) in enumerate(fields.items()):
         ttk.Label(frame, text=f"{name.title()} (hex)").grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(frame, width=48, textvariable=value).grid(row=row, column=1, columnspan=2,
-                                                            sticky="ew", pady=3)
+        entry = ttk.Entry(frame, width=48, textvariable=value)
+        entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=3)
+        field_entries[name] = entry
 
     estimate = tk.StringVar(value="Enter a hexadecimal pattern to see estimated difficulty.")
     ttk.Label(frame, textvariable=estimate).grid(row=3, column=0, columnspan=3, sticky="w", pady=(3, 8))
@@ -743,6 +752,20 @@ def run_gui() -> int:
     ttk.Label(frame, text="CUDA engine").grid(row=6, column=0, sticky="w", pady=3)
     ttk.Combobox(frame, width=14, state="readonly", textvariable=cuda_engine,
                  values=("optimized", "baseline")).grid(row=6, column=1, sticky="w")
+    collector_mode = tk.BooleanVar(value=False)
+
+    def toggle_collector_mode() -> None:
+        collecting = collector_mode.get()
+        for entry in field_entries.values():
+            entry.configure(state="disabled" if collecting else "normal")
+        button.configure(text="Start rare collector" if collecting else "Find vanity key")
+        refresh_estimate()
+
+    collector_checkbox = ttk.Checkbutton(
+        frame, text="Continuous rare collector", variable=collector_mode,
+        command=toggle_collector_mode,
+    )
+    collector_checkbox.grid(row=6, column=2, sticky="e")
 
     output_directory = tk.StringVar(value=str(DEFAULT_RESULTS_DIR))
     ttk.Label(frame, text="Results folder").grid(row=7, column=0, sticky="w", pady=3)
@@ -775,6 +798,8 @@ def run_gui() -> int:
         "process": None, "closing": False, "saved_path": None,
         "reveal_private": False, "observed_rate": None,
         "rare_count": initial_rare_count,
+        "collector_started": None, "collector_session_count": 0,
+        "collector_best_bits": 0.0, "collector_best_reason": None,
     }
 
     def show(text: str) -> None:
@@ -794,6 +819,9 @@ def run_gui() -> int:
 
     def refresh_estimate(*_args: object) -> None:
         try:
+            if collector_mode.get():
+                estimate.set("Continuous rare collection runs until cancelled; no vanity target is needed.")
+                return
             values = {name: valid_pattern(var.get(), name) for name, var in fields.items()}
             if not any(values.values()):
                 estimate.set("Enter a hexadecimal pattern to see estimated difficulty.")
@@ -836,11 +864,17 @@ def run_gui() -> int:
         save_button.configure(state=new_state)
 
     def start_search() -> None:
+        collecting = collector_mode.get()
         try:
             values = {name: valid_pattern(var.get(), name) for name, var in fields.items()}
-            if not any(values.values()):
+            if not collecting and not any(values.values()):
                 raise ValueError("Enter a prefix, suffix, or substring to search for")
-            validate_constraints(**values)
+            if collecting:
+                values = {"prefix": "", "suffix": "", "contains": ""}
+                if not cuda_available():
+                    raise ValueError("Continuous rare collection requires a working CUDA engine")
+            else:
+                validate_constraints(**values)
         except ValueError as error:
             messagebox.showerror("Invalid pattern", str(error))
             return
@@ -851,6 +885,10 @@ def run_gui() -> int:
         state["result"] = None
         state["saved_path"] = None
         state["reveal_private"] = False
+        state["collector_started"] = time.monotonic() if collecting else None
+        state["collector_session_count"] = 0
+        state["collector_best_bits"] = 0.0
+        state["collector_best_reason"] = None
         reveal_button.configure(text="Reveal private key")
         set_result_controls(False)
         worker_count = workers.get()
@@ -866,14 +904,24 @@ def run_gui() -> int:
             return
         watch_path = result_directory / "rare-keys.jsonl"
         state["rare_count"] = count_interesting(watch_path)
-        incidental.set(f"Saved rare incidental keys: {state['rare_count']}")
+        if collecting:
+            incidental.set(
+                f"Rare keys total: {state['rare_count']} | this session: 0 | best: none yet"
+            )
+        else:
+            incidental.set(f"Saved rare incidental keys: {state['rare_count']}")
         button.configure(state="disabled")
+        collector_checkbox.configure(state="disabled")
         cancel_button.configure(state="normal")
         activity.start(12)
-        status.set("Starting CUDA search…" if using_cuda else "Starting CPU search…")
-        if using_cuda:
+        if collecting:
+            status.set("Starting continuous rare collector…")
+            show("Continuous rare-key collection is active. It will run until you press Cancel.\nEvery verified discovery is saved immediately.")
+        elif using_cuda:
+            status.set("Starting CUDA search…")
             show("CUDA search is active. Longer patterns may take minutes or hours.\nRare incidental keys are being saved while you wait.")
         else:
+            status.set("Starting CPU search…")
             show("CPU fallback search is active. Automatic rare-key collection requires CUDA.")
 
         def progress(attempts: int, elapsed: float) -> None:
@@ -881,16 +929,36 @@ def run_gui() -> int:
                 rate = attempts / max(elapsed, .001)
                 if attempts:
                     state["observed_rate"] = rate
-                root.after(0, status.set, f"Searching: {attempts:,} keys, {rate:,.0f} keys/s")
+                label = "Collecting" if collecting else "Searching"
+                root.after(
+                    0, status.set,
+                    f"{label}: {attempts:,} keys, {rate:,.0f} keys/s, {format_duration(elapsed)}",
+                )
                 root.after(0, refresh_estimate)
 
         def watch_progress(rule: int, reason: str, public_key: str, path: Path) -> None:
             def display() -> None:
                 state["rare_count"] = int(state.get("rare_count", 0)) + 1
-                incidental.set(
-                    f"Saved rare incidental keys: {state['rare_count']} | latest: {reason} | "
-                    f"{public_key[:16]}… | saved: {path}"
-                )
+                if collecting:
+                    state["collector_session_count"] = int(
+                        state.get("collector_session_count", 0)
+                    ) + 1
+                    analyzed = interesting_matches(public_key)
+                    rarity_bits = analyzed[0].rarity_bits if analyzed else 0.0
+                    if rarity_bits > float(state.get("collector_best_bits", 0.0)):
+                        state["collector_best_bits"] = rarity_bits
+                        state["collector_best_reason"] = reason
+                    best = state.get("collector_best_reason") or "none yet"
+                    incidental.set(
+                        f"Rare keys total: {state['rare_count']} | this session: "
+                        f"{state['collector_session_count']} | best: {best} "
+                        f"({float(state['collector_best_bits']):.1f} bits)"
+                    )
+                else:
+                    incidental.set(
+                        f"Saved rare incidental keys: {state['rare_count']} | latest: {reason} | "
+                        f"{public_key[:16]}… | saved: {path}"
+                    )
             if not state["closing"]:
                 root.after(0, display)
 
@@ -904,6 +972,7 @@ def run_gui() -> int:
                                          watch_path=watch_path, watch_update=watch_progress,
                                          device=selected_device,
                                          engine=selected_engine,
+                                         collect_only=collecting,
                                          process_update=process_progress)
                 else:
                     result = search(**values, workers=worker_count, update=progress,
@@ -940,20 +1009,29 @@ def run_gui() -> int:
         render_result()
         set_result_controls(True)
         button.configure(state="normal")
+        collector_checkbox.configure(state="normal")
         cancel_button.configure(state="disabled")
 
     def stopped() -> None:
         state["searching"] = False
         activity.stop()
         status.set("Search cancelled")
-        show("Search cancelled. Interesting keys found before cancellation remain saved.")
+        if bool(state.get("collector_started")):
+            show(
+                f"Rare collector stopped. Saved {state['collector_session_count']} verified "
+                "keys during this session; all completed discoveries remain saved."
+            )
+        else:
+            show("Search cancelled. Interesting keys found before cancellation remain saved.")
         button.configure(state="normal")
+        collector_checkbox.configure(state="normal")
         cancel_button.configure(state="disabled")
 
     def failed(error_text: str) -> None:
         state["searching"] = False
         activity.stop()
         button.configure(state="normal")
+        collector_checkbox.configure(state="normal")
         cancel_button.configure(state="disabled")
         messagebox.showerror("Search failed", error_text)
 
@@ -1337,6 +1415,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="write result JSON with mode 0600")
     parser.add_argument("--watch-output", type=Path, default=DEFAULT_WATCH_PATH,
                         help="append incidental interesting keys here")
+    parser.add_argument("--collect-rare", action="store_true",
+                        help="continuously collect rare keys with CUDA until interrupted")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index (default: 0)")
     parser.add_argument("--cuda-engine", choices=("optimized", "baseline", "incremental"),
                         default="optimized", help="CUDA implementation (default: optimized)")
@@ -1359,22 +1439,66 @@ def main() -> int:
         return run_gui()
     try:
         prefix, suffix, contains = (valid_pattern(getattr(args, name), name) for name in ("prefix", "suffix", "contains"))
-        if not any((prefix, suffix, contains)):
+        if args.collect_rare and any((prefix, suffix, contains)):
+            raise ValueError("--collect-rare cannot be combined with a vanity pattern")
+        if not args.collect_rare and not any((prefix, suffix, contains)):
             raise ValueError("Specify --prefix, --suffix, or --contains (or use --gui)")
-        validate_constraints(prefix, suffix, contains)
+        if not args.collect_rare:
+            validate_constraints(prefix, suffix, contains)
         if args.workers < 1:
             raise ValueError("--workers must be at least 1")
         if args.device < 0:
             raise ValueError("--device must be zero or greater")
+        if args.collect_rare and args.backend == "cpu":
+            raise ValueError("--collect-rare requires the CUDA backend")
+        if args.collect_rare and (args.output or args.show_private or args.force):
+            raise ValueError("--output, --show-private, and --force do not apply to --collect-rare")
         if args.output and (args.output.exists() or args.output.is_symlink()) and not args.force:
             raise ValueError(f"output already exists; choose another path or add --force: {args.output}")
     except ValueError as error:
         parser.error(str(error))
-    use_cuda = args.backend == "cuda" or (args.backend == "auto" and cuda_available())
+    use_cuda = (args.collect_rare or args.backend == "cuda"
+                or (args.backend == "auto" and cuda_available()))
     if use_cuda:
         if not cuda_available():
             print("CUDA device or built engine unavailable; run 'make' and check nvidia-smi.", file=sys.stderr)
             return 2
+        if args.collect_rare:
+            session = {"count": 0, "best_bits": 0.0, "best": "none yet"}
+
+            def collector_progress(attempts: int, elapsed: float) -> None:
+                rate = attempts / max(elapsed, .001)
+                print(
+                    f"\rCollecting: {attempts:,} keys | {rate:,.0f} keys/s | "
+                    f"{format_duration(elapsed)} | saved this session: {session['count']} | "
+                    f"best: {session['best']}", end="", flush=True,
+                )
+
+            def collector_watch(_rule: int, reason: str, public_key: str, path: Path) -> None:
+                session["count"] = int(session["count"]) + 1
+                analyzed = interesting_matches(public_key)
+                rarity_bits = analyzed[0].rarity_bits if analyzed else 0.0
+                if rarity_bits > float(session["best_bits"]):
+                    session["best_bits"] = rarity_bits
+                    session["best"] = f"{reason} ({rarity_bits:.1f} bits)"
+                print(f"\nSaved {reason}; session total {session['count']} -> {path}")
+
+            print("Using CUDA continuous rare-key collector. Press Ctrl+C to stop.")
+            try:
+                search_cuda(
+                    "", "", "", update=collector_progress, watch_path=args.watch_output,
+                    watch_update=collector_watch, device=args.device,
+                    engine=args.cuda_engine, collect_only=True,
+                )
+            except KeyboardInterrupt:
+                print(
+                    f"\nCollector stopped. Saved {session['count']} verified rare keys "
+                    "during this session."
+                )
+                return 0
+            except RuntimeError as error:
+                print(f"\nCollector failed: {error}", file=sys.stderr)
+                return 2
         print("Using CUDA backend with independent CPU result verification.")
         result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output,
                              device=args.device, engine=args.cuda_engine)

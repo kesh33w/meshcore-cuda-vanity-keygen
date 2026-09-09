@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.3.1**. Generated identities have been validated
+The current release is **v1.4.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -114,6 +114,28 @@ roughly a 30× speedup. Approximate average search times at 880M/s are:
 
 These are probabilistic averages, not maximums. GPU model, cooling, power
 limits, and other workloads affect actual throughput.
+
+## Continuous rare-key collector
+
+Select **Continuous rare collector** in the GUI and click **Start rare
+collector** to collect built-in rare keys indefinitely without inventing an
+astronomically difficult vanity target. Pattern fields are disabled in this
+mode. The live display reports candidates tested, runtime, keys per second,
+discoveries during the current session, and the best session rarity. Press
+**Cancel** whenever you want to stop; every completed discovery has already
+been verified and saved.
+
+The equivalent command-line mode is:
+
+```bash
+meshcore-vanity-keygen --collect-rare
+```
+
+Use `Ctrl+C` for a clean stop. `--watch-output PATH`, `--device N`, and
+`--cuda-engine optimized|baseline` remain available. Collector mode requires
+CUDA and cannot be combined with a vanity prefix, suffix, or substring.
+Progress statistics and rare-match names appear in the terminal, but key
+material does not.
 
 ## Automatic rare-key collection
 
