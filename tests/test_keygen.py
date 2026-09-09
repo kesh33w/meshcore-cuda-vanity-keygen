@@ -4,7 +4,9 @@ import stat
 import tempfile
 import threading
 import unittest
+from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 import meshcore_vanity as vanity
 
@@ -48,15 +50,84 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(vanity.interesting_rule("1" * 64), 0)
         self.assertEqual(vanity.interesting_rule("not hex"), -1)
 
-    def test_result_file_is_private_even_if_it_already_exists(self):
+    def test_result_file_is_atomic_and_private(self):
         result = vanity.Result("11" * 32, "22" * 64, 1, 0.1, "test", "cpu")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "identity.json"
-            path.write_text("old", encoding="utf-8")
-            path.chmod(0o644)
             vanity.save_result(result, path)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(json.loads(path.read_text())["public_key"], "11" * 32)
+            self.assertFalse(list(Path(directory).glob(".*.tmp-*")))
+
+    def test_result_file_refuses_overwrite_without_explicit_permission(self):
+        result = vanity.Result("11" * 32, "22" * 64, 1, 0.1, "test", "cpu")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "identity.json"
+            path.write_text("original", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                vanity.save_result(result, path)
+            self.assertEqual(path.read_text(), "original")
+            vanity.save_result(result, path, overwrite=True)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(json.loads(path.read_text())["private_key"], "22" * 64)
+
+    def test_result_file_refuses_symlink(self):
+        result = vanity.Result("11" * 32, "22" * 64, 1, 0.1, "test", "cpu")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.json"
+            target.write_text("do not replace", encoding="utf-8")
+            link = root / "identity.json"
+            link.symlink_to(target)
+            with self.assertRaises(ValueError):
+                vanity.save_result(result, link, overwrite=True)
+            self.assertEqual(target.read_text(), "do not replace")
+
+    def test_difficulty_estimates(self):
+        self.assertEqual(vanity.estimate_attempts("cafe", "", ""), 16 ** 4)
+        self.assertEqual(vanity.estimate_attempts("cafe", "beef", ""), 16 ** 8)
+        # A four-nibble substring has 61 possible placements; this is an
+        # intentionally documented approximation because placements overlap.
+        self.assertAlmostEqual(vanity.estimate_attempts("", "", "cafe"), 16 ** 4 / 61)
+        self.assertEqual(vanity.format_duration(60), "1.0 minutes")
+
+    def test_default_result_path_avoids_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(vanity, "DEFAULT_RESULTS_DIR", Path(directory)):
+                first = vanity.default_result_path("a" * 64)
+                first.touch()
+                second = vanity.default_result_path("a" * 64)
+                self.assertNotEqual(first, second)
+                self.assertFalse(second.exists())
+
+    def test_cuda_malformed_output_is_rejected(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stderr = StringIO("")
+                self.stdout = StringIO("not-json\n")
+            def wait(self, timeout=None):
+                return 0
+            def poll(self):
+                return 0
+            def terminate(self):
+                pass
+            def kill(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch()
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(vanity.subprocess, "Popen", return_value=FakeProcess()):
+                with self.assertRaisesRegex(RuntimeError, "invalid result"):
+                    vanity.search_cuda("cafe", "", "", watch_path=Path(directory) / "rare.jsonl")
+
+    def test_count_interesting_handles_missing_and_existing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rare.jsonl"
+            self.assertEqual(vanity.count_interesting(path), 0)
+            path.write_text("{}\n\n{}\n", encoding="utf-8")
+            self.assertEqual(vanity.count_interesting(path), 2)
 
     @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
     def test_cuda_result_is_independently_verified(self):

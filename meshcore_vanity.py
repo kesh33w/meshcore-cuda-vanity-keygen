@@ -24,8 +24,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_WATCH_PATH = APP_DIR / "results" / "rare-keys.jsonl"
-DEFAULT_RESULTS_DIR = APP_DIR / "results"
+VERSION_PATH = APP_DIR / "VERSION"
+APP_VERSION = VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.is_file() else "development"
+DEFAULT_RESULTS_DIR = Path(
+    os.environ.get("MESHCORE_VANITY_RESULTS_DIR", str(APP_DIR / "results"))
+).expanduser().resolve()
+DEFAULT_WATCH_PATH = DEFAULT_RESULTS_DIR / "rare-keys.jsonl"
+REFERENCE_CUDA_RATE = 880_000_000.0
 
 
 class Sodium:
@@ -234,6 +239,69 @@ def cuda_available() -> bool:
     return cuda_device_count() > 0 and cuda_executable().is_file()
 
 
+def cuda_device_names() -> list[str]:
+    """Return user-facing GPU names without requiring the CUDA toolkit."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+
+
+def diagnostics() -> dict[str, object]:
+    devices = cuda_device_count()
+    names = cuda_device_names()
+    firmware_vector = SODIUM.derive_public(TEST_PRIVATE[:32]).hex() == TEST_PUBLIC
+    return {
+        "version": APP_VERSION,
+        "firmware_vector": firmware_vector,
+        "cuda_devices": devices,
+        "cuda_names": names,
+        "cuda_engine_built": cuda_executable().is_file(),
+        "cuda_ready": devices > 0 and cuda_executable().is_file(),
+        "results_directory": str(DEFAULT_RESULTS_DIR),
+    }
+
+
+def estimate_attempts(prefix: str, suffix: str, contains: str) -> float:
+    """Estimate mean candidates, exactly for prefix/suffix and approximately for contains."""
+    assigned: dict[int, str] = {}
+    for index, character in enumerate(prefix):
+        assigned[index] = character
+    for index, character in enumerate(suffix):
+        assigned[64 - len(suffix) + index] = character
+    fixed_probability = 16.0 ** -len(assigned)
+    if not contains:
+        probability = fixed_probability
+    else:
+        conditional = 0.0
+        for offset in range(65 - len(contains)):
+            if all(assigned.get(offset + index, character) == character
+                   for index, character in enumerate(contains)):
+                extra = sum(1 for index in range(len(contains)) if offset + index not in assigned)
+                conditional += 16.0 ** -extra
+        probability = min(1.0, fixed_probability * conditional)
+    return 1.0 / max(probability, 16.0 ** -64)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds:.2f} seconds"
+    if seconds < 60:
+        return f"{seconds:.1f} seconds"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f} minutes"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} hours"
+    if seconds < 31557600:
+        return f"{seconds / 86400:.1f} days"
+    return f"{seconds / 31557600:.1f} years"
+
+
 def search_cuda(prefix: str, suffix: str, contains: str,
                 update: Optional[Callable[[int, float], None]] = None,
                 watch_path: Optional[Path] = None,
@@ -334,13 +402,61 @@ def secure_open(path: Path, flags: int) -> int:
     return descriptor
 
 
-def save_result(result: Result, path: Path) -> None:
+def atomic_write_json(record: object, path: Path, overwrite: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    descriptor = secure_open(path, flags)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-        json.dump(asdict(result), file, indent=2)
-        file.write("\n")
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"refusing to replace non-regular file: {path}")
+        if not overwrite:
+            raise FileExistsError(f"refusing to overwrite existing file: {path}")
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(6)}")
+    try:
+        descriptor = secure_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+            json.dump(record, file, indent=2)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+            os.unlink(temporary)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def save_result(result: Result, path: Path, overwrite: bool = False) -> None:
+    atomic_write_json(asdict(result), path, overwrite)
+
+
+def available_result_path(directory: Path, public_key: str) -> Path:
+    base = directory / f"meshcore-identity-{public_key[:12]}.json"
+    if not base.exists() and not base.is_symlink():
+        return base
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return base.with_name(f"{base.stem}-{stamp}-{secrets.token_hex(2)}.json")
+
+
+def default_result_path(public_key: str) -> Path:
+    return available_result_path(DEFAULT_RESULTS_DIR, public_key)
+
+
+def count_interesting(path: Path) -> int:
+    try:
+        with path.open(encoding="utf-8") as file:
+            return sum(1 for line in file if line.strip())
+    except FileNotFoundError:
+        return 0
 
 
 def initialize_watch_file(path: Path) -> None:
@@ -420,9 +536,9 @@ TEST_PUBLIC = "1ec77175b0918ed206f9ae04ec136d6d5d4315bb26305427f645b492e9350c10"
 
 
 def self_test() -> bool:
-    derived = SODIUM.derive_public(TEST_PRIVATE[:32]).hex()
-    print("PASS" if derived == TEST_PUBLIC else "FAIL", "MeshCore firmware key vector")
-    return derived == TEST_PUBLIC
+    valid = verify_expanded_key(TEST_PRIVATE, bytes.fromhex(TEST_PUBLIC))
+    print("PASS" if valid else "FAIL", "MeshCore firmware derivation and signature vector")
+    return valid
 
 
 def run_gui() -> int:
@@ -434,38 +550,77 @@ def run_gui() -> int:
         return 2
 
     root = tk.Tk()
-    root.title("MeshCore Vanity Key Generator")
-    root.resizable(False, False)
+    root.title(f"MeshCore Vanity Key Generator {APP_VERSION}")
+    root.minsize(780, 620)
     frame = ttk.Frame(root, padding=16)
-    frame.grid()
-    fields: dict[str, tk.StringVar] = {name: tk.StringVar() for name in ("prefix", "suffix", "contains")}
+    frame.grid(sticky="nsew")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+    frame.columnconfigure(1, weight=1)
+
+    details = diagnostics()
+    gpu_count = int(details["cuda_devices"])
+    gpu_names = list(details["cuda_names"])
+    fields: dict[str, tk.StringVar] = {
+        name: tk.StringVar() for name in ("prefix", "suffix", "contains")
+    }
     for row, (name, value) in enumerate(fields.items()):
         ttk.Label(frame, text=f"{name.title()} (hex)").grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(frame, width=42, textvariable=value).grid(row=row, column=1, pady=3)
+        ttk.Entry(frame, width=48, textvariable=value).grid(row=row, column=1, columnspan=2,
+                                                            sticky="ew", pady=3)
+
+    estimate = tk.StringVar(value="Enter a hexadecimal pattern to see estimated difficulty.")
+    ttk.Label(frame, textvariable=estimate).grid(row=3, column=0, columnspan=3, sticky="w", pady=(3, 8))
+
     workers = tk.IntVar(value=max(1, (os.cpu_count() or 2) - 1))
-    ttk.Label(frame, text="CPU workers").grid(row=3, column=0, sticky="w", pady=3)
-    ttk.Spinbox(frame, from_=1, to=max(1, os.cpu_count() or 1), width=8, textvariable=workers).grid(row=3, column=1, sticky="w")
-    gpu_count = cuda_device_count()
-    device = tk.IntVar(value=0)
-    ttk.Label(frame, text="CUDA device").grid(row=4, column=0, sticky="w", pady=3)
-    device_box = ttk.Combobox(frame, width=8, state="readonly", textvariable=device,
-                              values=tuple(range(gpu_count)) if gpu_count else ("None",))
-    device_box.grid(row=4, column=1, sticky="w")
-    if not gpu_count:
-        device_box.current(0)
+    ttk.Label(frame, text="CPU workers").grid(row=4, column=0, sticky="w", pady=3)
+    ttk.Spinbox(frame, from_=1, to=max(1, os.cpu_count() or 1), width=8,
+                textvariable=workers).grid(row=4, column=1, sticky="w")
+
+    device = tk.StringVar()
+    device_values = tuple(
+        f"{index} — {gpu_names[index] if index < len(gpu_names) else 'NVIDIA GPU'}"
+        for index in range(gpu_count)
+    ) or ("None detected",)
+    device.set(device_values[0])
+    ttk.Label(frame, text="CUDA device").grid(row=5, column=0, sticky="w", pady=3)
+    ttk.Combobox(frame, state="readonly", textvariable=device,
+                 values=device_values).grid(row=5, column=1, columnspan=2, sticky="ew")
+
     cuda_engine = tk.StringVar(value="optimized")
-    ttk.Label(frame, text="CUDA engine").grid(row=5, column=0, sticky="w", pady=3)
-    ttk.Combobox(frame, width=12, state="readonly", textvariable=cuda_engine,
-                 values=("optimized", "baseline")).grid(row=5, column=1, sticky="w")
-    status = tk.StringVar(value=f"CUDA devices visible: {gpu_count} ({'CUDA' if cuda_available() else 'CPU'} backend)")
-    ttk.Label(frame, textvariable=status).grid(row=6, column=0, columnspan=2, sticky="w", pady=(9, 3))
-    incidental = tk.StringVar(value="Rare incidental keys found: 0")
-    ttk.Label(frame, textvariable=incidental).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 3))
-    output = tk.Text(frame, width=80, height=8, state="disabled", wrap="word")
-    output.grid(row=8, column=0, columnspan=2, pady=5)
+    ttk.Label(frame, text="CUDA engine").grid(row=6, column=0, sticky="w", pady=3)
+    ttk.Combobox(frame, width=14, state="readonly", textvariable=cuda_engine,
+                 values=("optimized", "baseline")).grid(row=6, column=1, sticky="w")
+
+    output_directory = tk.StringVar(value=str(DEFAULT_RESULTS_DIR))
+    ttk.Label(frame, text="Results folder").grid(row=7, column=0, sticky="w", pady=3)
+    ttk.Entry(frame, textvariable=output_directory).grid(row=7, column=1, sticky="ew", pady=3)
+
+    def choose_output_directory() -> None:
+        selected = filedialog.askdirectory(initialdir=output_directory.get() or str(DEFAULT_RESULTS_DIR))
+        if selected:
+            output_directory.set(selected)
+
+    ttk.Button(frame, text="Choose…", command=choose_output_directory).grid(row=7, column=2, padx=(7, 0))
+
+    vector_label = "PASS" if details["firmware_vector"] else "FAIL"
+    cuda_label = "ready" if details["cuda_ready"] else "CPU fallback"
+    diagnostic_text = (
+        f"Self-test: {vector_label}  •  CUDA: {cuda_label}  •  "
+        f"Devices: {gpu_count}  •  Version: {APP_VERSION}"
+    )
+    ttk.Label(frame, text=diagnostic_text).grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 3))
+    status = tk.StringVar(value="Ready")
+    ttk.Label(frame, textvariable=status).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+    incidental = tk.StringVar(value=f"Saved rare incidental keys: {count_interesting(DEFAULT_WATCH_PATH)}")
+    ttk.Label(frame, textvariable=incidental).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 3))
+    output = tk.Text(frame, width=86, height=10, state="disabled", wrap="word")
+    output.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=5)
+    frame.rowconfigure(11, weight=1)
     state: dict[str, object] = {
         "result": None, "cancel": threading.Event(), "searching": False,
-        "incidental": 0, "process": None, "closing": False,
+        "process": None, "closing": False, "saved_path": None,
+        "reveal_private": False, "observed_rate": None,
     }
 
     def show(text: str) -> None:
@@ -473,6 +628,58 @@ def run_gui() -> int:
         output.delete("1.0", "end")
         output.insert("1.0", text)
         output.configure(state="disabled")
+
+    def selected_results_directory() -> Path:
+        value = output_directory.get().strip()
+        if not value:
+            raise ValueError("Choose a results folder")
+        path = Path(value).expanduser().resolve()
+        if path.exists() and not path.is_dir():
+            raise ValueError("The selected results path is not a folder")
+        return path
+
+    def refresh_estimate(*_args: object) -> None:
+        try:
+            values = {name: valid_pattern(var.get(), name) for name, var in fields.items()}
+            if not any(values.values()):
+                estimate.set("Enter a hexadecimal pattern to see estimated difficulty.")
+                return
+            validate_constraints(**values)
+            attempts = estimate_attempts(**values)
+            rate = state.get("observed_rate")
+            if not isinstance(rate, (int, float)) or rate <= 0:
+                rate = REFERENCE_CUDA_RATE if details["cuda_ready"] else max(1, workers.get()) * 20_000
+            qualifier = "approximate " if values["contains"] else ""
+            estimate.set(
+                f"Mean work: {qualifier}{attempts:,.0f} candidates  •  "
+                f"Estimated average: {format_duration(attempts / rate)} at {rate:,.0f} keys/s"
+            )
+        except (ValueError, tk.TclError) as error:
+            estimate.set(str(error))
+
+    for variable in fields.values():
+        variable.trace_add("write", refresh_estimate)
+    workers.trace_add("write", refresh_estimate)
+
+    def render_result() -> None:
+        result = state.get("result")
+        if not isinstance(result, Result):
+            return
+        saved_path = state.get("saved_path")
+        private = result.private_key if state["reveal_private"] else "•" * 32 + "  (hidden)"
+        show(
+            f"PUBLIC KEY (64 hex characters):\n{result.public_key}\n\n"
+            f"PRIVATE KEY (128 hex characters):\n{private}\n\n"
+            f"Saved automatically: {saved_path or 'SAVE FAILED — use Save a copy'}\n\n"
+            "Import the private key as MeshCore prv.key, then reboot. Keep the JSON file private."
+        )
+
+    def set_result_controls(enabled: bool) -> None:
+        new_state = "normal" if enabled else "disabled"
+        reveal_button.configure(state=new_state)
+        copy_public_button.configure(state=new_state)
+        copy_private_button.configure(state=new_state)
+        save_button.configure(state=new_state)
 
     def start_search() -> None:
         try:
@@ -487,12 +694,24 @@ def run_gui() -> int:
         assert isinstance(cancel_event, threading.Event)
         cancel_event.clear()
         state["searching"] = True
-        state["incidental"] = 0
-        incidental.set("Rare incidental keys found: 0")
+        state["result"] = None
+        state["saved_path"] = None
+        state["reveal_private"] = False
+        reveal_button.configure(text="Reveal private key")
+        set_result_controls(False)
         worker_count = workers.get()
-        selected_device = device.get() if gpu_count else 0
+        selected_device = int(device.get().split()[0]) if gpu_count else 0
         selected_engine = cuda_engine.get()
         using_cuda = cuda_available()
+        try:
+            result_directory = selected_results_directory()
+            result_directory.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError) as error:
+            state["searching"] = False
+            messagebox.showerror("Invalid results folder", str(error))
+            return
+        watch_path = result_directory / "rare-keys.jsonl"
+        incidental.set(f"Saved rare incidental keys: {count_interesting(watch_path)}")
         button.configure(state="disabled")
         cancel_button.configure(state="normal")
         activity.start(12)
@@ -504,14 +723,16 @@ def run_gui() -> int:
 
         def progress(attempts: int, elapsed: float) -> None:
             if not state["closing"]:
-                root.after(0, status.set, f"Searching: {attempts:,} keys, {attempts / max(elapsed, .001):,.0f} keys/s")
+                rate = attempts / max(elapsed, .001)
+                if attempts:
+                    state["observed_rate"] = rate
+                root.after(0, status.set, f"Searching: {attempts:,} keys, {rate:,.0f} keys/s")
+                root.after(0, refresh_estimate)
 
         def watch_progress(rule: int, reason: str, public_key: str, path: Path) -> None:
             def display() -> None:
-                state["incidental"] = int(state["incidental"]) + 1
-                count = state["incidental"]
                 incidental.set(
-                    f"Rare incidental keys found: {count} | latest: {reason} | "
+                    f"Saved rare incidental keys: {count_interesting(path)} | latest: {reason} | "
                     f"{public_key[:16]}… | saved: {path}"
                 )
             if not state["closing"]:
@@ -524,7 +745,8 @@ def run_gui() -> int:
             try:
                 if using_cuda:
                     result = search_cuda(**values, update=progress, cancel=cancel_event,
-                                         watch_update=watch_progress, device=selected_device,
+                                         watch_path=watch_path, watch_update=watch_progress,
+                                         device=selected_device,
                                          engine=selected_engine,
                                          process_update=process_progress)
                 else:
@@ -532,7 +754,7 @@ def run_gui() -> int:
                                     cancel=cancel_event)
                 state["result"] = result
                 if not state["closing"]:
-                    root.after(0, complete, result)
+                    root.after(0, complete, result, result_directory)
             except SearchCancelled:
                 if not state["closing"]:
                     root.after(0, stopped)
@@ -543,12 +765,24 @@ def run_gui() -> int:
 
         threading.Thread(target=job, daemon=True).start()
 
-    def complete(result: Result) -> None:
+    def complete(result: Result, result_directory: Path) -> None:
         state["searching"] = False
         activity.stop()
         backend_label = result.backend.upper() + (f"/{result.engine}" if result.engine else "")
         status.set(f"Found with {backend_label} after ≤{result.attempts:,} attempts in {result.elapsed_seconds:.3f}s")
-        show(f"PUBLIC KEY (64 hex characters):\n{result.public_key}\n\nPRIVATE KEY — keep secret (128 hex characters):\n{result.private_key}\n\nImport the private key as MeshCore prv.key, then reboot.\n\nRare incidental matches are saved to results/rare-keys.jsonl.")
+        state["result"] = result
+        path = available_result_path(result_directory, result.public_key)
+        try:
+            save_result(result, path)
+            state["saved_path"] = path
+        except Exception as error:
+            state["saved_path"] = None
+            messagebox.showerror(
+                "Automatic save failed",
+                f"The key is still available in this window. Save a copy before closing.\n\n{error}",
+            )
+        render_result()
+        set_result_controls(True)
         button.configure(state="normal")
         cancel_button.configure(state="disabled")
 
@@ -577,25 +811,82 @@ def run_gui() -> int:
         status.set("Stopping search…")
         cancel_button.configure(state="disabled")
 
-    def save() -> None:
+    def save_copy() -> None:
         result = state["result"]
-        if not result:
+        if not isinstance(result, Result):
             messagebox.showinfo("Nothing to save", "Find a key first.")
             return
-        filename = filedialog.asksaveasfilename(defaultextension=".json", initialfile="meshcore-identity.json")
+        saved_path = state.get("saved_path")
+        initial_directory = (
+            saved_path.parent if isinstance(saved_path, Path) else DEFAULT_RESULTS_DIR
+        )
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json", initialdir=str(initial_directory),
+            initialfile=f"meshcore-identity-{result.public_key[:12]}.json",
+        )
         if filename:
-            save_result(result, Path(filename))
-            messagebox.showinfo("Saved", "Saved with owner-only permissions where supported.")
+            path = Path(filename)
+            overwrite = False
+            if path.exists():
+                overwrite = messagebox.askyesno("Replace file?", f"Replace the existing file?\n\n{path}")
+                if not overwrite:
+                    return
+            try:
+                save_result(result, path, overwrite=overwrite)
+                messagebox.showinfo("Saved", "Saved atomically with owner-only permissions.")
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Save failed", str(error))
+
+    def copy_value(private: bool) -> None:
+        result = state.get("result")
+        if not isinstance(result, Result):
+            return
+        value = result.private_key if private else result.public_key
+        root.clipboard_clear()
+        root.clipboard_append(value)
+        status.set("Private key copied; clipboard will be cleared in 60 seconds" if private else "Public key copied")
+        if private:
+            def clear_if_unchanged() -> None:
+                try:
+                    if root.clipboard_get() == value:
+                        root.clipboard_clear()
+                        status.set("Private key cleared from clipboard")
+                except tk.TclError:
+                    pass
+            root.after(60_000, clear_if_unchanged)
+
+    def toggle_private() -> None:
+        state["reveal_private"] = not bool(state["reveal_private"])
+        reveal_button.configure(text="Hide private key" if state["reveal_private"] else "Reveal private key")
+        render_result()
+
+    def open_results() -> None:
+        try:
+            path = selected_results_directory()
+            path.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Cannot open results", str(error))
 
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
-    activity.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(7, 3))
+    activity.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
-    controls.grid(row=10, column=0, columnspan=2, sticky="ew")
+    controls.grid(row=13, column=0, columnspan=3, sticky="ew")
     button = ttk.Button(controls, text="Find vanity key", command=start_search)
     button.pack(side="left")
     cancel_button = ttk.Button(controls, text="Cancel", command=cancel_search, state="disabled")
     cancel_button.pack(side="left", padx=7)
-    ttk.Button(controls, text="Save result", command=save).pack(side="right")
+    ttk.Button(controls, text="Open results", command=open_results).pack(side="left")
+    save_button = ttk.Button(controls, text="Save a copy…", command=save_copy, state="disabled")
+    save_button.pack(side="right")
+    copy_private_button = ttk.Button(controls, text="Copy private", command=lambda: copy_value(True), state="disabled")
+    copy_private_button.pack(side="right", padx=5)
+    copy_public_button = ttk.Button(controls, text="Copy public", command=lambda: copy_value(False), state="disabled")
+    copy_public_button.pack(side="right")
+    reveal_button = ttk.Button(controls, text="Reveal private key", command=toggle_private, state="disabled")
+    reveal_button.pack(side="right", padx=5)
+
     def close_window() -> None:
         state["closing"] = True
         cancel_event = state["cancel"]
@@ -611,12 +902,14 @@ def run_gui() -> int:
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close_window)
+    refresh_estimate()
     root.mainloop()
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("--prefix", default="", help="hexadecimal public-key prefix")
     parser.add_argument("--suffix", default="", help="hexadecimal public-key suffix")
     parser.add_argument("--contains", default="", help="hexadecimal substring anywhere in the public key")
@@ -629,12 +922,19 @@ def main() -> int:
                         default="optimized", help="CUDA implementation (default: optimized)")
     parser.add_argument("--show-private", action="store_true",
                         help="print the private key to the terminal")
+    parser.add_argument("--force", action="store_true",
+                        help="allow --output to replace an existing regular file")
     parser.add_argument("--gui", action="store_true", help="open the small desktop GUI")
     parser.add_argument("--backend", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="print local readiness information as JSON")
     args = parser.parse_args()
     if args.self_test:
         return 0 if self_test() else 1
+    if args.diagnostics:
+        print(json.dumps(diagnostics(), indent=2))
+        return 0
     if args.gui:
         return run_gui()
     try:
@@ -646,6 +946,8 @@ def main() -> int:
             raise ValueError("--workers must be at least 1")
         if args.device < 0:
             raise ValueError("--device must be zero or greater")
+        if args.output and (args.output.exists() or args.output.is_symlink()) and not args.force:
+            raise ValueError(f"output already exists; choose another path or add --force: {args.output}")
     except ValueError as error:
         parser.error(str(error))
     use_cuda = args.backend == "cuda" or (args.backend == "auto" and cuda_available())
@@ -661,8 +963,16 @@ def main() -> int:
         result = search(prefix, suffix, contains, args.workers, lambda n, e: print(f"\r{n:,} keys | {n / max(e, .001):,.0f} keys/s", end="", flush=True))
     backend_label = result.backend.upper() + (f"/{result.engine}" if result.engine else "")
     print(f"\nFound {result.public_key} after ≤{result.attempts:,} attempts ({result.elapsed_seconds:.3f}s, {backend_label}).")
-    output_path = args.output or (DEFAULT_RESULTS_DIR / f"meshcore-identity-{result.public_key[:8]}.json")
-    save_result(result, output_path)
+    output_path = args.output or default_result_path(result.public_key)
+    try:
+        save_result(result, output_path, overwrite=args.force)
+    except FileExistsError as error:
+        print(f"Refusing to overwrite a private-key file: {error}", file=sys.stderr)
+        print("Choose another --output path or repeat with --force.", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"Could not save identity: {error}", file=sys.stderr)
+        return 2
     print(f"Saved identity: {output_path}")
     if args.show_private:
         print(f"Private key: {result.private_key}")

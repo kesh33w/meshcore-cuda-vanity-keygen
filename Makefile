@@ -7,7 +7,7 @@ CUDA_ATTEMPTS_PER_THREAD ?= 4096
 CUDA_THREADS ?= 128
 CUDA_BLOCKS_PER_SM ?= 16
 
-.PHONY: all clean test test-cpu test-gpu
+.PHONY: all clean check test test-cpu test-gpu install-smoke
 
 all: meshcore_cuda_vanity
 
@@ -24,6 +24,16 @@ test-cpu:
 
 test-gpu: meshcore_cuda_vanity
 	RUN_CUDA_TESTS=1 python3 -m unittest discover -s tests -v
+
+check:
+	python3 -m py_compile meshcore_vanity.py tests/test_keygen.py
+	bash -n install.sh uninstall.sh meshcore-vanity-keygen publish_to_github.sh
+
+install-smoke: meshcore_cuda_vanity
+	tmp_dir=$$(mktemp -d); trap 'rm -rf "$$tmp_dir"' EXIT; \
+	./install.sh --prefix "$$tmp_dir/prefix" --skip-packages --skip-build --no-desktop; \
+	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --version; \
+	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --self-test
 
 clean:
 	$(RM) meshcore_cuda_vanity

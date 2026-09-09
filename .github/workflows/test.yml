@@ -3,13 +3,34 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   cpu:
-    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install runtime dependency
-        run: sudo apt-get update && sudo apt-get install -y libsodium23
-      - name: Run CPU tests
-        run: make test-cpu
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsodium23 shellcheck
+      - name: Static checks
+        run: make check && shellcheck install.sh uninstall.sh meshcore-vanity-keygen publish_to_github.sh
+      - name: CPU tests
+        run: make test
+
+  cuda-build-and-install:
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build and runtime dependencies
+        run: apt-get update && apt-get install -y g++ make python3 libsodium23
+      - name: Compile CUDA engine without requiring a GPU
+        run: make CUDA_ARCH=sm_75 HOST_CXX=/usr/bin/g++
+      - name: Test clean application installation
+        run: make install-smoke

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX="$(cd -- "$BIN_DIR/.." && pwd)"
+APP_HOME="$PREFIX/lib/meshcore-vanity-keygen"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/meshcore-vanity-keygen"
+
+export MESHCORE_VANITY_RESULTS_DIR="${MESHCORE_VANITY_RESULTS_DIR:-$DATA_HOME/results}"
+exec python3 "$APP_HOME/meshcore_vanity.py" "$@"

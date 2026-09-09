@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MeshCore Vanity Key Generator
+Comment=Generate MeshCore-compatible vanity identities with NVIDIA CUDA
+Exec=@EXEC@ --gui
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
+Keywords=MeshCore;LoRa;Ed25519;CUDA;Vanity;
+StartupNotify=true

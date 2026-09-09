@@ -4,7 +4,29 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
+The current release is **v1.0.0**. Generated identities have been validated
+against MeshCore firmware vectors and on physical RAK4631 hardware.
+
 ## Install and run (Ubuntu)
+
+For a normal desktop installation, clone the repository and run:
+
+```bash
+./install.sh
+```
+
+This installs missing Ubuntu dependencies, builds the CUDA engine, installs a
+`meshcore-vanity-keygen` command under `~/.local/bin`, and adds **MeshCore
+Vanity Key Generator** to the desktop application menu. It does not install or
+replace the NVIDIA display driver.
+
+Launch it from the application menu or run:
+
+```bash
+meshcore-vanity-keygen --gui
+```
+
+The manual development setup remains:
 
 ```bash
 sudo apt update
@@ -20,11 +42,24 @@ third-party Python packages are required. The program calls the system
 the desktop GUI.
 
 The private key is the 64-byte expanded key that MeshCore expects, not a
-32-byte seed. CLI results are automatically saved under `results/` unless
-`--output PATH` is supplied. Private keys are not printed in the terminal by
-default; add `--show-private` if you explicitly want that. Files are forced to
-owner-only permissions (`0600`). Do not share them. To import one, use your
-MeshCore client's key import / `prv.key` setting and then reboot the node.
+32-byte seed. CLI and GUI results are saved automatically. A source checkout
+uses its local `results/` folder; an installed copy uses
+`~/.local/share/meshcore-vanity-keygen/results/`. The GUI lets you select
+another folder.
+
+Private keys are hidden in the GUI and are not printed in the terminal by
+default. Use the explicit reveal/copy controls or add `--show-private` when you
+intend to expose one. Identity files are written atomically with owner-only
+permissions (`0600`), and existing files are never silently overwritten. Use
+`--force` with an explicit CLI output path to authorize replacement. Do not
+share private-key files. To import one, use your MeshCore client's key import /
+`prv.key` setting and then reboot the node.
+
+To see local readiness information without starting a search:
+
+```bash
+meshcore-vanity-keygen --diagnostics
+```
 
 ## GPU acceleration
 
@@ -60,6 +95,8 @@ signature, and signature-verified independently on the CPU before it is
 displayed or saved. Requested patterns that are impossible—including keys
 beginning with the MeshCore-rejected bytes `00` or `ff`—are rejected up front.
 The Cancel button, window close action, and `Ctrl+C` stop the CUDA process.
+The GUI displays mean-work and average-time estimates, updates them using the
+observed search rate, and shows GPU/self-test readiness before a search starts.
 
 ### Measured performance
 
@@ -111,9 +148,10 @@ Each JSONL record keeps the matching pair together:
 ```
 
 The file is created with owner-only permissions (`0600`) when the search starts;
-an empty file means no rare key has been found. Its default location is anchored
-to the application directory regardless of where the GUI is launched. Use
-`--watch-output PATH` to choose another location.
+an empty file means no rare key has been found. A source checkout stores it
+under local `results/`; an installed copy uses its private application-data
+directory. Both remain independent of the shell's working directory. Use
+`--watch-output PATH` to choose another CLI location.
 
 Only the first key for each of the 18 rules is retained in the output file,
 including across later runs. File locking prevents two searches from appending
@@ -137,6 +175,13 @@ its expanded key. The opt-in GPU suite exercises repeated incremental point
 addition, tests both CUDA engines, verifies generated signatures, and confirms
 cancellation leaves no child process behind.
 
+For v1.0.0, a CUDA-generated `c0dec0…` identity was also imported into a
+RAK4631 running MeshCore v1.17.1. The device exported the exact private key,
+produced a signature verified against the generated public key, and was then
+restored to its original identity. A device is not required for normal use;
+this was an independent physical compatibility test. See
+[`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) for the secret-free record.
+
 ## Security notes
 
 - Everything runs locally; generated keys are not sent over the network.
@@ -144,6 +189,19 @@ cancellation leaves no child process behind.
 - Treat both identity JSON and rare-key JSONL files as secrets despite their
   restrictive file permissions. Back them up only to storage you trust.
 - Search is probabilistic. A difficulty estimate is an average, not a deadline.
+- The project has extensive compatibility checks but no independent professional
+  cryptographic audit; see `SECURITY.md` for reporting and assurance details.
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
+The uninstaller removes the application and desktop launcher but deliberately
+preserves generated keys under `~/.local/share/meshcore-vanity-keygen/`.
+Review and delete that directory yourself only when its private keys are no
+longer needed.
 
 ## Publish your fork
 
