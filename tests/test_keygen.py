@@ -57,10 +57,14 @@ class KeygenTests(unittest.TestCase):
         middle = "1" * 44
         self.assertEqual(vanity.interesting_rule("abcde12345" + middle + "abcde12345"), 0)
         self.assertEqual(vanity.interesting_rule("abcde12345" + middle + "54321edcba"), 1)
-        self.assertEqual(vanity.interesting_rule("deadbeef00" + "1" * 54), 4)
-        self.assertEqual(vanity.interesting_rule("1" * 54 + "fadefade00"), 17)
+        self.assertEqual(vanity.interesting_rule("b" * 10 + "1234567890" * 5 + "1234"), 2)
+        self.assertEqual(vanity.interesting_rule("deadbeef00" + "1" * 54), 5)
+        self.assertEqual(vanity.interesting_rule("3141592653" + "1" * 54), 11)
+        self.assertEqual(vanity.interesting_rule("abcdef0123" + "1" * 44 + "fadefade00"), -1)
         self.assertEqual(vanity.interesting_rule("1" * 64), 0)
         self.assertEqual(vanity.interesting_rule("not hex"), -1)
+        self.assertEqual(len(vanity.WATCH_REASONS), 12)
+        self.assertFalse(any(reason.startswith("suffix-") for reason in vanity.WATCH_REASONS))
 
     def test_result_file_is_atomic_and_private(self):
         result = vanity.Result("11" * 32, "22" * 64, 1, 0.1, "test", "cpu")

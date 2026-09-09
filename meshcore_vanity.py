@@ -468,9 +468,9 @@ def initialize_watch_file(path: Path) -> None:
 
 
 WATCH_REASONS = (
-    "bookend-10", "mirror-10",
+    "bookend-10", "mirror-10", "repeat-prefix-10",
     *(f"prefix-{word}" for word in ("cafecafe00", "beefbeef00", "deadbeef00", "facebabe00", "babecafe00", "f00df00d00", "1337133713", "fadefade00")),
-    *(f"suffix-{word}" for word in ("cafecafe00", "beefbeef00", "deadbeef00", "facebabe00", "babecafe00", "f00df00d00", "1337133713", "fadefade00")),
+    "prefix-pi-3141592653",
 )
 
 
@@ -482,15 +482,17 @@ def interesting_rule(public_hex: str) -> int:
         return 0
     if public_hex[:10] == public_hex[-10:][::-1]:
         return 1
+    if public_hex[:10] == public_hex[0] * 10:
+        return 2
     words = (
         "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
         "babecafe00", "f00df00d00", "1337133713", "fadefade00",
     )
     for index, word in enumerate(words):
         if public_hex.startswith(word):
-            return 2 + index
-        if public_hex.endswith(word):
-            return 10 + index
+            return 3 + index
+    if public_hex.startswith("3141592653"):
+        return 11
     return -1
 
 

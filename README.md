@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.0.1**. Generated identities have been validated
+The current release is **v1.1.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -127,19 +127,25 @@ the latest rule matched, and a public-key preview. Incidental collection is a
 CUDA feature; the slower CPU fallback only searches for the requested pattern.
 
 The built-in rules are deliberately much harder than four-character vanity
-patterns. Each has ten hex characters of effective difficulty, or about 1.1
-trillion possibilities:
+patterns. Every individual pattern constrains ten hexadecimal characters:
 
 - First ten characters equal the last ten (`bookend-10`).
 - First ten characters equal the reverse of the last ten (`mirror-10`).
-- One of eight exact phrases appears at either end: `cafecafe00`, `beefbeef00`,
+- The first ten characters are identical (`repeat-prefix-10`), such as
+  `aaaaaaaaaa`. Repeated `0` and `f` prefixes are excluded because MeshCore
+  rejects identities beginning with bytes `00` and `ff`.
+- One of eight exact phrases appears at the beginning: `cafecafe00`, `beefbeef00`,
   `deadbeef00`, `facebabe00`, `babecafe00`, `f00df00d00`, `1337133713`, or
   `fadefade00`.
+- The first ten decimal digits of pi appear at the beginning:
+  `3141592653` (`prefix-pi-3141592653`).
 
 At the measured 880M keys/s, one specific ten-character rule averages roughly
-20.8 minutes. Because all 18 rules are checked together, some incidental match
-is expected approximately every 70 seconds. Random search times vary widely,
-and a short run may still find none.
+20.8 minutes. The repeated-prefix rule accepts 14 valid repeated digits, so it
+averages about 89 seconds. Across the 12 rule categories—25 effective
+ten-character possibilities—some incidental match is expected approximately
+every 50 seconds. Random search times vary widely, and a short run may still
+find none.
 
 Each JSONL record keeps the matching pair together:
 
@@ -153,10 +159,12 @@ under local `results/`; an installed copy uses its private application-data
 directory. Both remain independent of the shell's working directory. Use
 `--watch-output PATH` to choose another CLI location.
 
-Only the first key for each of the 18 rules is retained in the output file,
-including across later runs. File locking prevents two searches from appending
-the same rule concurrently. Collection stops when the requested key is found or
-the search is cancelled; rare keys already written remain saved.
+Only the first key for each of the 12 current rule categories is retained in the
+output file, including across later runs. File locking prevents two searches
+from appending the same rule concurrently. Collection stops when the requested
+key is found or the search is cancelled; rare keys already written remain
+saved. Upgrading does not delete legacy suffix records created by v1.0.x, but
+new suffix matches are no longer collected.
 
 The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
 `THIRD_PARTY_NOTICES.md`.

@@ -35,7 +35,7 @@ constexpr int kBlocksPerSm = MC_BLOCKS_PER_SM;
 #endif
 constexpr int kAttemptsPerThread = MC_ATTEMPTS_PER_THREAD;
 constexpr int kResultCheckInterval = 32;
-constexpr int kWatchRules = 18;
+constexpr int kWatchRules = 12;
 static_assert(kThreads > 0 && kThreads <= 1024 && kThreads % 32 == 0,
               "MC_THREADS must be a positive warp multiple no greater than 1024");
 static_assert(kAttemptsPerThread > 0 && kAttemptsPerThread % 32 == 0,
@@ -51,6 +51,7 @@ __constant__ char gpu_watch_words[8][11] = {
     "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
     "babecafe00", "f00df00d00", "1337133713", "fadefade00"
 };
+__constant__ char gpu_pi_prefix[11] = "3141592653";
 
 struct DeviceResult {
     int found;
@@ -111,10 +112,14 @@ __device__ int interesting_rule(const unsigned char *key) {
     }
     if (bookend) return 0;
     if (mirror) return 1;
+    bool repeated_prefix = true;
+    for (int i = 1; i < 10; ++i)
+        if (hex_at(key, i) != hex_at(key, 0)) repeated_prefix = false;
+    if (repeated_prefix) return 2;
     for (int word = 0; word < 8; ++word) {
-        if (equal_at(key, gpu_watch_words[word], 10, 0)) return 2 + word;
-        if (equal_at(key, gpu_watch_words[word], 10, 54)) return 10 + word;
+        if (equal_at(key, gpu_watch_words[word], 10, 0)) return 3 + word;
     }
+    if (equal_at(key, gpu_pi_prefix, 10, 0)) return 11;
     return -1;
 }
 

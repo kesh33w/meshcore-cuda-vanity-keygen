@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## 1.1.0 — 2026-09-08
+
+- Add a rare rule for public keys whose first ten characters are identical.
+- Add `3141592653`, the first ten decimal digits of pi, as a rare prefix.
+- Retain the structural bookend and mirror rules and all eight phrase prefixes.
+- Stop collecting phrase suffixes; existing saved records remain untouched.
+
 ## 1.0.1 — 2026-09-08
 
 - Replace the generic terminal icon with a purpose-built mesh-and-key icon.
