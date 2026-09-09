@@ -515,17 +515,8 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
         "backend": "cuda",
         "engine": engine,
     }
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as file:
+    with os.fdopen(descriptor, "a", encoding="utf-8") as file:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-        file.seek(0)
-        for line in file:
-            try:
-                existing = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if existing.get("reason") == WATCH_REASONS[rule] or existing.get("public_key") == public_hex:
-                return False
-        file.seek(0, os.SEEK_END)
         file.write(json.dumps(record, separators=(",", ":")) + "\n")
         file.flush()
         os.fsync(file.fileno())

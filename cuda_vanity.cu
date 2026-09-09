@@ -35,7 +35,7 @@ constexpr int kBlocksPerSm = MC_BLOCKS_PER_SM;
 #endif
 constexpr int kAttemptsPerThread = MC_ATTEMPTS_PER_THREAD;
 constexpr int kResultCheckInterval = 32;
-constexpr int kWatchRules = 12;
+constexpr int kWatchCapacity = 64;
 static_assert(kThreads > 0 && kThreads <= 1024 && kThreads % 32 == 0,
               "MC_THREADS must be a positive warp multiple no greater than 1024");
 static_assert(kAttemptsPerThread > 0 && kAttemptsPerThread % 32 == 0,
@@ -67,7 +67,7 @@ struct WatchResult {
 
 struct WatchBatch {
     int count;
-    WatchResult results[kWatchRules];
+    WatchResult results[kWatchCapacity];
 };
 
 void cuda_check(cudaError_t error, const char *operation) {
@@ -138,19 +138,15 @@ __device__ void increment_seed(unsigned char *seed, unsigned long long amount) {
 __device__ bool inspect_candidate(const unsigned char *private_key,
                                   const unsigned char *public_key,
                                   DeviceResult *result,
-                                  unsigned long long *watch_mask,
                                   WatchBatch *watch_batch) {
     const bool meshcore_valid = public_key[0] != 0 && public_key[0] != 255;
     int rule = meshcore_valid ? interesting_rule(public_key) : -1;
     if (rule >= 0) {
-        unsigned long long bit = 1ULL << rule;
-        if (!(atomicOr(watch_mask, bit) & bit)) {
-            int slot = atomicAdd(&watch_batch->count, 1);
-            if (slot < kWatchRules) {
-                watch_batch->results[slot].rule = rule;
-                for (int i = 0; i < 32; ++i) watch_batch->results[slot].public_key[i] = public_key[i];
-                for (int i = 0; i < 64; ++i) watch_batch->results[slot].private_key[i] = private_key[i];
-            }
+        int slot = atomicAdd(&watch_batch->count, 1);
+        if (slot < kWatchCapacity) {
+            watch_batch->results[slot].rule = rule;
+            for (int i = 0; i < 32; ++i) watch_batch->results[slot].public_key[i] = public_key[i];
+            for (int i = 0; i < 64; ++i) watch_batch->results[slot].private_key[i] = private_key[i];
         }
     }
     if (key_matches(public_key) && atomicCAS(&result->found, 0, 1) == 0) {
@@ -163,7 +159,7 @@ __device__ bool inspect_candidate(const unsigned char *private_key,
 }
 
 __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResult *result,
-                                     unsigned long long *watch_mask, WatchBatch *watch_batch) {
+                                     WatchBatch *watch_batch) {
     unsigned char seed[32];
     unsigned char private_key[64];
     unsigned char public_key[32];
@@ -180,7 +176,7 @@ __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResul
         private_key[31] |= 64;
         ge_scalarmult_base(&point, private_key);
         ge_p3_tobytes(public_key, &point);
-        if (inspect_candidate(private_key, public_key, result, watch_mask, watch_batch)) return;
+        if (inspect_candidate(private_key, public_key, result, watch_batch)) return;
         increment_seed(seed, 1);
     }
 }
@@ -213,9 +209,7 @@ __device__ void encode_batch(unsigned char encoded[BatchSize][32],
 }
 
 __global__ void scan_kernel_optimized(const unsigned char *base_scalar,
-                                                DeviceResult *result,
-                                                unsigned long long *watch_mask,
-                                                WatchBatch *watch_batch) {
+                                      DeviceResult *result, WatchBatch *watch_batch) {
     unsigned char private_key[64]{};
     unsigned char public_keys[32][32];
     ge_p3 points[32];
@@ -233,7 +227,7 @@ __global__ void scan_kernel_optimized(const unsigned char *base_scalar,
         }
         encode_batch<32>(public_keys, points);
         for (int i = 0; i < 32; ++i) {
-            if (inspect_candidate(private_key, public_keys[i], result, watch_mask, watch_batch)) return;
+            if (inspect_candidate(private_key, public_keys[i], result, watch_batch)) return;
             increment_seed(private_key, 8);
         }
         ge_madd(&next, &points[31], &base[0][7]);
@@ -376,12 +370,9 @@ int main(int argc, char **argv) {
     unsigned char *device_seed = nullptr;
     DeviceResult *device_result = nullptr;
     WatchBatch *device_watch = nullptr;
-    unsigned long long *device_watch_mask = nullptr;
     cuda_check(cudaMalloc(&device_seed, 32), "cudaMalloc seed");
     cuda_check(cudaMalloc(&device_result, sizeof(DeviceResult)), "cudaMalloc result");
     cuda_check(cudaMalloc(&device_watch, sizeof(WatchBatch)), "cudaMalloc watch results");
-    cuda_check(cudaMalloc(&device_watch_mask, sizeof(unsigned long long)), "cudaMalloc watch mask");
-    cuda_check(cudaMemset(device_watch_mask, 0, sizeof(unsigned long long)), "clear watch mask");
     unsigned long long attempts = 0;
     auto started = std::chrono::steady_clock::now();
     std::fprintf(stderr, "GPU %d: %s, engine %s, %d blocks x %d threads\n",
@@ -401,13 +392,21 @@ int main(int argc, char **argv) {
         cuda_check(cudaMemset(device_result, 0, sizeof(DeviceResult)), "clear result");
         cuda_check(cudaMemset(device_watch, 0, sizeof(WatchBatch)), "clear watch results");
         if (engine == "optimized")
-            scan_kernel_optimized<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
+            scan_kernel_optimized<<<blocks, kThreads>>>(device_seed, device_result, device_watch);
         else
-            scan_kernel_baseline<<<blocks, kThreads>>>(device_seed, device_result, device_watch_mask, device_watch);
+            scan_kernel_baseline<<<blocks, kThreads>>>(device_seed, device_result, device_watch);
         cuda_check(cudaGetLastError(), "launch scan kernel");
         cuda_check(cudaMemcpy(&result, device_result, sizeof(result), cudaMemcpyDeviceToHost), "copy result");
         cuda_check(cudaMemcpy(&watch, device_watch, sizeof(watch), cudaMemcpyDeviceToHost), "copy watch results");
-        for (int i = 0; i < watch.count && i < kWatchRules; ++i) {
+        if (watch.count > kWatchCapacity) {
+            std::fprintf(stderr, "Rare-key batch overflow (%d > %d); refusing to silently drop matches\n",
+                         watch.count, kWatchCapacity);
+            cudaFree(device_result);
+            cudaFree(device_seed);
+            cudaFree(device_watch);
+            return 2;
+        }
+        for (int i = 0; i < watch.count; ++i) {
             if (engine != "baseline") random_bytes(&watch.results[i].private_key[32], 32);
             std::fprintf(stderr, "WATCH %d %s %s\n", watch.results[i].rule,
                          hex(watch.results[i].public_key, 32).c_str(),
@@ -429,6 +428,5 @@ int main(int argc, char **argv) {
     cudaFree(device_result);
     cudaFree(device_seed);
     cudaFree(device_watch);
-    cudaFree(device_watch_mask);
     return 0;
 }

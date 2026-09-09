@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.0 — 2026-09-08
+
+- Log every independently verified rare-key discovery, including later matches
+  in a category that has already produced a result.
+- Remove the persistent per-rule CUDA suppression mask and Python deduplication.
+- Add a larger per-batch result buffer and fail explicitly on its practically
+  unreachable overflow instead of silently dropping matches.
+
 ## 1.1.0 — 2026-09-08
 
 - Add a rare rule for public keys whose first ten characters are identical.

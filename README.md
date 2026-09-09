@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.1.0**. Generated identities have been validated
+The current release is **v1.2.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -159,12 +159,13 @@ under local `results/`; an installed copy uses its private application-data
 directory. Both remain independent of the shell's working directory. Use
 `--watch-output PATH` to choose another CLI location.
 
-Only the first key for each of the 12 current rule categories is retained in the
-output file, including across later runs. File locking prevents two searches
-from appending the same rule concurrently. Collection stops when the requested
-key is found or the search is cancelled; rare keys already written remain
-saved. Upgrading does not delete legacy suffix records created by v1.0.x, but
-new suffix matches are no longer collected.
+Every discovery is retained, even when earlier keys matched the same category.
+File locking prevents concurrent searches from corrupting or interleaving
+records. Collection stops when the requested key is found or the search is
+cancelled; rare keys already written remain saved. At the measured rate and
+current criteria, continuous searching averages about 1,700 new records per
+day, or roughly 0.5 MB of JSONL data. Upgrading does not delete legacy suffix
+records created by v1.0.x, but new suffix matches are no longer collected.
 
 The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
 `THIRD_PARTY_NOTICES.md`.

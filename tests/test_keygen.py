@@ -145,6 +145,20 @@ class KeygenTests(unittest.TestCase):
             path.write_text("{}\n\n{}\n", encoding="utf-8")
             self.assertEqual(vanity.count_interesting(path), 2)
 
+    def test_every_interesting_discovery_is_appended(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rare.jsonl"
+            public = "11" * 32
+            private = "22" * 64
+            with mock.patch.object(vanity, "interesting_rule", return_value=0), \
+                    mock.patch.object(vanity, "verify_expanded_key", return_value=True):
+                self.assertTrue(vanity.append_interesting(path, 0, public, private))
+                self.assertTrue(vanity.append_interesting(path, 0, public, private))
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(len(records), 2)
+            self.assertEqual([record["reason"] for record in records], ["bookend-10"] * 2)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     @unittest.skipUnless(os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA smoke test is opt-in")
     def test_cuda_result_is_independently_verified(self):
         if not vanity.cuda_available():
