@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## 1.5.0 — 2026-09-08
+
+- Stop collecting the `cafecafe00`, `beefbeef00`, `deadbeef00`,
+  `facebabe00`, and `babecafe00` canned phrase prefixes.
+- Preserve all historical records for the removed categories in the rare-key
+  browser and JSONL history.
+- Keep `f00df00d00`, `1337133713`, `fadefade00`, pi, repeated-prefix,
+  mirror, and bookend collection active.
+
 ## 1.4.0 — 2026-09-08
 
 - Add a native CUDA continuous collector that searches only for built-in rare

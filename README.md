@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.4.0**. Generated identities have been validated
+The current release is **v1.5.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -159,17 +159,16 @@ patterns. Every individual pattern constrains ten hexadecimal characters:
 - The first ten characters are identical (`repeat-prefix-10`), such as
   `aaaaaaaaaa`. Repeated `0` and `f` prefixes are excluded because MeshCore
   rejects identities beginning with bytes `00` and `ff`.
-- One of eight exact phrases appears at the beginning: `cafecafe00`, `beefbeef00`,
-  `deadbeef00`, `facebabe00`, `babecafe00`, `f00df00d00`, `1337133713`, or
-  `fadefade00`.
+- One of three exact phrases appears at the beginning: `f00df00d00`,
+  `1337133713`, or `fadefade00`.
 - The first ten decimal digits of pi appear at the beginning:
   `3141592653` (`prefix-pi-3141592653`).
 
 At the measured 880M keys/s, one specific ten-character rule averages roughly
 20.8 minutes. The repeated-prefix rule accepts 14 valid repeated digits, so it
-averages about 89 seconds. Across the 12 rule categories—25 effective
+averages about 89 seconds. Across the 7 rule categories—20 effective
 ten-character possibilities—some incidental match is expected approximately
-every 50 seconds. Random search times vary widely, and a short run may still
+every 62 seconds. Random search times vary widely, and a short run may still
 find none.
 
 Each JSONL record keeps the matching pair together:
@@ -196,13 +195,14 @@ Every discovery is retained, even when earlier keys matched the same category.
 File locking prevents concurrent searches from corrupting or interleaving
 records. Collection stops when the requested key is found or the search is
 cancelled; rare keys already written remain saved. At the measured rate and
-current criteria, continuous searching averages about 1,700 new records per
+current criteria, continuous searching averages about 1,400 new records per
 day. The GUI keeps its live count in memory and the browser bounds memory use to
 the newest 10,000 valid records. Upgrading does not rewrite or delete legacy
 records; their basic rarity metadata is inferred when displayed. Legacy suffix
-records created by v1.0.x remain visible, but new suffix matches are no longer
-collected. Version-2 records are larger than the original minimal records, so
-storage growth depends on how many traits each key matches.
+records created by v1.0.x and records from later-removed phrase categories
+remain visible, but those patterns are no longer collected. Version-2 records
+are larger than the original minimal records, so storage growth depends on how
+many traits each key matches.
 
 The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
 `THIRD_PARTY_NOTICES.md`.

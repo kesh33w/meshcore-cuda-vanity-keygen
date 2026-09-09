@@ -37,8 +37,7 @@ ICON_PATH = APP_DIR / "assets" / "meshcore-vanity-keygen.png"
 RARE_LOG_SCHEMA = 2
 RARE_BROWSER_LIMIT = 10_000
 WATCH_WORDS = (
-    "cafecafe00", "beefbeef00", "deadbeef00", "facebabe00",
-    "babecafe00", "f00df00d00", "1337133713", "fadefade00",
+    "f00df00d00", "1337133713", "fadefade00",
 )
 PI_DIGITS = "3141592653589793238462643383279502884197169399375105820974944592"
 
@@ -520,7 +519,7 @@ def interesting_rule(public_hex: str) -> int:
         if public_hex.startswith(word):
             return 3 + index
     if public_hex.startswith("3141592653"):
-        return 11
+        return 6
     return -1
 
 

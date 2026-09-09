@@ -58,13 +58,29 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(vanity.interesting_rule("abcde12345" + middle + "abcde12345"), 0)
         self.assertEqual(vanity.interesting_rule("abcde12345" + middle + "54321edcba"), 1)
         self.assertEqual(vanity.interesting_rule("b" * 10 + "1234567890" * 5 + "1234"), 2)
-        self.assertEqual(vanity.interesting_rule("deadbeef00" + "1" * 54), 5)
-        self.assertEqual(vanity.interesting_rule("3141592653" + "1" * 54), 11)
+        self.assertEqual(vanity.interesting_rule("f00df00d00" + "1" * 54), 3)
+        self.assertEqual(vanity.interesting_rule("1337133713" + "1" * 54), 4)
+        self.assertEqual(vanity.interesting_rule("fadefade00" + "1" * 54), 5)
+        self.assertEqual(vanity.interesting_rule("3141592653" + "1" * 54), 6)
+        for removed in ("cafecafe00", "beefbeef00", "deadbeef00",
+                        "facebabe00", "babecafe00"):
+            self.assertEqual(vanity.interesting_rule(removed + "1" * 54), -1)
         self.assertEqual(vanity.interesting_rule("abcdef0123" + "1" * 44 + "fadefade00"), -1)
         self.assertEqual(vanity.interesting_rule("1" * 64), 0)
         self.assertEqual(vanity.interesting_rule("not hex"), -1)
-        self.assertEqual(len(vanity.WATCH_REASONS), 12)
+        self.assertEqual(len(vanity.WATCH_REASONS), 7)
         self.assertFalse(any(reason.startswith("suffix-") for reason in vanity.WATCH_REASONS))
+
+    def test_cuda_rare_rules_match_python_rules(self):
+        root = Path(vanity.__file__).resolve().parent
+        cuda_source = (root / "cuda_vanity.cu").read_text(encoding="utf-8")
+        self.assertIn("gpu_watch_words[3][11]", cuda_source)
+        for word in vanity.WATCH_WORDS:
+            self.assertIn(f'"{word}"', cuda_source)
+        for removed in ("cafecafe00", "beefbeef00", "deadbeef00",
+                        "facebabe00", "babecafe00"):
+            self.assertNotIn(f'"{removed}"', cuda_source)
+        self.assertIn("if (equal_at(key, gpu_pi_prefix, 10, 0)) return 6;", cuda_source)
 
     def test_rare_analysis_preserves_stronger_matches(self):
         repeat_key = "a" * 13 + "1234567890abcdef" * 3 + "123"
