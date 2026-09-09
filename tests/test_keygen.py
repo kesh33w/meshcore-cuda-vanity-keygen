@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import struct
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,17 @@ import meshcore_vanity as vanity
 
 
 class KeygenTests(unittest.TestCase):
+    def test_release_icon_assets_and_desktop_metadata(self):
+        root = Path(vanity.__file__).resolve().parent
+        png = (root / "assets" / "meshcore-vanity-keygen.png").read_bytes()
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(png[16:24], struct.pack(">II", 256, 256))
+        self.assertIn("<svg", (root / "assets" / "meshcore-vanity-keygen.svg").read_text())
+        desktop = (root / "meshcore-vanity-keygen.desktop.in").read_text()
+        self.assertIn("Icon=meshcore-vanity-keygen", desktop)
+        self.assertIn("StartupWMClass=Meshcorevanitykeygen", desktop)
+        self.assertNotIn("utilities-terminal", desktop)
+
     def test_meshcore_firmware_vector(self):
         self.assertEqual(
             vanity.SODIUM.derive_public(vanity.TEST_PRIVATE[:32]).hex(),

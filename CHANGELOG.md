@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## 1.0.1 — 2026-09-08
+
+- Replace the generic terminal icon with a purpose-built mesh-and-key icon.
+- Use the custom icon in the application menu, desktop shell, and GUI window.
+- Install scalable SVG and 256-pixel PNG icon assets with the application.
+
 ## 1.0.0 — 2026-09-08
 
 - Add a one-command Ubuntu installer, desktop launcher, and uninstaller.

@@ -22,10 +22,13 @@ APP_HOME="$PREFIX/lib/meshcore-vanity-keygen"
 BIN_PATH="$PREFIX/bin/meshcore-vanity-keygen"
 DESKTOP_PATH="${XDG_DATA_HOME:-$HOME/.local/share}/applications/meshcore-vanity-keygen.desktop"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/meshcore-vanity-keygen"
+ICON_HOME="$PREFIX/share/icons/hicolor"
 
-rm -f -- "$BIN_PATH" "$DESKTOP_PATH"
+rm -f -- "$BIN_PATH" "$DESKTOP_PATH" \
+    "$ICON_HOME/scalable/apps/meshcore-vanity-keygen.svg" \
+    "$ICON_HOME/256x256/apps/meshcore-vanity-keygen.png"
 if [[ -d "$APP_HOME" ]]; then
-    find "$APP_HOME" -mindepth 1 -maxdepth 1 -type f -delete
-    rmdir "$APP_HOME"
+    find "$APP_HOME" -type f -delete
+    find "$APP_HOME" -depth -type d -empty -delete
 fi
 echo "Application removed. Generated private keys were preserved in: $DATA_HOME/results"

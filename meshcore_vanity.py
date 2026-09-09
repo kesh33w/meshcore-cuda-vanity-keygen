@@ -31,6 +31,7 @@ DEFAULT_RESULTS_DIR = Path(
 ).expanduser().resolve()
 DEFAULT_WATCH_PATH = DEFAULT_RESULTS_DIR / "rare-keys.jsonl"
 REFERENCE_CUDA_RATE = 880_000_000.0
+ICON_PATH = APP_DIR / "assets" / "meshcore-vanity-keygen.png"
 
 
 class Sodium:
@@ -549,8 +550,14 @@ def run_gui() -> int:
         print("Tk is unavailable. Install python3-tk or use the command line.", file=sys.stderr)
         return 2
 
-    root = tk.Tk()
+    root = tk.Tk(className="MeshCoreVanityKeygen")
     root.title(f"MeshCore Vanity Key Generator {APP_VERSION}")
+    if ICON_PATH.is_file():
+        try:
+            window_icon = tk.PhotoImage(file=str(ICON_PATH))
+            root.iconphoto(True, window_icon)
+        except tk.TclError:
+            window_icon = None
     root.minsize(780, 620)
     frame = ttk.Frame(root, padding=16)
     frame.grid(sticky="nsew")

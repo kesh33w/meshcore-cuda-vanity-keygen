@@ -52,11 +52,16 @@ fi
 
 APP_HOME="$PREFIX/lib/meshcore-vanity-keygen"
 BIN_HOME="$PREFIX/bin"
-install -d -m 0755 "$APP_HOME" "$BIN_HOME"
+ICON_HOME="$PREFIX/share/icons/hicolor"
+install -d -m 0755 "$APP_HOME/assets" "$BIN_HOME"
+install -d -m 0755 "$ICON_HOME/scalable/apps" "$ICON_HOME/256x256/apps"
 install -m 0755 "$PROJECT_DIR/meshcore_vanity.py" "$APP_HOME/meshcore_vanity.py"
 install -m 0755 "$PROJECT_DIR/meshcore_cuda_vanity" "$APP_HOME/meshcore_cuda_vanity"
 install -m 0644 "$PROJECT_DIR/VERSION" "$APP_HOME/VERSION"
 install -m 0644 "$PROJECT_DIR/LICENSE" "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$APP_HOME/"
+install -m 0644 "$PROJECT_DIR/assets/meshcore-vanity-keygen.png" "$APP_HOME/assets/"
+install -m 0644 "$PROJECT_DIR/assets/meshcore-vanity-keygen.svg" "$ICON_HOME/scalable/apps/meshcore-vanity-keygen.svg"
+install -m 0644 "$PROJECT_DIR/assets/meshcore-vanity-keygen.png" "$ICON_HOME/256x256/apps/meshcore-vanity-keygen.png"
 install -m 0755 "$PROJECT_DIR/meshcore-vanity-keygen" "$BIN_HOME/meshcore-vanity-keygen"
 
 if ((DESKTOP)); then
@@ -69,6 +74,9 @@ if ((DESKTOP)); then
     install -m 0644 "$desktop_temp" "$APPLICATIONS_HOME/meshcore-vanity-keygen.desktop"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database "$APPLICATIONS_HOME" >/dev/null 2>&1 || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -f -t "$ICON_HOME" >/dev/null 2>&1 || true
     fi
 fi
 

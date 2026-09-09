@@ -33,7 +33,9 @@ install-smoke: meshcore_cuda_vanity
 	tmp_dir=$$(mktemp -d); trap 'rm -rf "$$tmp_dir"' EXIT; \
 	./install.sh --prefix "$$tmp_dir/prefix" --skip-packages --skip-build --no-desktop; \
 	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --version; \
-	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --self-test
+	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --self-test; \
+	test -f "$$tmp_dir/prefix/share/icons/hicolor/scalable/apps/meshcore-vanity-keygen.svg"; \
+	test -f "$$tmp_dir/prefix/lib/meshcore-vanity-keygen/assets/meshcore-vanity-keygen.png"
 
 clean:
 	$(RM) meshcore_cuda_vanity
