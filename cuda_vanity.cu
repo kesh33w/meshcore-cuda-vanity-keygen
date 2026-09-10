@@ -46,7 +46,7 @@ constexpr int kMaxRegisters = MC_MAX_REGISTERS;
 #endif
 constexpr const char *kBuildArches = MC_BUILD_ARCHES;
 constexpr const char *kBuildFingerprint = MC_BUILD_FINGERPRINT;
-constexpr int kProbeProtocolVersion = 1;
+constexpr int kProbeSchemaVersion = 1;
 constexpr int kRareRuleProtocolVersion = 1;
 constexpr int kMaxRareRules = 32;
 constexpr int kMaxRareRuleValueNibbles = 64;
@@ -901,13 +901,13 @@ bool bounded_plus_eight_relation(const unsigned char *left,
 int emit_probe_failure(int selected_device, const std::string &engine,
                        const std::string &error) {
     std::printf(
-        "{\"schema\":%d,\"protocol\":\"meshcore-cuda-probe-v1\","
+        "{\"schema\":%d,\"protocol\":\"meshcore-cuda-probe-v2\","
         "\"rare_rule_protocol\":%d,\"default_ruleset_fingerprint\":\"%s\","
         "\"ready\":false,\"device\":%d,\"engine\":\"%s\","
         "\"build_fingerprint\":\"%s\",\"build_arches\":\"%s\","
         "\"threads\":%d,\"blocks_per_sm\":%d,\"attempts_per_thread\":%d,"
         "\"max_registers\":%d,\"error\":\"%s\"}\n",
-        kProbeProtocolVersion, kRareRuleProtocolVersion,
+        kProbeSchemaVersion, kRareRuleProtocolVersion,
         meshcore_rare_generated::kRulesetFingerprint,
         selected_device, engine.c_str(),
         kBuildFingerprint, kBuildArches, kThreads, kBlocksPerSm,
@@ -946,6 +946,17 @@ int run_readiness_probe(int selected_device, const std::string &engine) {
         return emit_probe_failure(
             selected_device, engine,
             std::string("cudaGetDeviceProperties: ") + cudaGetErrorString(status));
+    }
+    char pci_bus_id[32]{};
+    const cudaError_t pci_status = cudaDeviceGetPCIBusId(
+        pci_bus_id, static_cast<int>(sizeof(pci_bus_id)), selected_device);
+    const std::string pci_json = pci_status == cudaSuccess
+        ? std::string(",\"pci_bus_id\":\"") + json_escape(pci_bus_id) + "\""
+        : std::string();
+    if (pci_status != cudaSuccess) {
+        // PCI identity enriches telemetry mapping but is not required for key
+        // generation. Do not let an optional lookup poison later launch checks.
+        (void)cudaGetLastError();
     }
 
     const int production_blocks = properties.multiProcessorCount * kBlocksPerSm;
@@ -1091,16 +1102,17 @@ int run_readiness_probe(int selected_device, const std::string &engine) {
     }
 
     std::printf(
-        "{\"schema\":%d,\"protocol\":\"meshcore-cuda-probe-v1\","
+        "{\"schema\":%d,\"protocol\":\"meshcore-cuda-probe-v2\","
         "\"rare_rule_protocol\":%d,\"default_ruleset_fingerprint\":\"%s\","
-        "\"ready\":true,\"device\":%d,\"device_name\":\"%s\","
+        "\"ready\":true,\"device\":%d,\"device_name\":\"%s\"%s,"
         "\"compute_capability\":\"%d.%d\",\"engine\":\"%s\","
         "\"build_fingerprint\":\"%s\",\"build_arches\":\"%s\","
         "\"threads\":%d,\"blocks_per_sm\":%d,\"attempts_per_thread\":%d,"
         "\"max_registers\":%d}\n",
-        kProbeProtocolVersion, kRareRuleProtocolVersion,
+        kProbeSchemaVersion, kRareRuleProtocolVersion,
         meshcore_rare_generated::kRulesetFingerprint, selected_device,
-        json_escape(properties.name).c_str(), properties.major, properties.minor,
+        json_escape(properties.name).c_str(), pci_json.c_str(),
+        properties.major, properties.minor,
         engine.c_str(), kBuildFingerprint, kBuildArches, kThreads, kBlocksPerSm,
         kAttemptsPerThread, kMaxRegisters);
     std::fflush(stdout);

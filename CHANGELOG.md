@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## 1.8.0 — 2026-09-10
+
+- Add live CPU-package and selected-GPU temperature readings to the GUI in
+  degrees Celsius, both while idle and during CUDA searches.
+- Sample sensors on a background thread so the window stays responsive and
+  temperature monitoring does not interrupt or materially slow key generation;
+  an A/B/A test on the RTX 4070 Ti showed no measurable throughput loss.
+- Read CPU temperatures directly from Linux hardware sensors and query all
+  NVIDIA devices with a time- and memory-bounded `nvidia-smi` call. Missing,
+  unsupported, or temporarily unavailable sensors degrade cleanly to `—`.
+- Map CUDA and NVIDIA devices by PCI bus identity when available, with a safe
+  single-device fallback, and extend the key-free CUDA probe protocol to v2
+  while retaining compatibility with v1 native binaries.
+- Add regression coverage for sensor selection, malformed telemetry, stale
+  readings, device replacement and reordering, subprocess bounds, monitor
+  shutdown, and both live CUDA probe engines.
+
 ## 1.7.0 — 2026-09-10
 
 - Add a scrollable **Rare keys to keep** chooser to the GUI, with a checkbox

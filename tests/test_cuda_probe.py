@@ -15,6 +15,7 @@ def successful_probe(device: int = 0, engine: str = "optimized") -> dict[str, ob
         "ready": True,
         "device": device,
         "device_name": "Test GPU",
+        "pci_bus_id": "00000000:01:00.0",
         "compute_capability": "8.9",
         "engine": engine,
         "build_fingerprint": "0123456789abcdef",
@@ -93,6 +94,64 @@ class PythonCudaProbeTests(unittest.TestCase):
                     result = vanity.cuda_probe()
             self.assertFalse(result["ready"])
             self.assertIn("rare-rule compatibility", str(result["error"]))
+
+    def test_probe_accepts_optional_and_normalizes_present_pci_bus_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch(mode=0o700)
+            valid = successful_probe()
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(valid), stderr="",
+            )
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(vanity.subprocess, "run", return_value=completed):
+                result = vanity.cuda_probe()
+        self.assertEqual(result["pci_bus_id"], "0000:01:00.0")
+
+        without_bus = successful_probe()
+        del without_bus["pci_bus_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch(mode=0o700)
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(without_bus), stderr="",
+            )
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(vanity.subprocess, "run", return_value=completed):
+                ready_without_bus = vanity.cuda_probe()
+        self.assertTrue(ready_without_bus["ready"])
+        self.assertNotIn("pci_bus_id", ready_without_bus)
+
+        for malformed in (None, "01:00.0", "not-a-bus", "00010000:01:00.0"):
+            with self.subTest(pci_bus_id=malformed), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / "engine"
+                executable.touch(mode=0o700)
+                response = successful_probe()
+                response["pci_bus_id"] = malformed
+                completed = subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(response), stderr="",
+                )
+                with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                        mock.patch.object(vanity.subprocess, "run", return_value=completed):
+                    rejected = vanity.cuda_probe()
+            self.assertFalse(rejected["ready"])
+            self.assertIn("readiness details", str(rejected["error"]))
+
+    def test_probe_accepts_previous_protocol_without_optional_bus_id(self) -> None:
+        response = successful_probe()
+        response["protocol"] = "meshcore-cuda-probe-v1"
+        del response["pci_bus_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch(mode=0o700)
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps(response), stderr="",
+            )
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(vanity.subprocess, "run", return_value=completed):
+                result = vanity.cuda_probe()
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["protocol"], "meshcore-cuda-probe-v1")
 
     def test_probe_requires_strict_integer_schema_and_device(self) -> None:
         invalid_values = (

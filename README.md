@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.7.0**. Generated identities have been validated
+The current release is **v1.8.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -117,8 +117,13 @@ beginning with the MeshCore-rejected bytes `00` or `ff`—are rejected up front.
 The Cancel button, window close action, and `Ctrl+C` stop the CUDA process.
 The GUI displays mean-work and average-time estimates, updates them using the
 observed search rate, and shows GPU/self-test readiness before a search starts.
-GPU discovery, real-kernel readiness checks, history loading, and key searching
-all run outside Tk's event thread, so the window remains responsive.
+It also shows the CPU package and selected GPU temperatures in degrees Celsius,
+both while idle and during a search. Sensor readings are best-effort monitoring,
+not thermal protection or fan/power control; unavailable readings appear as
+`—`. CPU sensors are read directly from Linux sysfs, while one bounded
+`nvidia-smi` query covers all NVIDIA GPUs. GPU discovery, real-kernel readiness
+checks, temperature sampling, history loading, and key searching all run
+outside Tk's event thread, so the window remains responsive.
 
 ### Measured performance
 
@@ -314,6 +319,10 @@ cancellation leaves no child process behind. The CPU suite also checks strict
 rule parsing, generated-header freshness, build configuration changes, GUI
 rule selection and preference validation, worker failure paths, bounded history
 loading, and pagination.
+Temperature tests additionally cover CPU sensor selection, multi-GPU PCI
+mapping, stale and malformed readings, subprocess time/output limits, and
+monitor shutdown. The live GPU suite checks both versions of the key-free
+readiness contract used by the current front end and native engine.
 
 For v1.0.0, a CUDA-generated `c0dec0…` identity was also imported into a
 RAK4631 running MeshCore v1.17.1. The device exported the exact private key,

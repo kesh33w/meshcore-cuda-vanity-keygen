@@ -14,12 +14,14 @@ import os
 import queue
 import re
 import secrets
+import selectors
+import signal
 import subprocess
 import stat
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -62,6 +64,10 @@ RARE_BROWSER_LIMIT = 10_000
 RARE_BROWSER_PAGE_SIZE = 500
 RARE_READ_BLOCK_SIZE = 64 * 1024
 RARE_MAX_RECORD_BYTES = 1024 * 1024
+TEMPERATURE_POLL_SECONDS = 3.0
+TEMPERATURE_STALE_SECONDS = 12.0
+TEMPERATURE_QUERY_TIMEOUT = 1.5
+TEMPERATURE_MAX_OUTPUT_BYTES = 64 * 1024
 WATCH_WORDS = tuple(
     rule.value for rule in DEFAULT_RARE_RULESET.rules
     if rule.kind == "literal-prefix" and rule.enabled
@@ -333,11 +339,385 @@ def search(prefix: str, suffix: str, contains: str, workers: int,
     return Result(public_hex, private_hex, attempts, elapsed, needle, "cpu")
 
 
+def _read_small_text(path: Path, limit: int = 128) -> Optional[str]:
+    """Read one bounded sysfs value without letting telemetry raise."""
+    try:
+        with path.open("rb") as file:
+            raw = file.read(limit + 1)
+        if len(raw) > limit:
+            return None
+        return raw.decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _read_millidegrees(path: Path) -> Optional[float]:
+    raw = _read_small_text(path)
+    if raw is None or re.fullmatch(r"-?[0-9]{1,9}", raw) is None:
+        return None
+    celsius = int(raw) / 1000.0
+    return celsius if -40.0 <= celsius <= 200.0 else None
+
+
+def read_cpu_package_temperature(
+        hwmon_root: Path = Path("/sys/class/hwmon"),
+        thermal_root: Path = Path("/sys/class/thermal"),
+) -> Optional[float]:
+    """Return the hottest CPU package/control sensor, never another device."""
+    preferred: list[float] = []
+    core_fallbacks: list[float] = []
+    cpu_hwmon_names = {
+        "coretemp", "k10temp", "zenpower", "cpu_thermal", "soc_thermal",
+        "x86_pkg_temp",
+    }
+    try:
+        chips = sorted(hwmon_root.glob("hwmon*"))
+    except OSError:
+        chips = []
+    for chip in chips:
+        name = (_read_small_text(chip / "name") or "").lower()
+        if name not in cpu_hwmon_names:
+            continue
+        try:
+            inputs = sorted(chip.glob("temp*_input"))
+        except OSError:
+            continue
+        for input_path in inputs:
+            match = re.fullmatch(r"temp([0-9]+)_input", input_path.name)
+            if match is None:
+                continue
+            celsius = _read_millidegrees(input_path)
+            if celsius is None:
+                continue
+            label = (
+                _read_small_text(chip / f"temp{match.group(1)}_label") or ""
+            ).lower()
+            is_package = (
+                name in {"cpu_thermal", "soc_thermal", "x86_pkg_temp"}
+                or (name == "coretemp" and label.startswith("package id"))
+                or (name in {"k10temp", "zenpower"}
+                    and label in {"tctl", "tdie", "package"})
+            )
+            (preferred if is_package else core_fallbacks).append(celsius)
+    if preferred:
+        return max(preferred)
+
+    thermal: list[float] = []
+    cpu_zone_types = {
+        "x86_pkg_temp", "cpu_thermal", "cpu-thermal", "cpu_therm",
+        "soc_thermal", "soc-thermal",
+    }
+    try:
+        zones = sorted(thermal_root.glob("thermal_zone*"))
+    except OSError:
+        zones = []
+    for zone in zones:
+        zone_type = (_read_small_text(zone / "type") or "").lower()
+        if zone_type not in cpu_zone_types:
+            continue
+        celsius = _read_millidegrees(zone / "temp")
+        if celsius is not None:
+            thermal.append(celsius)
+    if thermal:
+        return max(thermal)
+    return max(core_fallbacks) if core_fallbacks else None
+
+
+def normalize_pci_bus_id(value: object) -> Optional[str]:
+    """Normalize CUDA/NVIDIA PCI IDs to dddd:bb:dd.f for safe matching."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(
+        r"([0-9a-fA-F]{4}|[0-9a-fA-F]{8}):"
+        r"([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])",
+        value.strip(),
+    )
+    if match is None:
+        return None
+    domain = int(match.group(1), 16)
+    if domain > 0xffff:
+        return None
+    return (
+        f"{domain:04x}:{int(match.group(2), 16):02x}:"
+        f"{int(match.group(3), 16):02x}.{int(match.group(4))}"
+    )
+
+
+@dataclass(frozen=True)
+class NvidiaTemperatureReading:
+    index: int
+    pci_bus_id: str
+    celsius: Optional[float]
+
+
+@dataclass(frozen=True)
+class NvidiaTemperatureReport:
+    readings: tuple[NvidiaTemperatureReading, ...]
+
+
+@dataclass(frozen=True)
+class TemperatureSnapshot:
+    observed_at: float
+    cpu_celsius: Optional[float]
+    nvidia: Optional[NvidiaTemperatureReport]
+
+
+@dataclass
+class TemperatureCache:
+    cpu_celsius: Optional[float] = None
+    cpu_observed_at: float = float("-inf")
+    gpu_celsius_by_bus: dict[str, float] = field(default_factory=dict)
+    gpu_observed_at_by_bus: dict[str, float] = field(default_factory=dict)
+    nvidia_device_count: Optional[int] = None
+    nvidia_bus_ids: frozenset[str] = frozenset()
+    nvidia_observed_at: float = float("-inf")
+
+
+def parse_nvidia_temperatures(output: str) -> NvidiaTemperatureReport:
+    """Parse bounded CSV keyed by explicit NVIDIA index and PCI bus ID."""
+    if not isinstance(output, str) or len(output.encode("utf-8")) > TEMPERATURE_MAX_OUTPUT_BYTES:
+        raise ValueError("NVIDIA temperature output is too large")
+    rows = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(rows) > 256:
+        raise ValueError("NVIDIA temperature output has too many rows")
+    readings: list[NvidiaTemperatureReading] = []
+    seen_indices: set[int] = set()
+    seen_buses: set[str] = set()
+    for row in rows:
+        fields = [item.strip() for item in row.split(",")]
+        if len(fields) != 3 or re.fullmatch(r"[0-9]{1,4}", fields[0]) is None:
+            raise ValueError("malformed NVIDIA temperature row")
+        index = int(fields[0])
+        pci_bus_id = normalize_pci_bus_id(fields[1])
+        if pci_bus_id is None or index in seen_indices or pci_bus_id in seen_buses:
+            raise ValueError("ambiguous NVIDIA temperature row")
+        seen_indices.add(index)
+        seen_buses.add(pci_bus_id)
+        raw_temperature = fields[2].lower()
+        celsius: Optional[float] = None
+        if raw_temperature not in {"n/a", "[n/a]", "not supported"}:
+            if re.fullmatch(r"-?[0-9]{1,3}(?:\.[0-9])?", fields[2]) is None:
+                raise ValueError("malformed NVIDIA temperature value")
+            parsed = float(fields[2])
+            if not -40.0 <= parsed <= 200.0:
+                raise ValueError("implausible NVIDIA temperature value")
+            celsius = parsed
+        readings.append(NvidiaTemperatureReading(index, pci_bus_id, celsius))
+    readings.sort(key=lambda reading: reading.index)
+    return NvidiaTemperatureReport(tuple(readings))
+
+
+def _bounded_command_output(
+        command: list[str], timeout: float, max_output_bytes: int,
+) -> Optional[str]:
+    """Run a fixed argv command with a hard time and stdout memory bound."""
+    if not math.isfinite(timeout) or timeout <= 0 or max_output_bytes < 1:
+        raise ValueError("command telemetry bounds must be positive")
+    try:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+    except OSError:
+        return None
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + timeout
+    completed = False
+
+    def kill_process_group() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+
+    try:
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
+        raw = bytearray()
+        eof = False
+        while not eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            events = selector.select(remaining)
+            if not events:
+                return None
+            for _key, _mask in events:
+                while True:
+                    read_size = min(
+                        64 * 1024, max_output_bytes + 1 - len(raw),
+                    )
+                    try:
+                        chunk = os.read(descriptor, read_size)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        eof = True
+                        break
+                    raw.extend(chunk)
+                    if len(raw) > max_output_bytes:
+                        return None
+                if eof:
+                    break
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            return None
+        if return_code != 0:
+            return None
+        output = raw.decode("ascii")
+        completed = True
+        return output
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    finally:
+        selector.close()
+        if not completed:
+            kill_process_group()
+        if process.poll() is None:
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                kill_process_group()
+                try:
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
+        process.stdout.close()
+
+
+def query_nvidia_temperatures(
+        timeout: float = TEMPERATURE_QUERY_TIMEOUT,
+) -> Optional[NvidiaTemperatureReport]:
+    try:
+        output = _bounded_command_output(
+            ["nvidia-smi",
+             "--query-gpu=index,pci.bus_id,temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            timeout, TEMPERATURE_MAX_OUTPUT_BYTES,
+        )
+        if output is None:
+            return None
+        return parse_nvidia_temperatures(output)
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        return None
+
+
+def sample_hardware_temperatures() -> TemperatureSnapshot:
+    return TemperatureSnapshot(
+        time.monotonic(), read_cpu_package_temperature(),
+        query_nvidia_temperatures(),
+    )
+
+
+def update_temperature_cache(
+        cache: TemperatureCache, snapshot: TemperatureSnapshot,
+        stale_after: float = TEMPERATURE_STALE_SECONDS,
+) -> None:
+    """Merge a best-effort sample and expire readings after a grace period."""
+    if not math.isfinite(stale_after) or stale_after <= 0:
+        raise ValueError("temperature stale interval must be positive")
+    now = snapshot.observed_at
+    if snapshot.cpu_celsius is not None:
+        cache.cpu_celsius = snapshot.cpu_celsius
+        cache.cpu_observed_at = now
+    if now - cache.cpu_observed_at >= stale_after:
+        cache.cpu_celsius = None
+
+    if snapshot.nvidia is not None:
+        cache.nvidia_device_count = len(snapshot.nvidia.readings)
+        cache.nvidia_bus_ids = frozenset(
+            reading.pci_bus_id for reading in snapshot.nvidia.readings
+        )
+        cache.nvidia_observed_at = now
+        for reading in snapshot.nvidia.readings:
+            if reading.celsius is not None:
+                cache.gpu_celsius_by_bus[reading.pci_bus_id] = reading.celsius
+                cache.gpu_observed_at_by_bus[reading.pci_bus_id] = now
+    for pci_bus_id, observed_at in tuple(cache.gpu_observed_at_by_bus.items()):
+        if now - observed_at >= stale_after:
+            cache.gpu_observed_at_by_bus.pop(pci_bus_id, None)
+            cache.gpu_celsius_by_bus.pop(pci_bus_id, None)
+    if now - cache.nvidia_observed_at >= stale_after:
+        cache.nvidia_device_count = None
+        cache.nvidia_bus_ids = frozenset()
+
+
+def format_temperature_status(
+        cache: TemperatureCache, selected_device: Optional[int],
+        selected_pci_bus: Optional[str], cuda_device_count: int,
+) -> str:
+    def formatted(value: Optional[float]) -> str:
+        return "—" if value is None else f"{value:.0f} °C"
+
+    normalized_bus = normalize_pci_bus_id(selected_pci_bus)
+    gpu_celsius = (
+        cache.gpu_celsius_by_bus.get(normalized_bus)
+        if normalized_bus is not None else None
+    )
+    # A positional fallback is unambiguous only when both APIs see one GPU.
+    if (gpu_celsius is None and cache.nvidia_device_count == 1
+            and len(cache.nvidia_bus_ids) == 1 and cuda_device_count <= 1):
+        sole_bus = next(iter(cache.nvidia_bus_ids))
+        gpu_celsius = cache.gpu_celsius_by_bus.get(sole_bus)
+    gpu_name = f"GPU {selected_device}" if selected_device is not None else "GPU"
+    return (
+        f"CPU package {formatted(cache.cpu_celsius)}  •  "
+        f"{gpu_name} {formatted(gpu_celsius)}"
+    )
+
+
+def start_temperature_monitor(
+        callback: Callable[[TemperatureSnapshot], None],
+        stop_event: threading.Event, interval: float = TEMPERATURE_POLL_SECONDS,
+        sampler: Optional[Callable[[], TemperatureSnapshot]] = None,
+) -> threading.Thread:
+    """Start optional telemetry without ever doing sensor I/O on Tk's thread."""
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("temperature polling interval must be positive")
+    sample = sample_hardware_temperatures if sampler is None else sampler
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                snapshot = sample()
+            except Exception:
+                snapshot = TemperatureSnapshot(time.monotonic(), None, None)
+            if stop_event.is_set():
+                break
+            try:
+                callback(snapshot)
+            except Exception:
+                if stop_event.is_set():
+                    break
+            if stop_event.wait(interval):
+                break
+
+    thread = threading.Thread(
+        target=worker, daemon=True, name="meshcore-temperature-monitor",
+    )
+    thread.start()
+    return thread
+
+
 def cuda_executable() -> Path:
     return Path(__file__).resolve().with_name("meshcore_cuda_vanity")
 
 
-CUDA_PROBE_PROTOCOL = "meshcore-cuda-probe-v1"
+CUDA_PROBE_PROTOCOL = "meshcore-cuda-probe-v2"
+SUPPORTED_CUDA_PROBE_PROTOCOLS = frozenset((
+    "meshcore-cuda-probe-v1", CUDA_PROBE_PROTOCOL,
+))
 _CUDA_PROBE_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
 _CUDA_PROBE_LOCK = threading.Lock()
 
@@ -386,7 +766,7 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
         if (isinstance(payload.get("schema"), bool)
                 or not isinstance(payload.get("schema"), int)
                 or payload.get("schema") != 1
-                or payload.get("protocol") != CUDA_PROBE_PROTOCOL
+                or payload.get("protocol") not in SUPPORTED_CUDA_PROBE_PROTOCOLS
                 or isinstance(payload.get("device"), bool)
                 or not isinstance(payload.get("device"), int)
                 or payload.get("device") != device or payload.get("engine") != engine
@@ -394,7 +774,7 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
             raise ValueError("probe response does not match the requested protocol")
         allowed = {
             "schema", "protocol", "ready", "device", "device_name",
-            "compute_capability", "engine", "build_fingerprint", "build_arches",
+            "pci_bus_id", "compute_capability", "engine", "build_fingerprint", "build_arches",
             "threads", "blocks_per_sm", "attempts_per_thread", "max_registers",
             "rare_rule_protocol", "default_ruleset_fingerprint", "error",
         }
@@ -412,6 +792,8 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
                 raise ValueError("probe reported readiness with a failing exit status")
             if (not isinstance(payload.get("device_name"), str)
                     or not payload["device_name"]
+                    or ("pci_bus_id" in payload
+                        and normalize_pci_bus_id(payload.get("pci_bus_id")) is None)
                     or not isinstance(payload.get("compute_capability"), str)
                     or re.fullmatch(r"\d+\.\d+", str(payload["compute_capability"])) is None
                     or not isinstance(payload.get("build_fingerprint"), str)
@@ -429,6 +811,10 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
             if completed.returncode == 0 or not isinstance(payload.get("error"), str):
                 raise ValueError("probe failure details are malformed")
         result = {key: payload[key] for key in allowed if key in payload}
+        if result.get("ready") is True and "pci_bus_id" in result:
+            normalized_bus = normalize_pci_bus_id(result.get("pci_bus_id"))
+            assert normalized_bus is not None
+            result["pci_bus_id"] = normalized_bus
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError) as error:
         result = {**base, "error": f"CUDA readiness probe failed: {error}"}
 
@@ -1390,7 +1776,7 @@ def run_gui(
             root.iconphoto(True, window_icon)
         except tk.TclError:
             window_icon = None
-    root.minsize(780, 660)
+    root.minsize(780, 690)
     frame = ttk.Frame(root, padding=16)
     frame.grid(sticky="nsew")
     root.columnconfigure(0, weight=1)
@@ -1486,13 +1872,20 @@ def run_gui(
     ttk.Label(frame, textvariable=diagnostic_text).grid(
         row=9, column=0, columnspan=3, sticky="w", pady=(8, 3),
     )
+    temperature_text = tk.StringVar(value="CPU package —  •  GPU —")
+    ttk.Label(frame, text="Temperatures").grid(
+        row=10, column=0, sticky="w", pady=3,
+    )
+    ttk.Label(frame, textvariable=temperature_text).grid(
+        row=10, column=1, columnspan=2, sticky="w", pady=3,
+    )
     status = tk.StringVar(value="Discovering CUDA devices and checking compatibility…")
-    ttk.Label(frame, textvariable=status).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
+    ttk.Label(frame, textvariable=status).grid(row=11, column=0, columnspan=3, sticky="w", pady=3)
     incidental = tk.StringVar(value="Saved rare incidental keys: counting…")
-    ttk.Label(frame, textvariable=incidental).grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 3))
+    ttk.Label(frame, textvariable=incidental).grid(row=12, column=0, columnspan=3, sticky="w", pady=(0, 3))
     output = tk.Text(frame, width=86, height=10, state="disabled", wrap="word")
-    output.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=5)
-    frame.rowconfigure(12, weight=1)
+    output.grid(row=13, column=0, columnspan=3, sticky="nsew", pady=5)
+    frame.rowconfigure(13, weight=1)
     state: dict[str, object] = {
         "result": None, "cancel": threading.Event(), "searching": False,
         "process": None, "closing": False, "saved_path": None,
@@ -1510,6 +1903,10 @@ def run_gui(
     history_load_cancels: set[threading.Event] = set()
     process_lock = threading.Lock()
     active_process: list[Optional[subprocess.Popen[str]]] = [None]
+    temperature_cache = TemperatureCache()
+    temperature_update_lock = threading.Lock()
+    latest_temperature: list[Optional[TemperatureSnapshot]] = [None]
+    temperature_event_pending = [False]
 
     def open_rare_rule_selector() -> None:
         if state["searching"]:
@@ -1668,6 +2065,37 @@ def run_gui(
         probe = selected_cuda_probe()
         return bool(probe and probe.get("ready"))
 
+    def render_temperatures() -> None:
+        selected = selected_device_index()
+        probe = selected_cuda_probe()
+        pci_bus_id = (
+            str(probe.get("pci_bus_id"))
+            if isinstance(probe, dict) and probe.get("pci_bus_id") is not None
+            else None
+        )
+        temperature_text.set(format_temperature_status(
+            temperature_cache, selected, pci_bus_id, gpu_count,
+        ))
+
+    def apply_latest_temperature() -> None:
+        with temperature_update_lock:
+            snapshot = latest_temperature[0]
+            temperature_event_pending[0] = False
+        if state["closing"] or snapshot is None:
+            return
+        update_temperature_cache(temperature_cache, snapshot)
+        render_temperatures()
+
+    def queue_temperature_snapshot(snapshot: TemperatureSnapshot) -> None:
+        if shutdown_event.is_set():
+            return
+        with temperature_update_lock:
+            latest_temperature[0] = snapshot
+            if temperature_event_pending[0]:
+                return
+            temperature_event_pending[0] = True
+        post_ui(apply_latest_temperature)
+
     def render_diagnostic_summary() -> None:
         if state["discovery_pending"]:
             return
@@ -1692,6 +2120,7 @@ def run_gui(
         pending = bool(state["discovery_pending"])
         searching = bool(state["searching"])
         rare_rule_button.configure(state="disabled" if searching else "normal")
+        render_temperatures()
         if pending or searching:
             button.configure(state="disabled")
             collector_checkbox.configure(state="disabled")
@@ -2528,9 +2957,9 @@ def run_gui(
         reload_records()
 
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
-    activity.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(7, 3))
+    activity.grid(row=14, column=0, columnspan=3, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
-    controls.grid(row=14, column=0, columnspan=3, sticky="ew")
+    controls.grid(row=15, column=0, columnspan=3, sticky="ew")
     button = ttk.Button(
         controls, text="Find vanity key", command=start_search, state="disabled",
     )
@@ -2576,6 +3005,7 @@ def run_gui(
         ),
         ruleset,
     )
+    start_temperature_monitor(queue_temperature_snapshot, shutdown_event)
     return _run_gui_mainloop(root.mainloop, close_window)
 
 

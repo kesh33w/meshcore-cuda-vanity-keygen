@@ -155,7 +155,13 @@ class ProbeInterfaceTests(unittest.TestCase):
             "properties.multiProcessorCount * kBlocksPerSm", CUDA_SOURCE
         )
         self.assertIn("cudaDeviceSynchronize()", CUDA_SOURCE)
-        self.assertIn("meshcore-cuda-probe-v1", CUDA_SOURCE)
+        self.assertIn("meshcore-cuda-probe-v2", CUDA_SOURCE)
+        self.assertIn("constexpr int kProbeSchemaVersion = 1;", CUDA_SOURCE)
+        self.assertEqual(
+            CUDA_SOURCE.count("kProbeSchemaVersion, kRareRuleProtocolVersion"),
+            2,
+        )
+        self.assertIn("(void)cudaGetLastError();", CUDA_SOURCE)
         probe_section = CUDA_SOURCE[
             CUDA_SOURCE.index("int emit_probe_failure"):
             CUDA_SOURCE.index("int run_lane_isolation_self_test")
@@ -206,9 +212,15 @@ class ProbeInterfaceTests(unittest.TestCase):
                 payload = json.loads(completed.stdout)
                 self.assertTrue(payload["ready"])
                 self.assertEqual(payload["schema"], 1)
-                self.assertEqual(payload["protocol"], "meshcore-cuda-probe-v1")
+                self.assertEqual(payload["protocol"], "meshcore-cuda-probe-v2")
                 self.assertEqual(payload["engine"], engine)
                 self.assertRegex(payload["compute_capability"], r"^\d+\.\d+$")
+                if "pci_bus_id" in payload:
+                    self.assertRegex(
+                        payload["pci_bus_id"],
+                        r"^(?:[0-9a-fA-F]{4}|[0-9a-fA-F]{8}):"
+                        r"[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$",
+                    )
                 self.assertRegex(payload["build_fingerprint"], r"^[0-9a-f]{16}$")
                 self.assertNotIn("public_key", payload)
                 self.assertNotIn("private_key", payload)
