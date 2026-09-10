@@ -56,6 +56,7 @@ ICON_HOME="$PREFIX/share/icons/hicolor"
 install -d -m 0755 "$APP_HOME/assets" "$BIN_HOME"
 install -d -m 0755 "$ICON_HOME/scalable/apps" "$ICON_HOME/256x256/apps"
 install -m 0755 "$PROJECT_DIR/meshcore_vanity.py" "$APP_HOME/meshcore_vanity.py"
+install -m 0755 "$PROJECT_DIR/meshcore_key_audit.py" "$APP_HOME/meshcore_key_audit.py"
 install -m 0755 "$PROJECT_DIR/meshcore_cuda_vanity" "$APP_HOME/meshcore_cuda_vanity"
 install -m 0644 "$PROJECT_DIR/VERSION" "$APP_HOME/VERSION"
 install -m 0644 "$PROJECT_DIR/LICENSE" "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" "$APP_HOME/"
@@ -63,6 +64,7 @@ install -m 0644 "$PROJECT_DIR/assets/meshcore-vanity-keygen.png" "$APP_HOME/asse
 install -m 0644 "$PROJECT_DIR/assets/meshcore-vanity-keygen.svg" "$ICON_HOME/scalable/apps/meshcore-vanity-keygen.svg"
 install -m 0644 "$PROJECT_DIR/assets/meshcore-vanity-keygen.png" "$ICON_HOME/256x256/apps/meshcore-vanity-keygen.png"
 install -m 0755 "$PROJECT_DIR/meshcore-vanity-keygen" "$BIN_HOME/meshcore-vanity-keygen"
+install -m 0755 "$PROJECT_DIR/meshcore-key-audit" "$BIN_HOME/meshcore-key-audit"
 
 if ((DESKTOP)); then
     APPLICATIONS_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
@@ -84,6 +86,7 @@ fi
 echo
 echo "Installed MeshCore Vanity Key Generator $(<"$PROJECT_DIR/VERSION")"
 echo "Command: $BIN_HOME/meshcore-vanity-keygen --gui"
+echo "Saved-key audit: $BIN_HOME/meshcore-key-audit PATH"
 if [[ ":$PATH:" != *":$BIN_HOME:"* ]]; then
     echo "Add $BIN_HOME to PATH to use 'meshcore-vanity-keygen' directly."
 fi

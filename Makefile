@@ -23,17 +23,19 @@ test-cpu:
 	python3 -m unittest discover -s tests -v
 
 test-gpu: meshcore_cuda_vanity
+	./meshcore_cuda_vanity --internal-test-lane-isolation
 	RUN_CUDA_TESTS=1 python3 -m unittest discover -s tests -v
 
 check:
-	python3 -m py_compile meshcore_vanity.py tests/test_keygen.py
-	bash -n install.sh uninstall.sh meshcore-vanity-keygen publish_to_github.sh
+	python3 -m py_compile meshcore_vanity.py meshcore_key_audit.py tests/test_keygen.py tests/test_security.py tests/test_audit.py tests/test_firmware_reference.py
+	bash -n install.sh uninstall.sh meshcore-vanity-keygen meshcore-key-audit publish_to_github.sh
 
 install-smoke: meshcore_cuda_vanity
 	tmp_dir=$$(mktemp -d); trap 'rm -rf "$$tmp_dir"' EXIT; \
 	./install.sh --prefix "$$tmp_dir/prefix" --skip-packages --skip-build --no-desktop; \
 	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --version; \
 	"$$tmp_dir/prefix/bin/meshcore-vanity-keygen" --self-test; \
+	"$$tmp_dir/prefix/bin/meshcore-key-audit" --help >/dev/null; \
 	test -f "$$tmp_dir/prefix/share/icons/hicolor/scalable/apps/meshcore-vanity-keygen.svg"; \
 	test -f "$$tmp_dir/prefix/lib/meshcore-vanity-keygen/assets/meshcore-vanity-keygen.png"
 

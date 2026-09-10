@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX="$(cd -- "$BIN_DIR/.." && pwd)"
+APP_HOME="$PREFIX/lib/meshcore-vanity-keygen"
+
+# Work both from an installed prefix and directly from a source checkout.
+if [[ -f "$BIN_DIR/meshcore_key_audit.py" ]]; then
+    APP_HOME="$BIN_DIR"
+fi
+
+exec python3 "$APP_HOME/meshcore_key_audit.py" "$@"

@@ -55,6 +55,14 @@ class Sodium:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_void_p
         ]
         self.lib.crypto_sign_verify_detached.restype = ctypes.c_int
+        self.lib.crypto_sign_ed25519_pk_to_curve25519.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p
+        ]
+        self.lib.crypto_sign_ed25519_pk_to_curve25519.restype = ctypes.c_int
+        self.lib.crypto_scalarmult_curve25519.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+        ]
+        self.lib.crypto_scalarmult_curve25519.restype = ctypes.c_int
         if self.lib.sodium_init() < 0:
             raise RuntimeError("libsodium initialization failed")
 
@@ -74,6 +82,22 @@ class Sodium:
         return self.lib.crypto_sign_verify_detached(
             signature_buffer, message_buffer, len(message), public_buffer
         ) == 0
+
+    def key_exchange(self, scalar: bytes, peer_public: bytes) -> bytes:
+        """Match MeshCore's Ed25519-to-Montgomery shared-secret operation."""
+        if len(scalar) != 32 or len(peer_public) != 32:
+            raise ValueError("invalid MeshCore key-exchange key length")
+        montgomery_public = (ctypes.c_ubyte * 32)()
+        peer_buffer = (ctypes.c_ubyte * 32).from_buffer_copy(peer_public)
+        if self.lib.crypto_sign_ed25519_pk_to_curve25519(
+                montgomery_public, peer_buffer) != 0:
+            raise RuntimeError("libsodium rejected the Ed25519 public key")
+        shared_secret = (ctypes.c_ubyte * 32)()
+        scalar_buffer = (ctypes.c_ubyte * 32).from_buffer_copy(scalar)
+        if self.lib.crypto_scalarmult_curve25519(
+                shared_secret, scalar_buffer, montgomery_public) != 0:
+            raise RuntimeError("libsodium rejected the MeshCore key exchange")
+        return bytes(shared_secret)
 
 
 SODIUM = Sodium()
@@ -124,15 +148,27 @@ def sign_expanded(private: bytes, public: bytes, message: bytes) -> bytes:
     return encoded_nonce + response.to_bytes(32, "little")
 
 
+def meshcore_shared_secret(private: bytes, peer_public: bytes) -> bytes:
+    """Calculate the shared secret produced by MeshCore's ed25519_key_exchange."""
+    if len(private) != 64:
+        raise ValueError("invalid expanded Ed25519 private-key length")
+    return SODIUM.key_exchange(private[:32], peer_public)
+
+
 def verify_expanded_key(private: bytes, public: bytes) -> bool:
     if (len(private) != 64 or len(public) != 32 or private[0] & 7
-            or private[31] & 128 or not private[31] & 64):
+            or private[31] & 128 or not private[31] & 64
+            or public[0] in (0, 255)):
         return False
     message = b"MeshCore vanity key compatibility test"
     try:
-        return SODIUM.derive_public(private[:32]) == public and SODIUM.verify(
-            sign_expanded(private, public, message), message, public
-        )
+        if (SODIUM.derive_public(private[:32]) != public
+                or not SODIUM.verify(sign_expanded(private, public, message), message, public)):
+            return False
+        from_private = meshcore_shared_secret(private, ECDH_TEST_PEER_PUBLIC)
+        from_peer = meshcore_shared_secret(ECDH_TEST_PEER_PRIVATE, public)
+        return (bool(any(from_private))
+                and secrets.compare_digest(from_private, from_peer))
     except (ValueError, RuntimeError):
         return False
 
@@ -273,7 +309,7 @@ def cuda_device_names() -> list[str]:
 def diagnostics() -> dict[str, object]:
     devices = cuda_device_count()
     names = cuda_device_names()
-    firmware_vector = SODIUM.derive_public(TEST_PRIVATE[:32]).hex() == TEST_PUBLIC
+    firmware_vector = firmware_compatibility_test()
     return {
         "version": APP_VERSION,
         "firmware_vector": firmware_vector,
@@ -415,7 +451,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
         private = bytes.fromhex(private_hex)
     except (KeyError, ValueError, IndexError, json.JSONDecodeError) as error:
         raise RuntimeError("CUDA engine returned an invalid result") from error
-    if (payload.get("engine") != engine or not verify_expanded_key(private, public)
+    if (payload.get("engine") != engine or public[0] in (0, 255)
+            or not verify_expanded_key(private, public)
             or not matches(public_hex, prefix, suffix, contains)):
         raise RuntimeError("CUDA result failed independent CPU verification")
     needle = ", ".join(part for part in (prefix and f"prefix {prefix}", suffix and f"suffix {suffix}", contains and f"contains {contains}") if part)
@@ -685,10 +722,40 @@ TEST_PRIVATE = bytes.fromhex(
     "c4681193c7b9bc39945ba8064104bb618f8fd7a84a0af6f57033d6e8ddcd6471")
 TEST_PUBLIC = "1ec77175b0918ed206f9ae04ec136d6d5d4315bb26305427f645b492e9350c10"
 
+# A deterministic, non-secret second identity makes the firmware's two-sided
+# ECDH validation reproducible without depending on a device or random input.
+_ECDH_TEST_DIGEST = bytearray(
+    hashlib.sha512(b"MeshCore vanity ECDH validation peer").digest()
+)
+_ECDH_TEST_DIGEST[0] &= 248
+_ECDH_TEST_DIGEST[31] &= 63
+_ECDH_TEST_DIGEST[31] |= 64
+ECDH_TEST_PEER_PRIVATE = bytes(_ECDH_TEST_DIGEST)
+ECDH_TEST_PEER_PUBLIC = bytes.fromhex(
+    "8fca689524405a1529f7ae57f3b11e5e40fe32d73432401914393e9ca4b16b9a"
+)
+ECDH_TEST_SHARED = bytes.fromhex(
+    "86d47e289ad85d9b272a0fd1a739f6931d47ce0be5c5ea5ba6206644b73be228"
+)
+del _ECDH_TEST_DIGEST
+
+
+def firmware_compatibility_test() -> bool:
+    """Exercise the same derivation, signing, and ECDH checks as firmware."""
+    public = bytes.fromhex(TEST_PUBLIC)
+    if not verify_expanded_key(TEST_PRIVATE, public):
+        return False
+    try:
+        shared = meshcore_shared_secret(TEST_PRIVATE, ECDH_TEST_PEER_PUBLIC)
+        return secrets.compare_digest(shared, ECDH_TEST_SHARED)
+    except (ValueError, RuntimeError):
+        return False
+
 
 def self_test() -> bool:
-    valid = verify_expanded_key(TEST_PRIVATE, bytes.fromhex(TEST_PUBLIC))
-    print("PASS" if valid else "FAIL", "MeshCore firmware derivation and signature vector")
+    valid = firmware_compatibility_test()
+    print("PASS" if valid else "FAIL",
+          "MeshCore firmware derivation, signature, and shared-secret vector")
     return valid
 
 

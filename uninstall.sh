@@ -20,11 +20,12 @@ done
 
 APP_HOME="$PREFIX/lib/meshcore-vanity-keygen"
 BIN_PATH="$PREFIX/bin/meshcore-vanity-keygen"
+AUDIT_BIN_PATH="$PREFIX/bin/meshcore-key-audit"
 DESKTOP_PATH="${XDG_DATA_HOME:-$HOME/.local/share}/applications/meshcore-vanity-keygen.desktop"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}/meshcore-vanity-keygen"
 ICON_HOME="$PREFIX/share/icons/hicolor"
 
-rm -f -- "$BIN_PATH" "$DESKTOP_PATH" \
+rm -f -- "$BIN_PATH" "$AUDIT_BIN_PATH" "$DESKTOP_PATH" \
     "$ICON_HOME/scalable/apps/meshcore-vanity-keygen.svg" \
     "$ICON_HOME/256x256/apps/meshcore-vanity-keygen.png"
 if [[ -d "$APP_HOME" ]]; then

@@ -19,7 +19,7 @@ jobs:
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y libsodium23 shellcheck
       - name: Static checks
-        run: make check && shellcheck install.sh uninstall.sh meshcore-vanity-keygen publish_to_github.sh
+        run: make check && shellcheck install.sh uninstall.sh meshcore-vanity-keygen meshcore-key-audit publish_to_github.sh
       - name: CPU tests
         run: make test
 

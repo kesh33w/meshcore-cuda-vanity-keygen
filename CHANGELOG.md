@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## 1.5.2 — 2026-09-10
+
+- Derive a separate pseudorandom expanded Ed25519 private key for every
+  optimized CUDA lane, while retaining the fast bounded `+8` walk inside each
+  lane.
+- Retain at most one identity from any optimized lane and suppress an earlier
+  incidental identity when that lane later wins the requested search. This
+  prevents saved identities from exposing a small, known scalar relationship.
+- Add an independent final rejection for MeshCore-reserved `00` and `ff`
+  public-key prefixes.
+- Extend retained-key validation with the same Ed25519-to-X25519 shared-secret
+  operation used by MeshCore, in addition to public derivation and signatures.
+- Add `meshcore-key-audit`, a read-only, key-redacting validator and bounded
+  scalar-correlation detector for existing identity JSON and rare-key JSONL
+  files.
+- Document the v1.5.1-and-earlier optimized-output advisory and local audit and
+  rotation guidance.
+- Add regression coverage for key exchange, reserved prefixes, the auditor,
+  and both CUDA engines.
+
 ## 1.5.1 — 2026-09-08
 
 - Stop collecting the `f00df00d00` and `fadefade00` phrase prefixes.

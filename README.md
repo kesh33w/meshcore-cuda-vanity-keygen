@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.5.1**. Generated identities have been validated
+The current release is **v1.5.2**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -15,10 +15,10 @@ For a normal desktop installation, clone the repository and run:
 ./install.sh
 ```
 
-This installs missing Ubuntu dependencies, builds the CUDA engine, installs a
-`meshcore-vanity-keygen` command under `~/.local/bin`, and adds **MeshCore
-Vanity Key Generator** to the desktop application menu. It does not install or
-replace the NVIDIA display driver.
+This installs missing Ubuntu dependencies, builds the CUDA engine, installs
+`meshcore-vanity-keygen` and `meshcore-key-audit` commands under
+`~/.local/bin`, and adds **MeshCore Vanity Key Generator** to the desktop
+application menu. It does not install or replace the NVIDIA display driver.
 
 Launch it from the application menu or run:
 
@@ -78,20 +78,23 @@ select a GPU when more than one is installed:
 python3 meshcore_vanity.py --backend cuda --device 1 --suffix 1337
 ```
 
-The default optimized engine starts every batch from a securely random, clamped
-scalar. Each GPU thread calculates one full public point and then walks forward
-with the much cheaper `scalar += 8` and `point += 8B` operations. It compresses
-32 projective public points together using Montgomery's batch-inversion trick,
-sharing one expensive field inversion across the entire group. The second half
-of the expanded private key (the Ed25519 nonce prefix) is generated independently
-from `/dev/urandom` only when a key is retained, so it is never reused between
-saved identities. The older full-SHA-512/full-multiplication implementation
+The default optimized engine begins each batch with a securely random seed and
+uses domain-separated SHA-512 to derive an independent expanded Ed25519 private
+key for every GPU lane. Each lane calculates one full public point and then
+walks forward with the much cheaper `scalar += 8` and `point += 8B` operations.
+It compresses 32 projective public points together using Montgomery's
+batch-inversion trick,
+sharing one expensive field inversion across the entire group. SHA-512 also
+supplies a separate Ed25519 nonce prefix for each lane. At most one identity is
+retained from a lane, so two saved identities never come from the same short
+`+8` walk. The older full-SHA-512/full-multiplication implementation
 remains available for comparison with `--cuda-engine baseline` or from the GUI's
 CUDA engine selector. The former `incremental` CLI name remains an alias for
 `optimized`.
 
-Every retained GPU key is re-derived, pattern-checked, used to create a test
-signature, and signature-verified independently on the CPU before it is
+Every retained GPU key is independently re-derived and pattern-checked on the
+CPU. It must also create a valid test signature and produce matching, nonzero
+shared secrets through MeshCore's Ed25519 key-exchange path before it is
 displayed or saved. Requested patterns that are impossible—including keys
 beginning with the MeshCore-rejected bytes `00` or `ff`—are rejected up front.
 The Cancel button, window close action, and `Ctrl+C` stop the CUDA process.
@@ -203,6 +206,33 @@ remain visible, but those patterns are no longer collected. Version-2 records
 are larger than the original minimal records, so storage growth depends on how
 many traits each key matches.
 
+## Audit saved identities
+
+Release v1.5.1 and earlier used one bounded scalar walk across all optimized
+CUDA lanes in a batch. A risk exists when two or more retained identities came
+from the same batch: their private scalars have a small, detectable
+relationship. Disclosure of one related scalar can therefore allow recovery of
+another with a bounded search, even though the saved nonce prefixes differ.
+v1.5.2 isolates lanes and retains at most one identity from each bounded walk.
+
+After upgrading, audit existing identity JSON and rare-key JSONL files locally:
+
+```bash
+meshcore-key-audit ~/.local/share/meshcore-vanity-keygen/results
+```
+
+The auditor reads files without modifying them, refuses symbolic links, and
+reports only aggregate counts plus opaque file/line identifiers by default. It
+never includes public or private key contents in text or JSON output. After a
+finding, rerun locally with `--show-paths` to map opaque IDs to the records that
+should be reviewed and replaced; note that generated filenames may themselves
+contain a public-key prefix. Run `meshcore-key-audit --help` for JSON output and
+threshold options. A `CLEAN` result applies to the files scanned and the
+configured correlation span. The conservative default covers `2^40`
+candidates—far above the shipped pre-v1.5.2 launch span. Increase
+`--max-candidate-span` only when auditing keys made by a custom build whose
+launch span exceeded that bound.
+
 The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
 `THIRD_PARTY_NOTICES.md`.
 
@@ -215,10 +245,14 @@ make test-gpu
 ```
 
 The compatibility check and CPU suite derive the public key from the MeshCore
-firmware's known-good private-key test vector and verify a signature made with
-its expanded key. The opt-in GPU suite exercises repeated incremental point
-addition, tests both CUDA engines, verifies generated signatures, and confirms
-cancellation leaves no child process behind.
+firmware's known-good private-key test vector, verify a signature made with its
+expanded key, and exercise the firmware-compatible shared-secret path. The
+shared-secret test includes an independent Python implementation of the
+conversion and Montgomery ladder used by MeshCore at upstream commit
+`d92964352441e53b93e8667b802e04f6e072b39e`. The
+opt-in GPU suite exercises repeated incremental point addition, tests both CUDA
+engines, verifies generated identities, and confirms cancellation leaves no
+child process behind.
 
 For v1.0.0, a CUDA-generated `c0dec0…` identity was also imported into a
 RAK4631 running MeshCore v1.17.1. The device exported the exact private key,
