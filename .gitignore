@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 meshcore_cuda_vanity
+meshcore_cuda_vanity.d
+.meshcore_cuda_vanity.build-*
 results/

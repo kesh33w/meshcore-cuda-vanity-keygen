@@ -1,0 +1,384 @@
+import copy
+from contextlib import redirect_stderr
+from io import StringIO
+import json
+import os
+import stat
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+import rare_rules
+from tools import generate_rare_rules
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BINARY = ROOT / "meshcore_cuda_vanity"
+
+
+REMOVED_PREFIXES = (
+    "cafecafe00",
+    "beefbeef00",
+    "deadbeef00",
+    "facebabe00",
+    "babecafe00",
+    "f00df00d00",
+    "fadefade00",
+)
+
+
+def literal_rule(rule_id: str, value: str, enabled: bool = True) -> dict[str, object]:
+    return {
+        "id": rule_id,
+        "kind": "literal-prefix",
+        "enabled": enabled,
+        "value": value,
+    }
+
+
+def document_with(*rules: dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "ruleset_id": "test-rules",
+        "rules": list(rules),
+    }
+
+
+class RareRulesTests(unittest.TestCase):
+    def test_default_indices_triggers_and_removed_categories(self):
+        ruleset = rare_rules.DEFAULT_RULESET
+        self.assertEqual(
+            ruleset.watch_reasons,
+            (
+                "bookend-10",
+                "mirror-10",
+                "repeat-prefix-10",
+                "prefix-1337133713",
+                "prefix-pi-3141592653",
+            ),
+        )
+        middle = "1" * 44
+        examples = (
+            "abcde12345" + middle + "abcde12345",
+            "abcde12345" + middle + "54321edcba",
+            "b" * 10 + "1234567890" * 5 + "1234",
+            "1337133713" + "1" * 54,
+            "3141592653" + "1" * 54,
+        )
+        for expected, public_hex in enumerate(examples):
+            self.assertEqual(ruleset.classify(public_hex), expected)
+        for removed in REMOVED_PREFIXES:
+            self.assertEqual(ruleset.classify(removed + "1" * 54), -1)
+            self.assertNotIn(removed, json.dumps(ruleset.normalized()))
+
+    def test_default_analysis_preserves_stronger_and_overlapping_matches(self):
+        repeat_key = "a" * 13 + "1234567890abcdef" * 3 + "123"
+        repeat = rare_rules.analyze(repeat_key)[0]
+        self.assertEqual((repeat.reason, repeat.kind, repeat.length),
+                         ("repeat-prefix-13", "repeat-prefix", 13))
+        self.assertAlmostEqual(repeat.rarity_bits, 13 * 4 - 3.807, places=3)
+
+        pi_key = "314159265358979" + "a" * 49
+        pi = rare_rules.analyze(pi_key)[0]
+        self.assertEqual(
+            (pi.reason, pi.kind, pi.length, pi.rarity_bits),
+            ("prefix-pi-314159265358979", "pi-prefix", 15, 60.0),
+        )
+
+        matches = rare_rules.analyze("1" * 64)
+        self.assertEqual(matches[0].reason, "repeat-prefix-64")
+        self.assertEqual(
+            {match.kind for match in matches}, {"bookend", "mirror", "repeat-prefix"}
+        )
+
+    def test_default_rarity_limits_are_conservative(self):
+        ruleset = rare_rules.DEFAULT_RULESET
+        self.assertGreaterEqual(
+            min(rule.rarity_bits for rule in ruleset.rules),
+            rare_rules.MIN_INDIVIDUAL_RARITY_BITS,
+        )
+        self.assertGreaterEqual(
+            ruleset.rarity_bits_lower_bound, rare_rules.MIN_RULESET_RARITY_BITS
+        )
+        self.assertAlmostEqual(ruleset.rarity_bits_lower_bound, 35.83, places=2)
+
+    def test_custom_rules_classify_and_serialize_in_active_order(self):
+        ruleset = rare_rules.parse_ruleset(document_with(
+            literal_rule("disabled-rule", "abcdef1234", enabled=False),
+            literal_rule("first", "123456789a"),
+            {
+                "id": "repeat-prefix",
+                "kind": "repeat-prefix",
+                "enabled": True,
+                "minimum_nibbles": 10,
+                "excluded_nibbles": "0f",
+            },
+        ))
+        self.assertEqual(ruleset.classify("123456789a" + "0" * 54), 0)
+        self.assertEqual(ruleset.classify("c" * 10 + "1" * 54), 1)
+        self.assertEqual(
+            ruleset.cuda_arguments(),
+            (
+                "--rare-rules-v1",
+                ruleset.fingerprint,
+                "--rare-rule-v1",
+                "3:10:0000:123456789a",
+                "--rare-rule-v1",
+                "2:10:8001:",
+            ),
+        )
+        self.assertLessEqual(max(map(len, ruleset.cuda_arguments())), 80)
+
+    def test_fingerprint_is_semantic_deterministic_and_order_sensitive(self):
+        first = literal_rule("first", "123456789a")
+        second = literal_rule("second", "abcdef1234")
+        document = document_with(first, second)
+        reordered_keys = {
+            "rules": [dict(reversed(tuple(item.items()))) for item in document["rules"]],
+            "ruleset_id": document["ruleset_id"],
+            "schema_version": document["schema_version"],
+        }
+        a = rare_rules.parse_ruleset(document)
+        b = rare_rules.parse_ruleset(reordered_keys)
+        c = rare_rules.parse_ruleset(document_with(second, first))
+        self.assertEqual(a.fingerprint, b.fingerprint)
+        self.assertNotEqual(a.fingerprint, c.fingerprint)
+        self.assertRegex(a.fingerprint, r"[0-9a-f]{64}\Z")
+
+    def test_strict_schema_rejects_invalid_documents(self):
+        valid = document_with(literal_rule("valid", "12345678"))
+        invalid_documents: list[object] = []
+
+        unknown_root = copy.deepcopy(valid)
+        unknown_root["extra"] = True
+        invalid_documents.append(unknown_root)
+
+        wrong_schema = copy.deepcopy(valid)
+        wrong_schema["schema_version"] = 2
+        invalid_documents.append(wrong_schema)
+
+        invalid_documents.extend((
+            document_with(
+                literal_rule("duplicate", "12345678"),
+                literal_rule("duplicate", "abcdef12"),
+            ),
+            document_with({"id": "bad", "kind": "unknown", "enabled": True}),
+            document_with(literal_rule("uppercase", "ABCDEF12")),
+            document_with(literal_rule("too-short", "1234567")),
+            document_with({
+                "id": "repeat-prefix", "kind": "repeat-prefix", "enabled": True,
+                "minimum_nibbles": 10, "excluded_nibbles": "0",
+            }),
+            document_with({
+                "id": "sequence", "kind": "sequence-prefix", "enabled": True,
+                "minimum_nibbles": 11, "value": "123456789a",
+            }),
+            document_with({
+                "id": "bookend", "kind": "bookend", "enabled": True,
+                "minimum_nibbles": 33,
+            }),
+        ))
+        too_many = document_with(*(
+            literal_rule(f"rule-{index}", f"a{index:07x}") for index in range(33)
+        ))
+        invalid_documents.append(too_many)
+        too_frequent_together = document_with(*(
+            literal_rule(f"rule-{index}", f"a{index:07x}") for index in range(17)
+        ))
+        invalid_documents.append(too_frequent_together)
+
+        for index, document in enumerate(invalid_documents):
+            with self.subTest(index=index), self.assertRaises(rare_rules.RuleConfigError):
+                rare_rules.parse_ruleset(document)
+
+    def test_generated_header_is_current_and_contains_same_fingerprint(self):
+        root = Path(rare_rules.__file__).resolve().parent
+        header_path = root / "generated" / "rare_rules_default.cuh"
+        expected = generate_rare_rules.render_header(rare_rules.DEFAULT_RULESET)
+        self.assertEqual(header_path.read_text(encoding="utf-8"), expected)
+        self.assertIn(rare_rules.DEFAULT_RULESET.fingerprint, expected)
+        self.assertIn("constexpr unsigned int kRuleCount = 5U;", expected)
+        for trigger in rare_rules.DEFAULT_RULESET.watch_reasons:
+            self.assertIn(f'"{trigger}"', expected)
+        self.assertIn("__device__ __forceinline__ int classify_generated_default", expected)
+        cuda_source = (root / "cuda_vanity.cu").read_text(encoding="utf-8")
+        self.assertIn("meshcore_rare_generated::classify_generated_default", cuda_source)
+        self.assertNotIn("gpu_watch_words", cuda_source)
+        self.assertNotIn("gpu_pi_prefix", cuda_source)
+
+    def test_generator_check_and_write_if_changed(self):
+        expected = generate_rare_rules.render_header(rare_rules.DEFAULT_RULESET)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "rules.cuh"
+            self.assertTrue(generate_rare_rules.write_if_changed(output, expected))
+            first_stat = output.stat()
+            self.assertEqual(stat.S_IMODE(first_stat.st_mode), 0o644)
+            self.assertFalse(generate_rare_rules.write_if_changed(output, expected))
+            self.assertEqual(output.stat().st_mtime_ns, first_stat.st_mtime_ns)
+            self.assertEqual(
+                generate_rare_rules.main(["--output", str(output), "--check"]), 0
+            )
+            output.write_text("stale\n", encoding="utf-8")
+            with redirect_stderr(StringIO()):
+                self.assertEqual(
+                    generate_rare_rules.main(["--output", str(output), "--check"]), 1
+                )
+            self.assertEqual(output.read_text(encoding="utf-8"), "stale\n")
+
+    def test_load_ruleset_rejects_oversized_and_malformed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = root / "malformed.json"
+            malformed.write_text("not JSON", encoding="utf-8")
+            with self.assertRaises(rare_rules.RuleConfigError):
+                rare_rules.load_ruleset(malformed)
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b" " * (rare_rules.MAX_CONFIG_BYTES + 1))
+            with self.assertRaises(rare_rules.RuleConfigError):
+                rare_rules.load_ruleset(oversized)
+            duplicate = root / "duplicate.json"
+            duplicate.write_text(
+                '{"schema_version":1,"schema_version":1,'
+                '"ruleset_id":"duplicate","rules":[]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(rare_rules.RuleConfigError, "duplicate field"):
+                rare_rules.load_ruleset(duplicate)
+
+
+@unittest.skipUnless(BINARY.is_file(), "CUDA executable has not been built")
+class NativeCudaRareProtocolTests(unittest.TestCase):
+    def run_parser(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(BINARY), "--internal-test-rare-rules", *arguments],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+    def test_exact_generated_default_is_the_only_fast_path(self):
+        default_arguments = rare_rules.DEFAULT_RULESET.cuda_arguments()
+        exact = self.run_parser(*default_arguments)
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        exact_payload = json.loads(exact.stdout)
+        self.assertEqual(exact_payload["rules"], 5)
+        self.assertTrue(exact_payload["default_fast_path"])
+
+        altered = list(default_arguments)
+        altered[altered.index("3:10:0000:1337133713")] = "3:10:0000:123456789a"
+        mismatch = self.run_parser(*altered)
+        self.assertEqual(mismatch.returncode, 0, mismatch.stderr)
+        self.assertFalse(json.loads(mismatch.stdout)["default_fast_path"])
+
+    def test_host_parser_accepts_32_ordered_rules(self):
+        arguments = ["--rare-rules-v1", "1" * 64]
+        for index in range(32):
+            arguments.extend((
+                "--rare-rule-v1", f"3:16:0000:1{index:015x}",
+            ))
+        completed = self.run_parser(*arguments)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual(payload["rules"], 32)
+        self.assertFalse(payload["default_fast_path"])
+
+    def test_malformed_protocol_is_rejected_before_cuda(self):
+        fingerprint = "a" * 64
+        valid = "3:10:0000:123456789a"
+        invalid_commands = (
+            ("--rare-rules-v1", fingerprint),
+            ("--rare-rules-v1", fingerprint.upper(), "--rare-rule-v1", valid),
+            ("--rare-rule-v1", valid),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "03:10:0000:123456789a"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:010:0000:123456789a"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:10:0000:123456789A"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:10:0000:123456789a:extra"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "0:33:0000:"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "2:10:0001:"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:9:0000:123456789a"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:10:0000:003456789a"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:7:0000:1234567"),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", valid,
+             "--collect-only", "--rare-rule-v1", valid),
+            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", valid,
+             "--rare-rules-v1", fingerprint),
+        )
+        too_many = ["--rare-rules-v1", fingerprint]
+        for index in range(33):
+            too_many.extend(("--rare-rule-v1", f"3:16:0000:1{index:015x}"))
+
+        for arguments in (*invalid_commands, tuple(too_many)):
+            with self.subTest(arguments=arguments):
+                completed = self.run_parser(*arguments)
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertIn("Invalid rare-rule protocol:", completed.stderr)
+
+    def test_probe_source_reports_rule_protocol_and_default_fingerprint(self):
+        source = (ROOT / "cuda_vanity.cu").read_text(encoding="utf-8")
+        self.assertIn('"\\\"rare_rule_protocol\\\":%d', source)
+        self.assertIn('\\\"default_ruleset_fingerprint\\\":\\\"%s', source)
+
+    @unittest.skipUnless(
+        os.environ.get("RUN_CUDA_TESTS") == "1",
+        "CUDA classifier parity test is opt-in",
+    )
+    def test_gpu_default_and_custom_classifier_parity(self):
+        default_samples = (
+            "abcde12345" + "1" * 44 + "abcde12345",
+            "abcde12345" + "2" * 44 + "54321edcba",
+            "b" * 10 + "23456789abcdef" * 3 + "23456789abcd",
+            "1337133713" + "2" * 54,
+            "3141592653" + "2" * 54,
+            "123456789a" + "2" * 54,
+            "1" * 64,
+        )
+        custom = rare_rules.parse_ruleset(document_with(
+            {"id": "bookend", "kind": "bookend", "enabled": True,
+             "minimum_nibbles": 12},
+            {"id": "mirror", "kind": "mirror", "enabled": True,
+             "minimum_nibbles": 11},
+            {"id": "repeat", "kind": "repeat-prefix", "enabled": True,
+             "minimum_nibbles": 11, "excluded_nibbles": "0f"},
+            literal_rule("literal", "abcdef1234"),
+            {"id": "sequence", "kind": "sequence-prefix", "enabled": True,
+             "minimum_nibbles": 10,
+             "value": "271828182845904523536028747135266249775724709369995"},
+        ))
+        custom_samples = (
+            "123456789abc" + "2" * 40 + "123456789abc",
+            "abcdef12345" + "2" * 42 + "54321fedcba",
+            "b" * 11 + "2" * 53,
+            "abcdef1234" + "2" * 54,
+            "2718281828" + "2" * 54,
+            "123456789a" + "2" * 54,
+            "1" * 64,
+        )
+
+        for ruleset, samples, expect_fast in (
+                (rare_rules.DEFAULT_RULESET, default_samples, True),
+                (custom, custom_samples, False)):
+            arguments: list[str] = []
+            for sample in samples:
+                arguments.extend(("--internal-test-rare-classifier", sample))
+            arguments.extend(ruleset.cuda_arguments())
+            completed = subprocess.run(
+                [str(BINARY), *arguments], cwd=ROOT, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(
+                payload["indices"], [ruleset.classify(sample) for sample in samples]
+            )
+            self.assertEqual(payload["default_fast_path"], expect_fast)
+            self.assertTrue(payload["default_generic_parity"])
+            self.assertNotIn("private", completed.stdout)
+            self.assertNotIn("public", completed.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

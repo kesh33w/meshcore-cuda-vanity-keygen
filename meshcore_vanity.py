@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import ctypes
 import ctypes.util
 import fcntl
@@ -25,6 +24,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from rare_rules import (
+    CUDA_RULE_PROTOCOL_VERSION,
+    DEFAULT_RULESET as DEFAULT_RARE_RULESET,
+    RareMatch,
+    RareRuleset,
+    RuleConfigError,
+    load_ruleset,
+)
+
 APP_DIR = Path(__file__).resolve().parent
 VERSION_PATH = APP_DIR / "VERSION"
 APP_VERSION = VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.is_file() else "development"
@@ -32,14 +40,21 @@ DEFAULT_RESULTS_DIR = Path(
     os.environ.get("MESHCORE_VANITY_RESULTS_DIR", str(APP_DIR / "results"))
 ).expanduser().resolve()
 DEFAULT_WATCH_PATH = DEFAULT_RESULTS_DIR / "rare-keys.jsonl"
-REFERENCE_CUDA_RATE = 880_000_000.0
+REFERENCE_CUDA_RATE = 870_000_000.0
 ICON_PATH = APP_DIR / "assets" / "meshcore-vanity-keygen.png"
-RARE_LOG_SCHEMA = 2
+RARE_LOG_SCHEMA = 3
 RARE_BROWSER_LIMIT = 10_000
-WATCH_WORDS = (
-    "1337133713",
+RARE_BROWSER_PAGE_SIZE = 500
+RARE_READ_BLOCK_SIZE = 64 * 1024
+RARE_MAX_RECORD_BYTES = 1024 * 1024
+WATCH_WORDS = tuple(
+    rule.value for rule in DEFAULT_RARE_RULESET.rules
+    if rule.kind == "literal-prefix" and rule.enabled
 )
-PI_DIGITS = "3141592653589793238462643383279502884197169399375105820974944592"
+PI_DIGITS = next(
+    rule.value for rule in DEFAULT_RARE_RULESET.rules
+    if rule.kind == "sequence-prefix" and rule.id == "pi"
+)
 
 
 class Sodium:
@@ -104,6 +119,12 @@ SODIUM = Sodium()
 
 
 class SearchCancelled(RuntimeError):
+    pass
+
+
+class SearchWorkerError(RuntimeError):
+    """A CPU search worker stopped unexpectedly."""
+
     pass
 
 
@@ -184,15 +205,6 @@ class Result:
     engine: Optional[str] = None
 
 
-@dataclass(frozen=True)
-class RareMatch:
-    reason: str
-    kind: str
-    length: int
-    rarity_bits: float
-    mean_attempts: str
-
-
 def valid_pattern(value: str, label: str) -> str:
     value = value.strip().lower()
     if value and any(ch not in "0123456789abcdef" for ch in value):
@@ -239,45 +251,66 @@ def matches(key: str, prefix: str, suffix: str, contains: str) -> bool:
 def search(prefix: str, suffix: str, contains: str, workers: int,
            update: Optional[Callable[[int, float], None]] = None,
            cancel: Optional[threading.Event] = None) -> Result:
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
     stop = threading.Event()
     found: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=1)
+    failures: queue.Queue[BaseException] = queue.Queue(maxsize=1)
     counts = [0] * workers
     start = time.monotonic()
 
     def worker(index: int) -> None:
         local_count = 0
-        while not stop.is_set() and not (cancel and cancel.is_set()):
-            public, private = meshcore_keypair()
-            local_count += 1
-            public_hex = public.hex()
-            # MeshCore rejects these identities when importing the private key.
-            if public[0] not in (0, 255) and matches(public_hex, prefix, suffix, contains):
-                try:
-                    found.put_nowait((public_hex, private.hex()))
-                    stop.set()
-                except queue.Full:
-                    pass
-                break
-            if local_count % 256 == 0:
-                counts[index] = local_count
-        counts[index] = local_count
+        try:
+            while not stop.is_set() and not (cancel and cancel.is_set()):
+                public, private = meshcore_keypair()
+                local_count += 1
+                public_hex = public.hex()
+                # MeshCore rejects these identities when importing the private key.
+                if public[0] not in (0, 255) and matches(public_hex, prefix, suffix, contains):
+                    try:
+                        found.put_nowait((public_hex, private.hex()))
+                        stop.set()
+                    except queue.Full:
+                        pass
+                    break
+                if local_count % 256 == 0:
+                    counts[index] = local_count
+        except BaseException as error:
+            # A failed daemon worker must wake the coordinator. Otherwise every
+            # remaining worker can search forever for an impossible/test target.
+            try:
+                failures.put_nowait(error)
+            except queue.Full:
+                pass
+            stop.set()
+        finally:
+            counts[index] = local_count
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(workers)]
     for thread in threads:
         thread.start()
     last = 0.0
-    while not stop.wait(0.1):
-        if cancel and cancel.is_set():
-            stop.set()
-            break
-        elapsed = time.monotonic() - start
-        if update and elapsed - last >= 0.25:
-            update(sum(counts), elapsed)
-            last = elapsed
-    for thread in threads:
-        thread.join()
+    try:
+        while not stop.wait(0.1):
+            if cancel and cancel.is_set():
+                stop.set()
+                break
+            elapsed = time.monotonic() - start
+            if update and elapsed - last >= 0.25:
+                update(sum(counts), elapsed)
+                last = elapsed
+    except BaseException:
+        stop.set()
+        raise
+    finally:
+        for thread in threads:
+            thread.join()
     elapsed = time.monotonic() - start
     attempts = sum(counts)
+    if not failures.empty():
+        failure = failures.get_nowait()
+        raise SearchWorkerError(f"CPU search worker failed: {failure}") from failure
     if found.empty():
         raise SearchCancelled("Search cancelled")
     public_hex, private_hex = found.get_nowait()
@@ -289,8 +322,123 @@ def cuda_executable() -> Path:
     return Path(__file__).resolve().with_name("meshcore_cuda_vanity")
 
 
-def cuda_available() -> bool:
-    return cuda_device_count() > 0 and cuda_executable().is_file()
+CUDA_PROBE_PROTOCOL = "meshcore-cuda-probe-v1"
+_CUDA_PROBE_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
+_CUDA_PROBE_LOCK = threading.Lock()
+
+
+def cuda_probe(device: int = 0, engine: str = "optimized", *,
+               refresh: bool = False, timeout: float = 5.0) -> dict[str, object]:
+    """Exercise a real kernel and return a validated, key-free readiness report."""
+    if device < 0:
+        raise ValueError("CUDA device must be zero or greater")
+    if engine == "incremental":
+        engine = "optimized"
+    if engine not in ("optimized", "baseline"):
+        raise ValueError("CUDA engine must be optimized or baseline")
+    executable = cuda_executable()
+    base: dict[str, object] = {
+        "schema": 1,
+        "protocol": CUDA_PROBE_PROTOCOL,
+        "ready": False,
+        "device": device,
+        "engine": engine,
+    }
+    try:
+        metadata = executable.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("CUDA engine is not a regular file")
+    except OSError as error:
+        return {**base, "error": str(error)}
+    cache_key = (
+        str(executable.resolve()), metadata.st_dev, metadata.st_ino,
+        metadata.st_size, metadata.st_mtime_ns, device, engine,
+    )
+    with _CUDA_PROBE_LOCK:
+        cached = _CUDA_PROBE_CACHE.get(cache_key)
+    if cached is not None and not refresh:
+        return dict(cached)
+
+    try:
+        completed = subprocess.run(
+            [str(executable), "--probe", "--device", str(device), "--engine", engine],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+        payload = json.loads(completed.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("probe output is not a JSON object")
+        if (isinstance(payload.get("schema"), bool)
+                or not isinstance(payload.get("schema"), int)
+                or payload.get("schema") != 1
+                or payload.get("protocol") != CUDA_PROBE_PROTOCOL
+                or isinstance(payload.get("device"), bool)
+                or not isinstance(payload.get("device"), int)
+                or payload.get("device") != device or payload.get("engine") != engine
+                or not isinstance(payload.get("ready"), bool)):
+            raise ValueError("probe response does not match the requested protocol")
+        allowed = {
+            "schema", "protocol", "ready", "device", "device_name",
+            "compute_capability", "engine", "build_fingerprint", "build_arches",
+            "threads", "blocks_per_sm", "attempts_per_thread", "max_registers",
+            "rare_rule_protocol", "default_ruleset_fingerprint", "error",
+        }
+        if set(payload) - allowed:
+            raise ValueError("probe response contains unsupported fields")
+        if (isinstance(payload.get("rare_rule_protocol"), bool)
+                or payload.get("rare_rule_protocol") != CUDA_RULE_PROTOCOL_VERSION
+                or not isinstance(payload.get("default_ruleset_fingerprint"), str)
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(payload["default_ruleset_fingerprint"]),
+                ) is None):
+            raise ValueError("probe rare-rule compatibility details are malformed")
+        if payload["ready"]:
+            if completed.returncode != 0:
+                raise ValueError("probe reported readiness with a failing exit status")
+            if (not isinstance(payload.get("device_name"), str)
+                    or not payload["device_name"]
+                    or not isinstance(payload.get("compute_capability"), str)
+                    or re.fullmatch(r"\d+\.\d+", str(payload["compute_capability"])) is None
+                    or not isinstance(payload.get("build_fingerprint"), str)
+                    or re.fullmatch(r"[0-9a-f]{16}", str(payload["build_fingerprint"])) is None
+                    or not isinstance(payload.get("build_arches"), str)
+                    or any(isinstance(payload.get(name), bool)
+                           or not isinstance(payload.get(name), int)
+                           or int(payload[name]) <= 0
+                           for name in ("threads", "blocks_per_sm", "attempts_per_thread"))
+                    or isinstance(payload.get("max_registers"), bool)
+                    or not isinstance(payload.get("max_registers"), int)
+                    or int(payload["max_registers"]) < 0):
+                raise ValueError("probe readiness details are malformed")
+        else:
+            if completed.returncode == 0 or not isinstance(payload.get("error"), str):
+                raise ValueError("probe failure details are malformed")
+        result = {key: payload[key] for key in allowed if key in payload}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError) as error:
+        result = {**base, "error": f"CUDA readiness probe failed: {error}"}
+
+    with _CUDA_PROBE_LOCK:
+        # A binary replacement changes the cache key; discard stale entries so
+        # long-running GUIs cannot accumulate obsolete probe responses.
+        for previous_key in tuple(_CUDA_PROBE_CACHE):
+            if (previous_key[0] == cache_key[0]
+                    and previous_key[-2:] == cache_key[-2:]
+                    and previous_key != cache_key):
+                del _CUDA_PROBE_CACHE[previous_key]
+        # Initialization and driver failures can be transient. Retaining them
+        # would disable CUDA for the lifetime of a long-running GUI.
+        if result.get("ready") is True:
+            _CUDA_PROBE_CACHE[cache_key] = dict(result)
+        else:
+            _CUDA_PROBE_CACHE.pop(cache_key, None)
+    return result
+
+
+def cuda_available(device: int = 0, engine: str = "optimized", *,
+                   refresh: bool = False) -> bool:
+    if cuda_device_count() <= device:
+        return False
+    return bool(cuda_probe(device, engine, refresh=refresh).get("ready"))
 
 
 def cuda_device_names() -> list[str]:
@@ -306,19 +454,90 @@ def cuda_device_names() -> list[str]:
         return []
 
 
-def diagnostics() -> dict[str, object]:
+def signal_process_termination(process: subprocess.Popen[str]) -> bool:
+    """Request child termination without leaking a concurrent-exit race."""
+    if process.poll() is not None:
+        return False
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def terminate_process(process: subprocess.Popen[str], timeout: float = 2.0) -> None:
+    """Terminate and reap a child, escalating to kill after a bounded wait."""
+    if not signal_process_termination(process):
+        return
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object]:
     devices = cuda_device_count()
     names = cuda_device_names()
     firmware_vector = firmware_compatibility_test()
+    probes = [cuda_probe(index) for index in range(devices)]
     return {
         "version": APP_VERSION,
         "firmware_vector": firmware_vector,
         "cuda_devices": devices,
         "cuda_names": names,
         "cuda_engine_built": cuda_executable().is_file(),
-        "cuda_ready": devices > 0 and cuda_executable().is_file(),
+        "cuda_ready": any(bool(probe.get("ready")) for probe in probes),
+        "cuda_probes": probes,
         "results_directory": str(DEFAULT_RESULTS_DIR),
+        "rare_ruleset_id": ruleset.ruleset_id,
+        "rare_ruleset_fingerprint": ruleset.fingerprint,
     }
+
+
+def gui_diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object]:
+    """Collect every GUI CUDA-engine readiness result without touching Tk."""
+    details = diagnostics(ruleset)
+    device_count = int(details.get("cuda_devices", 0))
+    engine_probes: dict[tuple[int, str], dict[str, object]] = {}
+    existing = details.get("cuda_probes", [])
+    if isinstance(existing, list):
+        for probe in existing:
+            if not isinstance(probe, dict):
+                continue
+            probe_device = probe.get("device")
+            probe_engine = probe.get("engine")
+            if (isinstance(probe_device, int) and not isinstance(probe_device, bool)
+                    and probe_engine in ("optimized", "baseline")):
+                engine_probes[(probe_device, str(probe_engine))] = dict(probe)
+    for device_index in range(device_count):
+        for engine in ("optimized", "baseline"):
+            if (device_index, engine) not in engine_probes:
+                engine_probes[(device_index, engine)] = cuda_probe(device_index, engine)
+    details["cuda_engine_probes"] = engine_probes
+    details["cuda_ready"] = any(
+        bool(probe.get("ready")) for probe in engine_probes.values()
+    )
+    return details
+
+
+def start_gui_diagnostics(
+        callback: Callable[[Optional[dict[str, object]], Optional[str]], None],
+        ruleset: RareRuleset = DEFAULT_RARE_RULESET,
+) -> threading.Thread:
+    """Launch GUI discovery and report from a worker through a safe callback."""
+    def worker() -> None:
+        try:
+            callback(gui_diagnostics(ruleset), None)
+        except Exception as error:
+            callback(None, str(error))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
 
 
 def estimate_attempts(prefix: str, suffix: str, contains: str) -> float:
@@ -364,7 +583,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 device: int = 0,
                 engine: str = "optimized",
                 collect_only: bool = False,
-                process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None) -> Result:
+                process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
+                ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
         raise RuntimeError("CUDA engine is not built; run 'make'")
@@ -373,6 +593,7 @@ def search_cuda(prefix: str, suffix: str, contains: str,
     if engine not in ("optimized", "baseline"):
         raise ValueError("CUDA engine must be optimized or baseline")
     command = [str(executable), "--device", str(device), "--engine", engine]
+    command.extend(ruleset.cuda_arguments())
     if collect_only:
         if any((prefix, suffix, contains)):
             raise ValueError("Collector mode cannot be combined with a vanity pattern")
@@ -382,8 +603,12 @@ def search_cuda(prefix: str, suffix: str, contains: str,
             command.extend((option, value))
     if update:
         update(0, 0.0)
+    if cancel and cancel.is_set():
+        raise SearchCancelled("Search cancelled")
     watch_path = watch_path or DEFAULT_WATCH_PATH
     initialize_watch_file(watch_path)
+    if cancel and cancel.is_set():
+        raise SearchCancelled("Search cancelled")
     process: Optional[subprocess.Popen[str]] = None
     errors: list[str] = []
     stdout = ""
@@ -392,6 +617,10 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                                    stderr=subprocess.PIPE, bufsize=1)
         if process_update:
             process_update(process)
+        # Process registration and the GUI close path form a handshake: if
+        # close won the race before registration, this worker owns cleanup.
+        if cancel and cancel.is_set():
+            raise SearchCancelled("Search cancelled")
         assert process.stderr is not None
         for line in process.stderr:
             if cancel and cancel.is_set():
@@ -405,7 +634,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                     _, rule, public_hex, private_hex = line.strip().split()
                     rule_number = int(rule)
                     record = append_interesting(
-                        watch_path, rule_number, public_hex, private_hex, engine
+                        watch_path, rule_number, public_hex, private_hex, engine,
+                        ruleset=ruleset,
                     )
                     if watch_update:
                         watch_update(rule_number, str(record["reason"]), public_hex, watch_path)
@@ -418,12 +648,7 @@ def search_cuda(prefix: str, suffix: str, contains: str,
         return_code = process.wait()
     finally:
         if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            terminate_process(process)
         if process is not None:
             if process.stdout is not None:
                 process.stdout.close()
@@ -445,19 +670,37 @@ def search_cuda(prefix: str, suffix: str, contains: str,
         raise RuntimeError("CUDA collector stopped unexpectedly")
     try:
         payload = json.loads(stdout.strip().splitlines()[-1])
-        public_hex = payload["public_key"]
-        private_hex = payload["private_key"]
+        allowed_fields = {
+            "public_key", "private_key", "engine", "attempts", "elapsed_seconds",
+        }
+        if not isinstance(payload, dict) or set(payload) != allowed_fields:
+            raise ValueError("result object has unexpected fields")
+        public_hex = payload.get("public_key")
+        private_hex = payload.get("private_key")
+        attempts = payload.get("attempts")
+        elapsed_seconds = payload.get("elapsed_seconds")
+        if (not isinstance(public_hex, str)
+                or re.fullmatch(r"[0-9a-f]{64}", public_hex) is None
+                or not isinstance(private_hex, str)
+                or re.fullmatch(r"[0-9a-f]{128}", private_hex) is None
+                or payload.get("engine") != engine
+                or isinstance(attempts, bool) or not isinstance(attempts, int)
+                or attempts < 0
+                or isinstance(elapsed_seconds, bool)
+                or not isinstance(elapsed_seconds, (int, float))
+                or not math.isfinite(float(elapsed_seconds))
+                or float(elapsed_seconds) < 0):
+            raise ValueError("result fields are malformed")
         public = bytes.fromhex(public_hex)
         private = bytes.fromhex(private_hex)
-    except (KeyError, ValueError, IndexError, json.JSONDecodeError) as error:
+    except (IndexError, OverflowError, TypeError, ValueError) as error:
         raise RuntimeError("CUDA engine returned an invalid result") from error
-    if (payload.get("engine") != engine or public[0] in (0, 255)
-            or not verify_expanded_key(private, public)
+    if (public[0] in (0, 255) or not verify_expanded_key(private, public)
             or not matches(public_hex, prefix, suffix, contains)):
         raise RuntimeError("CUDA result failed independent CPU verification")
     needle = ", ".join(part for part in (prefix and f"prefix {prefix}", suffix and f"suffix {suffix}", contains and f"contains {contains}") if part)
-    return Result(public_hex, private_hex, int(payload["attempts"]),
-                  float(payload["elapsed_seconds"]), needle, "cuda", engine)
+    return Result(public_hex, private_hex, attempts,
+                  float(elapsed_seconds), needle, "cuda", engine)
 
 
 def secure_open(path: Path, flags: int) -> int:
@@ -520,12 +763,58 @@ def default_result_path(public_key: str) -> Path:
     return available_result_path(DEFAULT_RESULTS_DIR, public_key)
 
 
-def count_interesting(path: Path) -> int:
+def count_interesting(
+        path: Path, cancel: Optional[threading.Event] = None,
+        progress: Optional[Callable[[int, int], None]] = None,
+        block_size: int = RARE_READ_BLOCK_SIZE,
+) -> int:
+    """Count nonblank entries in a stable size snapshot without blocking appends."""
+    if block_size < 1:
+        raise ValueError("count block size must be positive")
     try:
-        with path.open(encoding="utf-8") as file:
-            return sum(1 for line in file if line.strip())
+        with path.open("rb") as file:
+            fcntl.flock(file.fileno(), fcntl.LOCK_SH)
+            try:
+                snapshot_size = os.fstat(file.fileno()).st_size
+            finally:
+                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+            remaining = snapshot_size
+            scanned = 0
+            count = 0
+            line_has_content = False
+            while remaining and not (cancel and cancel.is_set()):
+                chunk = file.read(min(block_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                scanned += len(chunk)
+                parts = chunk.split(b"\n")
+                if len(parts) == 1:
+                    line_has_content = line_has_content or bool(parts[0].strip())
+                else:
+                    if line_has_content or parts[0].strip():
+                        count += 1
+                    count += sum(1 for part in parts[1:-1] if part.strip())
+                    line_has_content = bool(parts[-1].strip())
+                if progress:
+                    progress(scanned, snapshot_size)
+            if remaining == 0 and line_has_content:
+                count += 1
+            return count
     except FileNotFoundError:
         return 0
+
+
+def apply_rare_count_snapshot(
+        state: dict[str, object], generation: int, total: int,
+) -> bool:
+    """Apply a background count only if no search invalidated its snapshot."""
+    current = state.get("rare_count_generation")
+    if (isinstance(current, bool) or not isinstance(current, int)
+            or current != generation):
+        return False
+    state["rare_count"] = total
+    return True
 
 
 def initialize_watch_file(path: Path) -> None:
@@ -535,104 +824,107 @@ def initialize_watch_file(path: Path) -> None:
     os.close(descriptor)
 
 
-WATCH_REASONS = (
-    "bookend-10", "mirror-10", "repeat-prefix-10",
-    *(f"prefix-{word}" for word in WATCH_WORDS),
-    "prefix-pi-3141592653",
-)
+WATCH_REASONS = DEFAULT_RARE_RULESET.watch_reasons
 
 
-def interesting_rule(public_hex: str) -> int:
+def interesting_rule(public_hex: str,
+                     ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
     """Classify a rare public key independently of the CUDA implementation."""
-    if len(public_hex) != 64 or not re.fullmatch(r"[0-9a-f]{64}", public_hex):
-        return -1
-    if public_hex[:10] == public_hex[-10:]:
-        return 0
-    if public_hex[:10] == public_hex[-10:][::-1]:
-        return 1
-    if public_hex[:10] == public_hex[0] * 10:
-        return 2
-    for index, word in enumerate(WATCH_WORDS):
-        if public_hex.startswith(word):
-            return 3 + index
-    if public_hex.startswith("3141592653"):
-        return 4
-    return -1
+    return ruleset.classify(public_hex)
 
 
-def make_rare_match(reason: str, kind: str, length: int,
-                    alternatives: int = 1) -> RareMatch:
-    attempts = (16 ** length + alternatives - 1) // alternatives
-    rarity_bits = length * 4.0 - math.log2(alternatives)
-    return RareMatch(reason, kind, length, round(rarity_bits, 3), str(attempts))
-
-
-def interesting_matches(public_hex: str) -> list[RareMatch]:
+def interesting_matches(public_hex: str,
+                        ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> list[RareMatch]:
     """Describe every recognized rare property, strongest property first."""
-    if len(public_hex) != 64 or not re.fullmatch(r"[0-9a-f]{64}", public_hex):
-        return []
-    matches_found: list[RareMatch] = []
-
-    # Same-order bookends are not nested as their width changes, so inspect all
-    # meaningful widths and retain the strongest one that this key satisfies.
-    bookend_lengths = [
-        length for length in range(10, 33)
-        if public_hex[:length] == public_hex[-length:]
-    ]
-    if bookend_lengths:
-        length = max(bookend_lengths)
-        matches_found.append(make_rare_match(f"bookend-{length}", "bookend", length))
-
-    mirror_length = 0
-    for index in range(32):
-        if public_hex[index] != public_hex[63 - index]:
-            break
-        mirror_length += 1
-    if mirror_length >= 10:
-        matches_found.append(make_rare_match(
-            f"mirror-{mirror_length}", "mirror", mirror_length
-        ))
-
-    repeat_length = 1
-    while repeat_length < len(public_hex) and public_hex[repeat_length] == public_hex[0]:
-        repeat_length += 1
-    if repeat_length >= 10 and public_hex[0] not in "0f":
-        matches_found.append(make_rare_match(
-            f"repeat-prefix-{repeat_length}", "repeat-prefix", repeat_length, 14
-        ))
-
-    for word in WATCH_WORDS:
-        if public_hex.startswith(word):
-            matches_found.append(make_rare_match(f"prefix-{word}", "phrase-prefix", 10))
-
-    pi_length = 0
-    while (pi_length < len(public_hex) and pi_length < len(PI_DIGITS)
-           and public_hex[pi_length] == PI_DIGITS[pi_length]):
-        pi_length += 1
-    if pi_length >= 10:
-        matches_found.append(make_rare_match(
-            f"prefix-pi-{PI_DIGITS[:pi_length]}", "pi-prefix", pi_length
-        ))
-
-    return sorted(matches_found, key=lambda match: match.rarity_bits, reverse=True)
+    return list(ruleset.analyze(public_hex))
 
 
 def infer_legacy_rarity(record: dict[str, object]) -> tuple[int, float]:
     """Infer basic sortable metadata for records written by older releases."""
     reason = str(record.get("reason", ""))
-    numbered = re.fullmatch(r"(?:bookend|mirror|repeat-prefix)-(\d+)", reason)
+    numbered = re.fullmatch(r"(?:bookend|mirror|repeat-prefix)-(\d{1,2})", reason)
     if numbered:
         length = int(numbered.group(1))
+        if not 1 <= length <= 64:
+            return 0, 0.0
         alternatives = 14 if reason.startswith("repeat-prefix-") else 1
         return length, round(length * 4.0 - math.log2(alternatives), 3)
     for marker in ("prefix-pi-", "prefix-", "suffix-"):
         if reason.startswith(marker):
             length = len(reason.removeprefix(marker))
-            return length, float(length * 4)
+            if 1 <= length <= 64:
+                return length, float(length * 4)
     return 0, 0.0
 
 
-def normalize_interesting_record(record: object) -> Optional[dict[str, object]]:
+def _history_length(value: object, fallback: int = 0) -> int:
+    if (isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= 64):
+        return value
+    return fallback
+
+
+def _history_rarity(value: object, fallback: float = 0.0) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            converted = float(value)
+        except (OverflowError, TypeError, ValueError):
+            pass
+        else:
+            if math.isfinite(converted) and 0 <= converted <= 256:
+                return converted
+    return fallback
+
+
+def _history_attempts(value: object, fallback: str = "0") -> str:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,80}", value):
+        return value
+    return fallback
+
+
+def _sanitize_stored_match(value: object) -> Optional[dict[str, object]]:
+    if not isinstance(value, dict):
+        return None
+    reason = value.get("reason")
+    kind = value.get("kind")
+    length = value.get("length")
+    rarity = value.get("rarity_bits")
+    attempts = value.get("mean_attempts")
+    if (not isinstance(reason, str) or not reason
+            or not isinstance(kind, str) or not kind
+            or _history_length(length, -1) < 1
+            or _history_rarity(rarity, -1.0) < 0
+            or not isinstance(attempts, str)
+            or re.fullmatch(r"[0-9]{1,80}", attempts) is None):
+        return None
+    sanitized = dict(value)
+    sanitized["length"] = _history_length(length)
+    sanitized["rarity_bits"] = _history_rarity(rarity)
+    sanitized["mean_attempts"] = _history_attempts(attempts)
+    return sanitized
+
+
+def _stored_rare_analysis(record: dict[str, object]) -> Optional[dict[str, object]]:
+    """Return the primary stored match when schema-v2+ analysis is well formed."""
+    schema_version = record.get("schema_version")
+    matches_found = record.get("matches")
+    if (isinstance(schema_version, bool) or not isinstance(schema_version, int)
+            or schema_version < 2 or not isinstance(matches_found, list)
+            or not matches_found):
+        return None
+    sanitized = [
+        match for item in matches_found
+        if (match := _sanitize_stored_match(item)) is not None
+    ]
+    if not sanitized:
+        return None
+    record["matches"] = sanitized
+    return sanitized[0]
+
+
+def normalize_interesting_record(
+        record: object, ruleset: RareRuleset = DEFAULT_RARE_RULESET,
+) -> Optional[dict[str, object]]:
     """Validate a log record and add display metadata without exposing secrets."""
     if not isinstance(record, dict):
         return None
@@ -643,53 +935,196 @@ def normalize_interesting_record(record: object) -> Optional[dict[str, object]]:
             or not re.fullmatch(r"[0-9a-f]{128}", private_hex)):
         return None
     normalized = dict(record)
-    analyzed = interesting_matches(public_hex)
+    stored_primary = _stored_rare_analysis(normalized)
+    if stored_primary is not None:
+        # A recorded ruleset may later be disabled or changed. Preserve the
+        # original analysis as historical truth instead of reclassifying it.
+        normalized["reason"] = stored_primary["reason"]
+        normalized["match_length"] = stored_primary["length"]
+        normalized["rarity_bits"] = stored_primary["rarity_bits"]
+        normalized["mean_attempts"] = stored_primary["mean_attempts"]
+        return normalized
+
+    analyzed = interesting_matches(public_hex, ruleset)
     if analyzed:
         primary = analyzed[0]
         normalized["reason"] = primary.reason
         normalized["match_length"] = primary.length
         normalized["rarity_bits"] = primary.rarity_bits
+        normalized["mean_attempts"] = primary.mean_attempts
         normalized["matches"] = [asdict(match) for match in analyzed]
     else:
         length, rarity_bits = infer_legacy_rarity(normalized)
-        normalized.setdefault("match_length", length)
-        normalized.setdefault("rarity_bits", rarity_bits)
+        normalized["match_length"] = _history_length(
+            normalized.get("match_length"), length,
+        )
+        normalized["rarity_bits"] = _history_rarity(
+            normalized.get("rarity_bits"), rarity_bits,
+        )
+        alternatives = 14 if str(normalized.get("reason", "")).startswith(
+            "repeat-prefix-"
+        ) else 1
+        inferred_attempts = (
+            str((16 ** length + alternatives - 1) // alternatives)
+            if length else "0"
+        )
+        normalized["mean_attempts"] = _history_attempts(
+            normalized.get("mean_attempts"), inferred_attempts,
+        )
+        normalized["matches"] = []
     return normalized
 
 
-def load_interesting_records(path: Path, limit: int = RARE_BROWSER_LIMIT
-                             ) -> tuple[list[dict[str, object]], int]:
-    """Load the most recent valid records with bounded memory use."""
-    records: deque[dict[str, object]] = deque(maxlen=max(1, limit))
+def load_interesting_records(
+        path: Path, limit: int = RARE_BROWSER_LIMIT,
+        progress: Optional[Callable[[int, int], None]] = None,
+        block_size: int = RARE_READ_BLOCK_SIZE,
+        max_record_bytes: int = RARE_MAX_RECORD_BYTES,
+        ruleset: RareRuleset = DEFAULT_RARE_RULESET,
+        cancel: Optional[threading.Event] = None,
+) -> tuple[list[dict[str, object]], int]:
+    """Load newest valid JSONL records by reading backward from the file tail.
+
+    Work and retained memory are bounded by ``limit`` and the bytes needed to
+    reach that many valid records. A shared advisory lock prevents observing a
+    half-written line from this program's append path. A malformed crash tail
+    is skipped and does not hide the preceding valid records.
+    """
+    if limit < 1:
+        return [], 0
+    if block_size < 1 or max_record_bytes < 1:
+        raise ValueError("tail-reader bounds must be positive")
+    if cancel and cancel.is_set():
+        return [], 0
+
+    newest_first: list[dict[str, object]] = []
     skipped = 0
+
+    def consume(raw: bytes) -> None:
+        nonlocal skipped
+        if not raw.strip():
+            return
+        if len(raw) > max_record_bytes:
+            skipped += 1
+            return
+        try:
+            normalized = normalize_interesting_record(json.loads(raw), ruleset)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            normalized = None
+        if normalized is None:
+            skipped += 1
+        elif len(newest_first) < limit:
+            newest_first.append(normalized)
+
     try:
-        with path.open(encoding="utf-8") as file:
-            for line in file:
-                if not line.strip():
-                    continue
-                try:
-                    normalized = normalize_interesting_record(json.loads(line))
-                except json.JSONDecodeError:
-                    normalized = None
-                if normalized is None:
-                    skipped += 1
-                else:
-                    records.append(normalized)
+        with path.open("rb") as file:
+            fcntl.flock(file.fileno(), fcntl.LOCK_SH)
+            try:
+                total = file.seek(0, os.SEEK_END)
+                position = total
+                pending = b""
+                dropping_oversized = False
+                scanned = 0
+                last_progress = 0.0
+                while (position > 0 and len(newest_first) < limit
+                       and not (cancel and cancel.is_set())):
+                    size = min(block_size, position)
+                    position -= size
+                    file.seek(position)
+                    chunk = file.read(size)
+                    scanned += len(chunk)
+
+                    if dropping_oversized:
+                        parts = chunk.split(b"\n")
+                        if len(parts) == 1:
+                            if progress and time.monotonic() - last_progress >= 0.1:
+                                progress(scanned, total)
+                                last_progress = time.monotonic()
+                            continue
+                        # The rightmost fragment belongs to the oversized line
+                        # already counted as malformed. Earlier complete lines
+                        # in this chunk remain usable.
+                        pending = parts[0]
+                        candidates = parts[1:-1]
+                        dropping_oversized = False
+                    else:
+                        parts = (chunk + pending).split(b"\n")
+                        pending = parts[0]
+                        candidates = parts[1:]
+
+                    for raw in reversed(candidates):
+                        if cancel and cancel.is_set():
+                            break
+                        consume(raw)
+
+                    if len(pending) > max_record_bytes:
+                        pending = b""
+                        dropping_oversized = True
+                        skipped += 1
+
+                    now = time.monotonic()
+                    if progress and now - last_progress >= 0.1:
+                        progress(scanned, total)
+                        last_progress = now
+
+                if (position == 0 and not dropping_oversized
+                        and not (cancel and cancel.is_set())):
+                    consume(pending)
+                if progress:
+                    progress(scanned, total)
+            finally:
+                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
     except FileNotFoundError:
-        pass
-    return list(records), skipped
+        if progress:
+            progress(0, 0)
+    newest_first.reverse()
+    return newest_first, skipped
+
+
+def select_interesting_page(
+        records: list[dict[str, object]], query: str, sort_column: str,
+        reverse: bool, page: int, page_size: int = RARE_BROWSER_PAGE_SIZE,
+) -> tuple[list[dict[str, object]], int, int, int]:
+    """Filter, sort, and select one bounded page for the rare-key browser."""
+    if page_size < 1:
+        raise ValueError("page size must be positive")
+    normalized_query = query.strip().lower()
+    filtered = [
+        record for record in records
+        if not normalized_query or normalized_query in " ".join((
+            str(record.get("found_at", "")), str(record.get("reason", "")),
+            str(record.get("public_key", "")),
+        )).lower()
+    ]
+    if sort_column == "length":
+        sort_key = lambda record: _history_length(record.get("match_length", 0))
+    elif sort_column == "rarity":
+        sort_key = lambda record: _history_rarity(record.get("rarity_bits", 0))
+    elif sort_column == "public":
+        sort_key = lambda record: str(record.get("public_key", ""))
+    elif sort_column == "reason":
+        sort_key = lambda record: str(record.get("reason", ""))
+    else:
+        sort_key = lambda record: str(record.get("found_at", ""))
+    filtered.sort(key=sort_key, reverse=reverse)
+    pages = max(1, math.ceil(len(filtered) / page_size))
+    selected_page = min(max(0, page), pages - 1)
+    start = selected_page * page_size
+    return filtered[start:start + page_size], len(filtered), selected_page, pages
 
 
 def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
-                       engine: str = "optimized") -> dict[str, object]:
+                       engine: str = "optimized", *,
+                       ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object]:
     private = bytes.fromhex(private_hex)
     public = bytes.fromhex(public_hex)
-    if (rule < 0 or rule >= len(WATCH_REASONS) or interesting_rule(public_hex) != rule
+    if (rule < 0 or rule >= len(ruleset.watch_reasons)
+            or interesting_rule(public_hex, ruleset) != rule
             or len(private) != 64 or len(public) != 32
             or public[0] in (0, 255)
             or not verify_expanded_key(private, public)):
         raise RuntimeError("An incidental CUDA result failed CPU verification")
-    matches_found = interesting_matches(public_hex)
+    matches_found = interesting_matches(public_hex, ruleset)
     if not matches_found:
         raise RuntimeError("An incidental CUDA result failed rarity analysis")
     primary = matches_found[0]
@@ -698,7 +1133,7 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
     record = {
         "schema_version": RARE_LOG_SCHEMA,
         "found_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "trigger": WATCH_REASONS[rule],
+        "trigger": ruleset.watch_reasons[rule],
         "reason": primary.reason,
         "match_length": primary.length,
         "rarity_bits": primary.rarity_bits,
@@ -708,6 +1143,8 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
         "private_key": private_hex,
         "backend": "cuda",
         "engine": engine,
+        "ruleset_id": ruleset.ruleset_id,
+        "ruleset_fingerprint": ruleset.fingerprint,
     }
     with os.fdopen(descriptor, "a", encoding="utf-8") as file:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX)
@@ -759,7 +1196,19 @@ def self_test() -> bool:
     return valid
 
 
-def run_gui() -> int:
+def _run_gui_mainloop(
+        mainloop: Callable[[], None], close_window: Callable[[], None],
+) -> int:
+    """Translate a terminal interrupt into the GUI's normal cleanup path."""
+    try:
+        mainloop()
+    except KeyboardInterrupt:
+        close_window()
+        return 130
+    return 0
+
+
+def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
     try:
         import tkinter as tk
         import tkinter.font as tkfont
@@ -783,9 +1232,14 @@ def run_gui() -> int:
     root.rowconfigure(0, weight=1)
     frame.columnconfigure(1, weight=1)
 
-    details = diagnostics()
-    gpu_count = int(details["cuda_devices"])
-    gpu_names = list(details["cuda_names"])
+    # Render first. Driver discovery, nvidia-smi, native probes, and the
+    # firmware compatibility vector all run after Tk's event loop is ready.
+    details: dict[str, object] = {
+        "firmware_vector": None, "cuda_devices": 0, "cuda_names": [],
+        "cuda_ready": False,
+    }
+    gpu_count = 0
+    gpu_names: list[str] = []
     fields: dict[str, tk.StringVar] = {
         name: tk.StringVar() for name in ("prefix", "suffix", "contains")
     }
@@ -805,19 +1259,21 @@ def run_gui() -> int:
                 textvariable=workers).grid(row=4, column=1, sticky="w")
 
     device = tk.StringVar()
-    device_values = tuple(
-        f"{index} — {gpu_names[index] if index < len(gpu_names) else 'NVIDIA GPU'}"
-        for index in range(gpu_count)
-    ) or ("None detected",)
+    device_values = ("Discovering…",)
     device.set(device_values[0])
     ttk.Label(frame, text="CUDA device").grid(row=5, column=0, sticky="w", pady=3)
-    ttk.Combobox(frame, state="readonly", textvariable=device,
-                 values=device_values).grid(row=5, column=1, columnspan=2, sticky="ew")
+    device_combo = ttk.Combobox(
+        frame, state="disabled", textvariable=device, values=device_values,
+    )
+    device_combo.grid(row=5, column=1, columnspan=2, sticky="ew")
 
     cuda_engine = tk.StringVar(value="optimized")
     ttk.Label(frame, text="CUDA engine").grid(row=6, column=0, sticky="w", pady=3)
-    ttk.Combobox(frame, width=14, state="readonly", textvariable=cuda_engine,
-                 values=("optimized", "baseline")).grid(row=6, column=1, sticky="w")
+    engine_combo = ttk.Combobox(
+        frame, width=14, state="disabled", textvariable=cuda_engine,
+        values=("optimized", "baseline"),
+    )
+    engine_combo.grid(row=6, column=1, sticky="w")
     collector_mode = tk.BooleanVar(value=False)
 
     def toggle_collector_mode() -> None:
@@ -829,7 +1285,7 @@ def run_gui() -> int:
 
     collector_checkbox = ttk.Checkbutton(
         frame, text="Continuous rare collector", variable=collector_mode,
-        command=toggle_collector_mode,
+        command=toggle_collector_mode, state="disabled",
     )
     collector_checkbox.grid(row=6, column=2, sticky="e")
 
@@ -844,17 +1300,18 @@ def run_gui() -> int:
 
     ttk.Button(frame, text="Choose…", command=choose_output_directory).grid(row=7, column=2, padx=(7, 0))
 
-    vector_label = "PASS" if details["firmware_vector"] else "FAIL"
-    cuda_label = "ready" if details["cuda_ready"] else "CPU fallback"
-    diagnostic_text = (
-        f"Self-test: {vector_label}  •  CUDA: {cuda_label}  •  "
-        f"Devices: {gpu_count}  •  Version: {APP_VERSION}"
+    diagnostic_text = tk.StringVar(
+        value=(
+            "Self-test: checking…  •  CUDA: discovering…  •  "
+            f"Devices: …  •  Version: {APP_VERSION}"
+        )
     )
-    ttk.Label(frame, text=diagnostic_text).grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 3))
-    status = tk.StringVar(value="Ready")
+    ttk.Label(frame, textvariable=diagnostic_text).grid(
+        row=8, column=0, columnspan=3, sticky="w", pady=(8, 3),
+    )
+    status = tk.StringVar(value="Discovering CUDA devices and checking compatibility…")
     ttk.Label(frame, textvariable=status).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
-    initial_rare_count = count_interesting(DEFAULT_WATCH_PATH)
-    incidental = tk.StringVar(value=f"Saved rare incidental keys: {initial_rare_count}")
+    incidental = tk.StringVar(value="Saved rare incidental keys: counting…")
     ttk.Label(frame, textvariable=incidental).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 3))
     output = tk.Text(frame, width=86, height=10, state="disabled", wrap="word")
     output.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=5)
@@ -863,10 +1320,161 @@ def run_gui() -> int:
         "result": None, "cancel": threading.Event(), "searching": False,
         "process": None, "closing": False, "saved_path": None,
         "reveal_private": False, "observed_rate": None,
-        "rare_count": initial_rare_count,
+        "rare_count": None, "rare_count_generation": 0,
         "collector_started": None, "collector_session_count": 0,
         "collector_best_bits": 0.0, "collector_best_reason": None,
+        "discovery_pending": True, "discovery_error": None,
+        "cuda_probes": {},
     }
+    ui_events: queue.SimpleQueue[
+        tuple[Callable[..., None], tuple[object, ...]]
+    ] = queue.SimpleQueue()
+    shutdown_event = threading.Event()
+    history_load_cancels: set[threading.Event] = set()
+    process_lock = threading.Lock()
+    active_process: list[Optional[subprocess.Popen[str]]] = [None]
+
+    def post_ui(callback: Callable[..., None], *args: object) -> None:
+        """Queue a callback for execution by Tk's main thread."""
+        ui_events.put((callback, args))
+
+    def selected_device_index() -> Optional[int]:
+        if state["discovery_pending"] or gpu_count < 1:
+            return None
+        match = re.match(r"(\d+)\s", device.get())
+        if match is None:
+            return None
+        selected = int(match.group(1))
+        return selected if 0 <= selected < gpu_count else None
+
+    def selected_cuda_probe() -> Optional[dict[str, object]]:
+        selected = selected_device_index()
+        probes = state.get("cuda_probes")
+        if selected is None or not isinstance(probes, dict):
+            return None
+        probe = probes.get((selected, cuda_engine.get()))
+        return probe if isinstance(probe, dict) else None
+
+    def selected_cuda_ready() -> bool:
+        probe = selected_cuda_probe()
+        return bool(probe and probe.get("ready"))
+
+    def render_diagnostic_summary() -> None:
+        if state["discovery_pending"]:
+            return
+        firmware = details.get("firmware_vector")
+        vector_label = "PASS" if firmware is True else "FAIL"
+        if gpu_count < 1:
+            cuda_label = "not detected (CPU available)"
+        else:
+            probe = selected_cuda_probe()
+            cuda_label = (
+                f"{cuda_engine.get()} ready" if probe and probe.get("ready")
+                else f"{cuda_engine.get()} unavailable (CPU available)"
+            )
+        diagnostic_text.set(
+            f"Self-test: {vector_label}  •  CUDA: {cuda_label}  •  "
+            f"Devices: {gpu_count}  •  Version: {APP_VERSION}"
+        )
+
+    def update_backend_controls(*_args: object) -> None:
+        if state["closing"]:
+            return
+        pending = bool(state["discovery_pending"])
+        searching = bool(state["searching"])
+        if pending or searching:
+            button.configure(state="disabled")
+            collector_checkbox.configure(state="disabled")
+            device_combo.configure(state="disabled")
+            engine_combo.configure(state="disabled")
+            return
+        device_combo.configure(state="readonly" if gpu_count else "disabled")
+        engine_combo.configure(state="readonly" if gpu_count else "disabled")
+        ready = selected_cuda_ready()
+        if collector_mode.get() and not ready:
+            collector_mode.set(False)
+            toggle_collector_mode()
+        collector_checkbox.configure(state="normal" if ready else "disabled")
+        button.configure(state="normal")
+        render_diagnostic_summary()
+
+    def apply_gui_diagnostics(
+            discovered: Optional[dict[str, object]], error_text: Optional[str],
+    ) -> None:
+        nonlocal gpu_count, gpu_names
+        if state["closing"]:
+            return
+        report = discovered or {
+            "firmware_vector": False, "cuda_devices": 0, "cuda_names": [],
+            "cuda_ready": False, "cuda_engine_probes": {},
+        }
+        details.clear()
+        details.update(report)
+        raw_count = report.get("cuda_devices", 0)
+        gpu_count = (
+            raw_count if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+            and raw_count >= 0 else 0
+        )
+        raw_names = report.get("cuda_names", [])
+        gpu_names = (
+            [str(name) for name in raw_names] if isinstance(raw_names, list) else []
+        )
+        raw_probes = report.get("cuda_engine_probes", {})
+        state["cuda_probes"] = dict(raw_probes) if isinstance(raw_probes, dict) else {}
+        state["discovery_error"] = error_text
+        state["discovery_pending"] = False
+
+        values = tuple(
+            f"{index} — {gpu_names[index] if index < len(gpu_names) else 'NVIDIA GPU'}"
+            for index in range(gpu_count)
+        ) or ("None detected",)
+        device_combo.configure(values=values)
+        device.set(values[0])
+        update_backend_controls()
+        if error_text:
+            status.set(f"Ready for CPU searches; hardware diagnostics failed: {error_text}")
+        elif details.get("firmware_vector") is not True:
+            status.set("Ready; firmware compatibility self-test failed")
+        elif any(
+                bool(probe.get("ready"))
+                for probe in state["cuda_probes"].values()
+                if isinstance(probe, dict)):
+            status.set("Ready")
+        else:
+            status.set("Ready; CUDA unavailable, CPU searches are available")
+        refresh_estimate()
+
+    def poll_ui_events() -> None:
+        if state["closing"]:
+            return
+        # Bound each drain so a burst of progress events cannot starve Tk.
+        for _index in range(256):
+            try:
+                callback, arguments = ui_events.get_nowait()
+            except queue.Empty:
+                break
+            callback(*arguments)
+            if state["closing"]:
+                return
+        root.after(25, poll_ui_events)
+
+    initial_count_generation = int(state["rare_count_generation"])
+
+    def apply_initial_rare_count(total: int, generation: int) -> None:
+        if not apply_rare_count_snapshot(state, generation, total):
+            return
+        incidental.set(f"Saved rare incidental keys: {total}")
+
+    def count_initial_records() -> None:
+        try:
+            total = count_interesting(DEFAULT_WATCH_PATH, cancel=shutdown_event)
+        except OSError:
+            return
+        if shutdown_event.is_set():
+            return
+        post_ui(apply_initial_rare_count, total, initial_count_generation)
+
+    threading.Thread(target=count_initial_records, daemon=True).start()
 
     def show(text: str) -> None:
         output.configure(state="normal")
@@ -896,7 +1504,16 @@ def run_gui() -> int:
             attempts = estimate_attempts(**values)
             rate = state.get("observed_rate")
             if not isinstance(rate, (int, float)) or rate <= 0:
-                rate = REFERENCE_CUDA_RATE if details["cuda_ready"] else max(1, workers.get()) * 20_000
+                if state["discovery_pending"]:
+                    estimate.set(
+                        f"Mean work: {attempts:,.0f} candidates  •  "
+                        "GPU discovery in progress"
+                    )
+                    return
+                rate = (
+                    REFERENCE_CUDA_RATE if selected_cuda_ready()
+                    else max(1, workers.get()) * 20_000
+                )
             qualifier = "approximate " if values["contains"] else ""
             estimate.set(
                 f"Mean work: {qualifier}{attempts:,.0f} candidates  •  "
@@ -908,6 +1525,13 @@ def run_gui() -> int:
     for variable in fields.values():
         variable.trace_add("write", refresh_estimate)
     workers.trace_add("write", refresh_estimate)
+
+    def backend_selection_changed(_event: object = None) -> None:
+        update_backend_controls()
+        refresh_estimate()
+
+    device_combo.bind("<<ComboboxSelected>>", backend_selection_changed)
+    engine_combo.bind("<<ComboboxSelected>>", backend_selection_changed)
 
     def render_result() -> None:
         result = state.get("result")
@@ -930,18 +1554,29 @@ def run_gui() -> int:
         save_button.configure(state=new_state)
 
     def start_search() -> None:
+        if state["discovery_pending"]:
+            status.set("CUDA discovery is still in progress; please wait")
+            return
         collecting = collector_mode.get()
+        selected_device = selected_device_index()
+        if selected_device is None:
+            selected_device = 0
+        selected_engine = cuda_engine.get()
+        using_cuda = selected_cuda_ready()
         try:
             values = {name: valid_pattern(var.get(), name) for name, var in fields.items()}
+            worker_count = workers.get()
+            if not 1 <= worker_count <= max(1, os.cpu_count() or 1):
+                raise ValueError("CPU workers must be within the range shown")
             if not collecting and not any(values.values()):
                 raise ValueError("Enter a prefix, suffix, or substring to search for")
             if collecting:
                 values = {"prefix": "", "suffix": "", "contains": ""}
-                if not cuda_available():
+                if not using_cuda:
                     raise ValueError("Continuous rare collection requires a working CUDA engine")
             else:
                 validate_constraints(**values)
-        except ValueError as error:
+        except (ValueError, tk.TclError) as error:
             messagebox.showerror("Invalid pattern", str(error))
             return
         cancel_event = state["cancel"]
@@ -957,10 +1592,6 @@ def run_gui() -> int:
         state["collector_best_reason"] = None
         reveal_button.configure(text="Reveal private key")
         set_result_controls(False)
-        worker_count = workers.get()
-        selected_device = int(device.get().split()[0]) if gpu_count else 0
-        selected_engine = cuda_engine.get()
-        using_cuda = cuda_available()
         try:
             result_directory = selected_results_directory()
             result_directory.mkdir(parents=True, exist_ok=True)
@@ -968,16 +1599,24 @@ def run_gui() -> int:
             state["searching"] = False
             messagebox.showerror("Invalid results folder", str(error))
             return
+        state["rare_count_generation"] = int(state["rare_count_generation"]) + 1
         watch_path = result_directory / "rare-keys.jsonl"
-        state["rare_count"] = count_interesting(watch_path)
+        # Counting an arbitrarily large history belongs off Tk's main thread.
+        # Keep an already-known default count; otherwise report this session
+        # until the browser performs its own bounded background tail load.
+        known_total = (state.get("rare_count")
+                       if watch_path == DEFAULT_WATCH_PATH else None)
+        state["rare_count"] = known_total
         if collecting:
-            incidental.set(
-                f"Rare keys total: {state['rare_count']} | this session: 0 | best: none yet"
-            )
+            total_label = f"{known_total}" if isinstance(known_total, int) else "counting deferred"
+            incidental.set(f"Rare keys total: {total_label} | this session: 0 | best: none yet")
         else:
-            incidental.set(f"Saved rare incidental keys: {state['rare_count']}")
-        button.configure(state="disabled")
-        collector_checkbox.configure(state="disabled")
+            incidental.set(
+                f"Saved rare incidental keys: {known_total}"
+                if isinstance(known_total, int)
+                else "Saved rare incidental keys this session: 0"
+            )
+        update_backend_controls()
         cancel_button.configure(state="normal")
         activity.start(12)
         if collecting:
@@ -990,46 +1629,63 @@ def run_gui() -> int:
             status.set("Starting CPU search…")
             show("CPU fallback search is active. Automatic rare-key collection requires CUDA.")
 
-        def progress(attempts: int, elapsed: float) -> None:
-            if not state["closing"]:
-                rate = attempts / max(elapsed, .001)
-                if attempts:
-                    state["observed_rate"] = rate
-                label = "Collecting" if collecting else "Searching"
-                root.after(
-                    0, status.set,
-                    f"{label}: {attempts:,} keys, {rate:,.0f} keys/s, {format_duration(elapsed)}",
-                )
-                root.after(0, refresh_estimate)
+        def display_progress(attempts: int, elapsed: float) -> None:
+            rate = attempts / max(elapsed, .001)
+            if attempts:
+                state["observed_rate"] = rate
+            label = "Collecting" if collecting else "Searching"
+            status.set(
+                f"{label}: {attempts:,} keys, {rate:,.0f} keys/s, {format_duration(elapsed)}"
+            )
+            refresh_estimate()
 
-        def watch_progress(rule: int, reason: str, public_key: str, path: Path) -> None:
-            def display() -> None:
-                state["rare_count"] = int(state.get("rare_count", 0)) + 1
-                if collecting:
-                    state["collector_session_count"] = int(
-                        state.get("collector_session_count", 0)
-                    ) + 1
-                    analyzed = interesting_matches(public_key)
-                    rarity_bits = analyzed[0].rarity_bits if analyzed else 0.0
-                    if rarity_bits > float(state.get("collector_best_bits", 0.0)):
-                        state["collector_best_bits"] = rarity_bits
-                        state["collector_best_reason"] = reason
-                    best = state.get("collector_best_reason") or "none yet"
-                    incidental.set(
-                        f"Rare keys total: {state['rare_count']} | this session: "
-                        f"{state['collector_session_count']} | best: {best} "
-                        f"({float(state['collector_best_bits']):.1f} bits)"
-                    )
-                else:
-                    incidental.set(
-                        f"Saved rare incidental keys: {state['rare_count']} | latest: {reason} | "
-                        f"{public_key[:16]}… | saved: {path}"
-                    )
-            if not state["closing"]:
-                root.after(0, display)
+        def progress(attempts: int, elapsed: float) -> None:
+            post_ui(display_progress, attempts, elapsed)
+
+        def display_watch_progress(reason: str, public_key: str, path: Path) -> None:
+            known = state.get("rare_count")
+            if isinstance(known, int):
+                state["rare_count"] = known + 1
+            state["collector_session_count"] = int(
+                state.get("collector_session_count", 0)
+            ) + 1
+            session_count = int(state["collector_session_count"])
+            if collecting:
+                analyzed = interesting_matches(public_key, ruleset)
+                rarity_bits = analyzed[0].rarity_bits if analyzed else 0.0
+                if rarity_bits > float(state.get("collector_best_bits", 0.0)):
+                    state["collector_best_bits"] = rarity_bits
+                    state["collector_best_reason"] = reason
+                best = state.get("collector_best_reason") or "none yet"
+                total_label = (str(state["rare_count"])
+                               if isinstance(state.get("rare_count"), int)
+                               else "not counted")
+                incidental.set(
+                    f"Rare keys total: {total_label} | this session: {session_count} | "
+                    f"best: {best} ({float(state['collector_best_bits']):.1f} bits)"
+                )
+            else:
+                count_label = (f"total: {state['rare_count']}"
+                               if isinstance(state.get("rare_count"), int)
+                               else f"this session: {session_count}")
+                incidental.set(
+                    f"Saved rare incidental keys {count_label} | latest: {reason} | "
+                    f"{public_key[:16]}… | saved: {path}"
+                )
+
+        def watch_progress(_rule: int, reason: str, public_key: str, path: Path) -> None:
+            post_ui(display_watch_progress, reason, public_key, path)
+
+        def display_process(process: Optional[subprocess.Popen[str]]) -> None:
+            state["process"] = process
 
         def process_progress(process: Optional[subprocess.Popen[str]]) -> None:
-            state["process"] = process
+            # Process lifetime is operational synchronization state, not Tk
+            # state. Mirroring it under a lock lets Cancel/Close terminate a
+            # just-started child even before the next UI queue poll.
+            with process_lock:
+                active_process[0] = process
+            post_ui(display_process, process)
 
         def job() -> None:
             try:
@@ -1039,22 +1695,20 @@ def run_gui() -> int:
                                          device=selected_device,
                                          engine=selected_engine,
                                          collect_only=collecting,
-                                         process_update=process_progress)
+                                         process_update=process_progress,
+                                         ruleset=ruleset)
                 else:
                     result = search(**values, workers=worker_count, update=progress,
                                     cancel=cancel_event)
-                state["result"] = result
-                if not state["closing"]:
-                    root.after(0, complete, result, result_directory)
+                post_ui(complete, result, result_directory)
             except SearchCancelled:
-                if not state["closing"]:
-                    root.after(0, stopped)
+                post_ui(stopped)
             except Exception as error:
-                error_text = str(error)
-                if not state["closing"]:
-                    root.after(0, failed, error_text)
+                post_ui(failed, str(error))
 
-        threading.Thread(target=job, daemon=True).start()
+        # A non-daemon coordinator guarantees that a CUDA child spawned during
+        # the close/register race reaches search_cuda's cleanup path.
+        threading.Thread(target=job, daemon=False).start()
 
     def complete(result: Result, result_directory: Path) -> None:
         state["searching"] = False
@@ -1074,8 +1728,7 @@ def run_gui() -> int:
             )
         render_result()
         set_result_controls(True)
-        button.configure(state="normal")
-        collector_checkbox.configure(state="normal")
+        update_backend_controls()
         cancel_button.configure(state="disabled")
 
     def stopped() -> None:
@@ -1089,15 +1742,13 @@ def run_gui() -> int:
             )
         else:
             show("Search cancelled. Interesting keys found before cancellation remain saved.")
-        button.configure(state="normal")
-        collector_checkbox.configure(state="normal")
+        update_backend_controls()
         cancel_button.configure(state="disabled")
 
     def failed(error_text: str) -> None:
         state["searching"] = False
         activity.stop()
-        button.configure(state="normal")
-        collector_checkbox.configure(state="normal")
+        update_backend_controls()
         cancel_button.configure(state="disabled")
         messagebox.showerror("Search failed", error_text)
 
@@ -1105,9 +1756,10 @@ def run_gui() -> int:
         cancel_event = state["cancel"]
         assert isinstance(cancel_event, threading.Event)
         cancel_event.set()
-        process = state.get("process")
-        if isinstance(process, subprocess.Popen) and process.poll() is None:
-            process.terminate()
+        with process_lock:
+            process = active_process[0]
+        if isinstance(process, subprocess.Popen):
+            signal_process_termination(process)
         status.set("Stopping search…")
         cancel_button.configure(state="disabled")
 
@@ -1194,7 +1846,8 @@ def run_gui() -> int:
         toolbar.grid(row=0, column=0, sticky="ew")
         toolbar.columnconfigure(1, weight=1)
         ttk.Label(toolbar, text="Filter").grid(row=0, column=0, padx=(0, 7))
-        ttk.Entry(toolbar, textvariable=filter_value).grid(row=0, column=1, sticky="ew")
+        filter_entry = ttk.Entry(toolbar, textvariable=filter_value)
+        filter_entry.grid(row=0, column=1, sticky="ew")
         ttk.Label(toolbar, textvariable=browser_status).grid(row=0, column=2, padx=(12, 0))
 
         table_frame = ttk.Frame(browser, padding=(10, 5))
@@ -1237,7 +1890,10 @@ def run_gui() -> int:
         detail.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 5))
         browser_state: dict[str, object] = {
             "records": [], "visible": {}, "sort": "found", "reverse": True,
-            "private_visible": False, "skipped": 0,
+            "private_visible": False, "skipped": 0, "page": 0,
+            "pages": 1, "matching": 0, "loading": False,
+            "load_generation": 0, "closed": False, "filter_after": None,
+            "load_cancel": None,
         }
 
         def selected_record(require_valid_private: bool = False) -> Optional[dict[str, object]]:
@@ -1279,56 +1935,63 @@ def run_gui() -> int:
                     "1.0",
                     f"Public key: {record['public_key']}\n"
                     f"Private key: {private}\n"
-                    f"Rarity: {float(record.get('rarity_bits', 0)):.1f} bits"
-                    f"  •  Match length: {record.get('match_length', 0)}"
+                    f"Rarity: {_history_rarity(record.get('rarity_bits', 0)):.1f} bits"
+                    f"  •  Match length: {_history_length(record.get('match_length', 0))}"
                     f"  •  All matches: {', '.join(match_names) or record.get('reason', 'unknown')}",
                 )
             detail.configure(state="disabled")
 
-        def refresh_view(*_args: object) -> None:
-            query = filter_value.get().strip().lower()
+        def refresh_view(reset_page: bool = False) -> None:
+            if reset_page:
+                browser_state["page"] = 0
             records = browser_state["records"]
             assert isinstance(records, list)
-            filtered = [
-                record for record in records
-                if not query or query in " ".join((
-                    str(record.get("found_at", "")), str(record.get("reason", "")),
-                    str(record.get("public_key", "")),
-                )).lower()
-            ]
-            sort_column = str(browser_state["sort"])
-            if sort_column == "length":
-                key = lambda record: int(record.get("match_length", 0))
-            elif sort_column == "rarity":
-                key = lambda record: float(record.get("rarity_bits", 0))
-            elif sort_column == "public":
-                key = lambda record: str(record.get("public_key", ""))
-            elif sort_column == "reason":
-                key = lambda record: str(record.get("reason", ""))
-            else:
-                key = lambda record: str(record.get("found_at", ""))
-            filtered.sort(key=key, reverse=bool(browser_state["reverse"]))
-            tree.delete(*tree.get_children())
+            page_records, matching, selected_page, pages = select_interesting_page(
+                records, filter_value.get(), str(browser_state["sort"]),
+                bool(browser_state["reverse"]), int(browser_state["page"]),
+            )
+            browser_state["page"] = selected_page
+            browser_state["pages"] = pages
+            browser_state["matching"] = matching
+            children = tree.get_children()
+            if children:
+                tree.delete(*children)
             visible: dict[str, dict[str, object]] = {}
-            for index, record in enumerate(filtered):
-                item = f"record-{index}"
+            for index, record in enumerate(page_records):
+                item = f"record-{selected_page}-{index}"
                 visible[item] = record
                 found_at = str(record.get("found_at", "")).replace("T", " ").replace("Z", "")[:19]
-                rarity = f"{float(record.get('rarity_bits', 0)):.1f} bits"
+                rarity = f"{_history_rarity(record.get('rarity_bits', 0)):.1f} bits"
                 tree.insert("", "end", iid=item, values=(
                     found_at, record.get("reason", "unknown"),
-                    record.get("match_length", 0), rarity, record.get("public_key", ""),
+                    _history_length(record.get("match_length", 0)), rarity,
+                    record.get("public_key", ""),
                 ))
             browser_state["visible"] = visible
             browser_state["private_visible"] = False
+            rare_reveal.configure(text="Reveal private")
             children = tree.get_children()
             if children:
                 tree.selection_set(children[0])
                 tree.focus(children[0])
             skipped = int(browser_state["skipped"])
             note = f" • {skipped} malformed skipped" if skipped else ""
-            limited = " • showing newest 10,000" if len(records) == RARE_BROWSER_LIMIT else ""
-            browser_status.set(f"{len(filtered):,} shown / {len(records):,} loaded{limited}{note}")
+            limited = (f" • newest {RARE_BROWSER_LIMIT:,} retained"
+                       if len(records) == RARE_BROWSER_LIMIT else "")
+            if matching:
+                first = selected_page * RARE_BROWSER_PAGE_SIZE + 1
+                last = first + len(page_records) - 1
+                range_label = f"{first:,}–{last:,} of {matching:,} matches"
+            else:
+                range_label = "0 matches"
+            browser_status.set(
+                f"{range_label} • {len(records):,} loaded{limited}{note}"
+            )
+            page_status.set(f"Page {selected_page + 1:,} of {pages:,}")
+            previous_button.configure(state="normal" if selected_page > 0 else "disabled")
+            next_button.configure(
+                state="normal" if selected_page + 1 < pages else "disabled"
+            )
             render_selected()
 
         def sort_by(column: str) -> None:
@@ -1337,16 +2000,84 @@ def run_gui() -> int:
             else:
                 browser_state["sort"] = column
                 browser_state["reverse"] = column in ("found", "length", "rarity")
-            refresh_view()
+            refresh_view(reset_page=True)
 
         for column in columns:
             tree.heading(column, text=headings[column], command=lambda value=column: sort_by(value))
 
-        def reload_records() -> None:
-            records, skipped = load_interesting_records(path)
-            browser_state["records"] = records
+        def set_loading(loading: bool) -> None:
+            browser_state["loading"] = loading
+            widget_state = "disabled" if loading else "normal"
+            refresh_button.configure(state=widget_state)
+            filter_entry.configure(state=widget_state)
+            for control in record_action_buttons:
+                control.configure(state=widget_state)
+            if loading:
+                previous_button.configure(state="disabled")
+                next_button.configure(state="disabled")
+
+        def load_progress(generation: int, scanned: int, total: int) -> None:
+            if (browser_state["closed"]
+                    or generation != browser_state["load_generation"]):
+                return
+            if total:
+                browser_status.set(
+                    f"Loading newest records… {scanned / total:.0%} of file scanned"
+                )
+            else:
+                browser_status.set("Loading newest records…")
+
+        def finish_load(
+                generation: int, records: Optional[list[dict[str, object]]],
+                skipped: int, error_text: Optional[str],
+                load_cancel: threading.Event,
+        ) -> None:
+            history_load_cancels.discard(load_cancel)
+            if browser_state.get("load_cancel") is load_cancel:
+                browser_state["load_cancel"] = None
+            if (browser_state["closed"]
+                    or generation != browser_state["load_generation"]):
+                return
+            set_loading(False)
+            if error_text is not None:
+                browser_status.set("Could not load rare-key history")
+                messagebox.showerror("Could not load rare keys", error_text, parent=browser)
+                return
+            browser_state["records"] = records or []
             browser_state["skipped"] = skipped
-            refresh_view()
+            refresh_view(reset_page=True)
+
+        def reload_records() -> None:
+            if browser_state["loading"]:
+                return
+            generation = int(browser_state["load_generation"]) + 1
+            browser_state["load_generation"] = generation
+            set_loading(True)
+            browser_status.set("Loading newest records…")
+            load_cancel = threading.Event()
+            browser_state["load_cancel"] = load_cancel
+            history_load_cancels.add(load_cancel)
+
+            def loader() -> None:
+                try:
+                    records, skipped = load_interesting_records(
+                        path,
+                        progress=lambda scanned, total: post_ui(
+                            load_progress, generation, scanned, total
+                        ),
+                        ruleset=ruleset,
+                        cancel=load_cancel,
+                    )
+                except Exception as error:
+                    post_ui(
+                        finish_load, generation, None, 0, str(error), load_cancel,
+                    )
+                    return
+                post_ui(
+                    finish_load, generation, records, skipped, None, load_cancel,
+                )
+
+            threading.Thread(target=loader, daemon=True).start()
 
         def copy_selected(private: bool) -> None:
             record = selected_record(require_valid_private=private)
@@ -1417,26 +2148,79 @@ def run_gui() -> int:
             rare_reveal.configure(text="Reveal private"),
             render_selected(),
         ))
-        filter_value.trace_add("write", refresh_view)
+
+        def schedule_filter(*_args: object) -> None:
+            pending = browser_state.get("filter_after")
+            if isinstance(pending, str):
+                try:
+                    browser.after_cancel(pending)
+                except tk.TclError:
+                    pass
+            browser_state["filter_after"] = browser.after(
+                180, lambda: refresh_view(reset_page=True)
+            )
+
+        filter_value.trace_add("write", schedule_filter)
         browser_controls = ttk.Frame(browser, padding=(10, 5, 10, 10))
         browser_controls.grid(row=3, column=0, sticky="ew")
-        ttk.Button(browser_controls, text="Refresh", command=reload_records).pack(side="left")
-        ttk.Button(browser_controls, text="Copy public",
-                   command=lambda: copy_selected(False)).pack(side="left", padx=6)
-        ttk.Button(browser_controls, text="Copy private",
-                   command=lambda: copy_selected(True)).pack(side="left")
+        refresh_button = ttk.Button(browser_controls, text="Refresh", command=reload_records)
+        refresh_button.pack(side="left")
+        copy_rare_public = ttk.Button(
+            browser_controls, text="Copy public", command=lambda: copy_selected(False)
+        )
+        copy_rare_public.pack(side="left", padx=6)
+        copy_rare_private = ttk.Button(
+            browser_controls, text="Copy private", command=lambda: copy_selected(True)
+        )
+        copy_rare_private.pack(side="left")
         rare_reveal = ttk.Button(browser_controls, text="Reveal private", command=toggle_rare_private)
         rare_reveal.pack(side="left", padx=6)
-        ttk.Button(browser_controls, text="Export selected…",
-                   command=export_selected).pack(side="left")
-        ttk.Button(browser_controls, text="Close", command=browser.destroy).pack(side="right")
+        export_rare = ttk.Button(
+            browser_controls, text="Export selected…", command=export_selected
+        )
+        export_rare.pack(side="left")
+        record_action_buttons = (
+            copy_rare_public, copy_rare_private, rare_reveal, export_rare,
+        )
+        def change_page(offset: int) -> None:
+            browser_state["page"] = int(browser_state["page"]) + offset
+            refresh_view()
+
+        def close_browser() -> None:
+            browser_state["closed"] = True
+            browser_state["load_generation"] = int(browser_state["load_generation"]) + 1
+            load_cancel = browser_state.get("load_cancel")
+            if isinstance(load_cancel, threading.Event):
+                load_cancel.set()
+            pending = browser_state.get("filter_after")
+            if isinstance(pending, str):
+                try:
+                    browser.after_cancel(pending)
+                except tk.TclError:
+                    pass
+            browser.destroy()
+
+        ttk.Button(browser_controls, text="Close", command=close_browser).pack(side="right")
+        next_button = ttk.Button(
+            browser_controls, text="Next", command=lambda: change_page(1), state="disabled"
+        )
+        next_button.pack(side="right", padx=(6, 0))
+        previous_button = ttk.Button(
+            browser_controls, text="Previous", command=lambda: change_page(-1), state="disabled"
+        )
+        previous_button.pack(side="right")
+        page_status = ttk.Label(browser_controls, text="Page 1 of 1")
+        page_status.pack(side="right", padx=8)
+        browser.protocol("WM_DELETE_WINDOW", close_browser)
         reload_records()
 
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
     activity.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
     controls.grid(row=13, column=0, columnspan=3, sticky="ew")
-    button = ttk.Button(controls, text="Find vanity key", command=start_search)
+    button = ttk.Button(
+        controls, text="Find vanity key", command=start_search, state="disabled",
+    )
     button.pack(side="left")
     cancel_button = ttk.Button(controls, text="Cancel", command=cancel_search, state="disabled")
     cancel_button.pack(side="left", padx=7)
@@ -1453,22 +2237,33 @@ def run_gui() -> int:
 
     def close_window() -> None:
         state["closing"] = True
+        shutdown_event.set()
+        for history_cancel in tuple(history_load_cancels):
+            history_cancel.set()
         cancel_event = state["cancel"]
         assert isinstance(cancel_event, threading.Event)
         cancel_event.set()
-        process = state.get("process")
+        with process_lock:
+            process = active_process[0]
         if isinstance(process, subprocess.Popen) and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            # Reaping can take up to the timeout, so keep it off Tk's thread.
+            # This thread is intentionally non-daemon: the CUDA child cannot
+            # outlive a GUI that is closing.
+            threading.Thread(
+                target=terminate_process, args=(process,), daemon=False,
+            ).start()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close_window)
     refresh_estimate()
-    root.mainloop()
-    return 0
+    root.after(25, poll_ui_events)
+    start_gui_diagnostics(
+        lambda discovered, error_text: post_ui(
+            apply_gui_diagnostics, discovered, error_text,
+        ),
+        ruleset,
+    )
+    return _run_gui_mainloop(root.mainloop, close_window)
 
 
 def main() -> int:
@@ -1481,6 +2276,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="write result JSON with mode 0600")
     parser.add_argument("--watch-output", type=Path, default=DEFAULT_WATCH_PATH,
                         help="append incidental interesting keys here")
+    parser.add_argument("--rare-rules", type=Path,
+                        help="load an alternate rare-key rules JSON file")
     parser.add_argument("--collect-rare", action="store_true",
                         help="continuously collect rare keys with CUDA until interrupted")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index (default: 0)")
@@ -1496,13 +2293,23 @@ def main() -> int:
     parser.add_argument("--diagnostics", action="store_true",
                         help="print local readiness information as JSON")
     args = parser.parse_args()
+    try:
+        ruleset = (load_ruleset(args.rare_rules)
+                   if args.rare_rules is not None else DEFAULT_RARE_RULESET)
+    except RuleConfigError as error:
+        parser.error(str(error))
     if args.self_test:
         return 0 if self_test() else 1
     if args.diagnostics:
-        print(json.dumps(diagnostics(), indent=2))
+        try:
+            report = diagnostics(ruleset)
+        except KeyboardInterrupt:
+            print("\nDiagnostics cancelled.")
+            return 130
+        print(json.dumps(report, indent=2))
         return 0
     if args.gui:
-        return run_gui()
+        return run_gui(ruleset)
     try:
         prefix, suffix, contains = (valid_pattern(getattr(args, name), name) for name in ("prefix", "suffix", "contains"))
         if args.collect_rare and any((prefix, suffix, contains)):
@@ -1523,12 +2330,29 @@ def main() -> int:
             raise ValueError(f"output already exists; choose another path or add --force: {args.output}")
     except ValueError as error:
         parser.error(str(error))
+    try:
+        cuda_is_ready = (cuda_available(args.device, args.cuda_engine)
+                         if args.collect_rare or args.backend != "cpu" else False)
+    except KeyboardInterrupt:
+        print("\nSearch cancelled.")
+        return 130
     use_cuda = (args.collect_rare or args.backend == "cuda"
-                or (args.backend == "auto" and cuda_available()))
+                or (args.backend == "auto" and cuda_is_ready))
     if use_cuda:
-        if not cuda_available():
-            print("CUDA device or built engine unavailable; run 'make' and check nvidia-smi.", file=sys.stderr)
-            return 2
+        if not cuda_is_ready:
+            try:
+                # Failed probes are intentionally not cached, so an explicit
+                # CUDA request gets one immediate recovery attempt.
+                probe = cuda_probe(args.device, args.cuda_engine)
+            except KeyboardInterrupt:
+                print("\nSearch cancelled.")
+                return 130
+            if probe.get("ready") is True:
+                cuda_is_ready = True
+            else:
+                detail = probe.get("error", "selected CUDA engine did not become ready")
+                print(f"CUDA unavailable: {detail}", file=sys.stderr)
+                return 2
         if args.collect_rare:
             session = {"count": 0, "best_bits": 0.0, "best": "none yet"}
 
@@ -1542,7 +2366,7 @@ def main() -> int:
 
             def collector_watch(_rule: int, reason: str, public_key: str, path: Path) -> None:
                 session["count"] = int(session["count"]) + 1
-                analyzed = interesting_matches(public_key)
+                analyzed = interesting_matches(public_key, ruleset)
                 rarity_bits = analyzed[0].rarity_bits if analyzed else 0.0
                 if rarity_bits > float(session["best_bits"]):
                     session["best_bits"] = rarity_bits
@@ -1554,7 +2378,7 @@ def main() -> int:
                 search_cuda(
                     "", "", "", update=collector_progress, watch_path=args.watch_output,
                     watch_update=collector_watch, device=args.device,
-                    engine=args.cuda_engine, collect_only=True,
+                    engine=args.cuda_engine, collect_only=True, ruleset=ruleset,
                 )
             except KeyboardInterrupt:
                 print(
@@ -1566,11 +2390,38 @@ def main() -> int:
                 print(f"\nCollector failed: {error}", file=sys.stderr)
                 return 2
         print("Using CUDA backend with independent CPU result verification.")
-        result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output,
-                             device=args.device, engine=args.cuda_engine)
+        try:
+            result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output,
+                                 device=args.device, engine=args.cuda_engine,
+                                 ruleset=ruleset)
+        except KeyboardInterrupt:
+            print("\nSearch cancelled.")
+            return 130
+        except SearchCancelled:
+            print("\nSearch cancelled.")
+            return 0
+        except RuntimeError as error:
+            print(f"\nSearch failed: {error}", file=sys.stderr)
+            return 2
     else:
         print(f"Using verified CPU backend with {args.workers} workers.")
-        result = search(prefix, suffix, contains, args.workers, lambda n, e: print(f"\r{n:,} keys | {n / max(e, .001):,.0f} keys/s", end="", flush=True))
+        try:
+            result = search(
+                prefix, suffix, contains, args.workers,
+                lambda n, e: print(
+                    f"\r{n:,} keys | {n / max(e, .001):,.0f} keys/s",
+                    end="", flush=True,
+                ),
+            )
+        except KeyboardInterrupt:
+            print("\nSearch cancelled.")
+            return 130
+        except SearchCancelled:
+            print("\nSearch cancelled.")
+            return 0
+        except (RuntimeError, SearchWorkerError) as error:
+            print(f"\nSearch failed: {error}", file=sys.stderr)
+            return 2
     backend_label = result.backend.upper() + (f"/{result.engine}" if result.engine else "")
     print(f"\nFound {result.public_key} after ≤{result.attempts:,} attempts ({result.elapsed_seconds:.3f}s, {backend_label}).")
     output_path = args.output or default_result_path(result.public_key)

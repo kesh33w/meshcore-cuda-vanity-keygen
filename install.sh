@@ -29,7 +29,7 @@ done
 if ((INSTALL_PACKAGES)); then
     if ! command -v apt-get >/dev/null 2>&1; then
         echo "Automatic package installation currently supports apt-based Linux systems." >&2
-        echo "Install Python 3, Tk, libsodium, GNU Make/C++, and the CUDA toolkit, then use --skip-packages." >&2
+        echo "Install Python 3, Tk, libsodium, GNU Make/C++, and CUDA toolkit 11.8 or newer, then use --skip-packages." >&2
         exit 2
     fi
     packages=(build-essential libsodium23 python3 python3-tk)
@@ -56,6 +56,8 @@ ICON_HOME="$PREFIX/share/icons/hicolor"
 install -d -m 0755 "$APP_HOME/assets" "$BIN_HOME"
 install -d -m 0755 "$ICON_HOME/scalable/apps" "$ICON_HOME/256x256/apps"
 install -m 0755 "$PROJECT_DIR/meshcore_vanity.py" "$APP_HOME/meshcore_vanity.py"
+install -m 0644 "$PROJECT_DIR/rare_rules.py" "$APP_HOME/rare_rules.py"
+install -m 0644 "$PROJECT_DIR/rare_rules.json" "$APP_HOME/rare_rules.json"
 install -m 0755 "$PROJECT_DIR/meshcore_key_audit.py" "$APP_HOME/meshcore_key_audit.py"
 install -m 0755 "$PROJECT_DIR/meshcore_cuda_vanity" "$APP_HOME/meshcore_cuda_vanity"
 install -m 0644 "$PROJECT_DIR/VERSION" "$APP_HOME/VERSION"

@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import stat
@@ -10,9 +11,23 @@ from pathlib import Path
 from unittest import mock
 
 import meshcore_vanity as vanity
+import rare_rules
 
 
 class KeygenTests(unittest.TestCase):
+    @staticmethod
+    def custom_ruleset() -> rare_rules.RareRuleset:
+        return rare_rules.parse_ruleset({
+            "schema_version": 1,
+            "ruleset_id": "test-custom",
+            "rules": [{
+                "id": "custom-prefix",
+                "kind": "literal-prefix",
+                "enabled": True,
+                "value": "abcdef1234",
+            }],
+        })
+
     def test_release_icon_assets_and_desktop_metadata(self):
         root = Path(vanity.__file__).resolve().parent
         png = (root / "assets" / "meshcore-vanity-keygen.png").read_bytes()
@@ -70,17 +85,26 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(len(vanity.WATCH_REASONS), 5)
         self.assertFalse(any(reason.startswith("suffix-") for reason in vanity.WATCH_REASONS))
 
+    def test_rare_rule_compatibility_api_uses_canonical_types_and_defaults(self):
+        self.assertIs(vanity.RareMatch, rare_rules.RareMatch)
+        self.assertIs(vanity.DEFAULT_RARE_RULESET, rare_rules.DEFAULT_RULESET)
+        self.assertEqual(vanity.WATCH_REASONS, rare_rules.DEFAULT_RULESET.watch_reasons)
+        self.assertEqual(
+            vanity.diagnostics()["rare_ruleset_fingerprint"],
+            rare_rules.DEFAULT_RULESET.fingerprint,
+        )
+
     def test_cuda_rare_rules_match_python_rules(self):
         root = Path(vanity.__file__).resolve().parent
         cuda_source = (root / "cuda_vanity.cu").read_text(encoding="utf-8")
-        self.assertIn("gpu_watch_words[1][11]", cuda_source)
-        for word in vanity.WATCH_WORDS:
-            self.assertIn(f'"{word}"', cuda_source)
+        self.assertIn('#include "generated/rare_rules_default.cuh"', cuda_source)
+        self.assertIn("classify_generated_default", cuda_source)
+        self.assertIn("classify_generic_rules", cuda_source)
+        self.assertNotIn("gpu_watch_words", cuda_source)
         for removed in ("cafecafe00", "beefbeef00", "deadbeef00",
                         "facebabe00", "babecafe00", "f00df00d00",
                         "fadefade00"):
             self.assertNotIn(f'"{removed}"', cuda_source)
-        self.assertIn("if (equal_at(key, gpu_pi_prefix, 10, 0)) return 4;", cuda_source)
 
     def test_rare_analysis_preserves_stronger_matches(self):
         repeat_key = "a" * 13 + "1234567890abcdef" * 3 + "123"
@@ -236,13 +260,146 @@ class KeygenTests(unittest.TestCase):
             with mock.patch.object(vanity, "verify_expanded_key", return_value=True):
                 first = vanity.append_interesting(path, 0, public, private)
                 second = vanity.append_interesting(path, 0, public, private)
-                self.assertEqual(first["schema_version"], 2)
+                self.assertEqual(first["schema_version"], vanity.RARE_LOG_SCHEMA)
                 self.assertEqual(first["trigger"], "bookend-10")
                 self.assertEqual(second["match_length"], 10)
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(records), 2)
             self.assertEqual([record["reason"] for record in records], ["bookend-10"] * 2)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_custom_rule_is_carried_into_cuda_argv_and_saved_metadata(self):
+        class FinishedCollector:
+            def __init__(self):
+                self.stderr = StringIO("")
+                self.stdout = StringIO("")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        ruleset = self.custom_ruleset()
+        public = "abcdef1234" + "1" * 54
+        private = "22" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "engine"
+            executable.touch()
+            watch_path = root / "rare.jsonl"
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(
+                        vanity.subprocess, "Popen", return_value=FinishedCollector()
+                    ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "stopped unexpectedly"):
+                    vanity.search_cuda(
+                        "", "", "", collect_only=True, watch_path=watch_path,
+                        ruleset=ruleset,
+                    )
+            command = popen.call_args.args[0]
+            offset = command.index("--rare-rules-v1")
+            self.assertEqual(
+                tuple(command[offset:offset + len(ruleset.cuda_arguments())]),
+                ruleset.cuda_arguments(),
+            )
+
+            with mock.patch.object(vanity, "verify_expanded_key", return_value=True):
+                record = vanity.append_interesting(
+                    watch_path, 0, public, private, ruleset=ruleset,
+                )
+            self.assertEqual(record["trigger"], "prefix-abcdef1234")
+            self.assertEqual(record["ruleset_id"], ruleset.ruleset_id)
+            self.assertEqual(record["ruleset_fingerprint"], ruleset.fingerprint)
+
+    def test_schema_v2_and_newer_history_preserves_stored_analysis(self):
+        stored_matches = [{
+            "reason": "prefix-fadefade00",
+            "kind": "phrase-prefix",
+            "length": 10,
+            "rarity_bits": 40.0,
+            "mean_attempts": str(16 ** 10),
+        }]
+        for schema_version in (2, 3):
+            record = {
+                "schema_version": schema_version,
+                "reason": "prefix-fadefade00",
+                "match_length": 10,
+                "rarity_bits": 40.0,
+                "mean_attempts": str(16 ** 10),
+                "matches": stored_matches,
+                # This key matches stronger current structural rules, proving
+                # normalization does not overwrite persisted v2+ analysis.
+                "public_key": "1" * 64,
+                "private_key": "2" * 128,
+            }
+            with self.subTest(schema_version=schema_version):
+                normalized = vanity.normalize_interesting_record(record)
+                self.assertIsNotNone(normalized)
+                assert normalized is not None
+                self.assertEqual(normalized["reason"], "prefix-fadefade00")
+                self.assertEqual(normalized["matches"], stored_matches)
+
+            damaged_summary = {
+                **record,
+                "match_length": -1,
+                "rarity_bits": -2.0,
+                "mean_attempts": None,
+            }
+            normalized = vanity.normalize_interesting_record(damaged_summary)
+            self.assertIsNotNone(normalized)
+            assert normalized is not None
+            self.assertEqual(normalized["match_length"], 10)
+            self.assertEqual(normalized["rarity_bits"], 40.0)
+            self.assertEqual(normalized["mean_attempts"], str(16 ** 10))
+
+    def test_cli_rejects_invalid_rare_rules_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-rules.json"
+            path.write_text(
+                json.dumps({
+                    "schema_version": 99,
+                    "ruleset_id": "invalid",
+                    "rules": [],
+                }),
+                encoding="utf-8",
+            )
+            error_output = StringIO()
+            with mock.patch("sys.argv", [
+                    "meshcore_vanity.py", "--diagnostics", "--rare-rules", str(path),
+            ]), contextlib.redirect_stderr(error_output), self.assertRaises(SystemExit) as raised:
+                vanity.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("unsupported ruleset schema", error_output.getvalue())
+        self.assertNotIn("Traceback", error_output.getvalue())
+
+    def test_cli_loads_custom_rules_once_and_passes_frozen_instance(self):
+        ruleset = self.custom_ruleset()
+        output = StringIO()
+        with mock.patch("sys.argv", [
+                "meshcore_vanity.py", "--collect-rare", "--backend", "cuda",
+                "--rare-rules", "/tmp/test-rules.json",
+        ]), mock.patch.object(vanity, "load_ruleset", return_value=ruleset) as loader, \
+                mock.patch.object(vanity, "cuda_available", return_value=True), \
+                mock.patch.object(vanity, "search_cuda", side_effect=KeyboardInterrupt) as search, \
+                contextlib.redirect_stdout(output):
+            status = vanity.main()
+        self.assertEqual(status, 0)
+        loader.assert_called_once_with(Path("/tmp/test-rules.json"))
+        self.assertIs(search.call_args.kwargs["ruleset"], ruleset)
+
+    def test_installer_includes_canonical_rule_sources(self):
+        install_script = (Path(vanity.__file__).resolve().parent / "install.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"$PROJECT_DIR/rare_rules.py" "$APP_HOME/rare_rules.py"', install_script)
+        self.assertIn('"$PROJECT_DIR/rare_rules.json" "$APP_HOME/rare_rules.json"', install_script)
 
     def test_rare_browser_loads_legacy_records_with_bounded_memory(self):
         legacy_public = vanity.TEST_PUBLIC

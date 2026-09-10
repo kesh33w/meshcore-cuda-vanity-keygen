@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.5.2**. Generated identities have been validated
+The current release is **v1.6.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -36,8 +36,12 @@ python3 meshcore_vanity.py --prefix cafe
 python3 meshcore_vanity.py --gui
 ```
 
-You also need a working NVIDIA driver (`nvidia-smi` should list your GPU). No
-third-party Python packages are required. The program calls the system
+You also need a working NVIDIA driver (`nvidia-smi` should list your GPU) and
+CUDA toolkit 11.8 or newer. Some older Ubuntu releases package an earlier
+`nvidia-cuda-toolkit`; in that case, install a current NVIDIA CUDA toolkit and
+rerun `./install.sh --skip-packages`. The build checks the compiler version and
+stops with a clear message before compilation when it is too old. No third-party
+Python packages are required. The program calls the system
 `libsodium` Ed25519 base-point operation through `ctypes`; `python3-tk` supplies
 the desktop GUI.
 
@@ -61,14 +65,27 @@ To see local readiness information without starting a search:
 meshcore-vanity-keygen --diagnostics
 ```
 
+Diagnostics now allocate the optimized engine's production-sized lane state and
+exercise one full configured block through the real optimized scan engine on
+every visible GPU, rather than treating a listed device and an existing binary
+as proof that CUDA can actually run. During background discovery, the GUI also
+checks the baseline engine on every visible GPU so switching engines remains
+instant. Probe results contain no key material.
+
 ## GPU acceleration
 
-Build the CUDA engine with `make`. The Makefile detects the first GPU's compute
-capability and an available GNU C++ compiler. Override either when cross-building:
+Build the CUDA engine with `make`. The Makefile detects every visible GPU
+compute capability, embeds native code for each one, retains PTX for the newest,
+and selects an available GNU C++ compiler. Override the architecture when
+cross-building:
 
 ```bash
 make CUDA_ARCH=sm_89 HOST_CXX=/usr/bin/g++-13 CUDA_MAX_REGISTERS=128
 ```
+
+Header dependencies and a source/configuration fingerprint prevent stale CUDA
+binaries when architecture or tuning values change—even when switching back to
+an earlier configuration.
 
 On an NVIDIA system, `--backend auto` selects CUDA automatically. Use
 `--backend cuda` or `--backend cpu` to force a backend, and `--device N` to
@@ -83,8 +100,8 @@ uses domain-separated SHA-512 to derive an independent expanded Ed25519 private
 key for every GPU lane. Each lane calculates one full public point and then
 walks forward with the much cheaper `scalar += 8` and `point += 8B` operations.
 It compresses 32 projective public points together using Montgomery's
-batch-inversion trick,
-sharing one expensive field inversion across the entire group. SHA-512 also
+batch-inversion trick, sharing one expensive field inversion across the entire
+group. SHA-512 also
 supplies a separate Ed25519 nonce prefix for each lane. At most one identity is
 retained from a lane, so two saved identities never come from the same short
 `+8` walk. The older full-SHA-512/full-multiplication implementation
@@ -100,23 +117,30 @@ beginning with the MeshCore-rejected bytes `00` or `ff`—are rejected up front.
 The Cancel button, window close action, and `Ctrl+C` stop the CUDA process.
 The GUI displays mean-work and average-time estimates, updates them using the
 observed search rate, and shows GPU/self-test readiness before a search starts.
+GPU discovery, real-kernel readiness checks, history loading, and key searching
+all run outside Tk's event thread, so the window remains responsive.
 
 ### Measured performance
 
-On the development RTX 4070 Ti, the optimized engine processes about 880 million
-keys per second, compared with about 29 million for the retained baseline:
-roughly a 30× speedup. Approximate average search times at 880M/s are:
+On the development RTX 4070 Ti, the secured optimized engine processes about
+866–870 million keys per second, compared with about 29 million for the
+retained baseline:
+roughly a 30× speedup. Approximate average search times at 870M/s are:
 
 | Hex characters | Possibilities | Average time |
 | ---: | ---: | ---: |
 | 7 | 268 million | 0.3 seconds |
 | 8 | 4.3 billion | 4.9 seconds |
 | 9 | 68.7 billion | 1.3 minutes |
-| 10 | 1.1 trillion | 20.8 minutes |
+| 10 | 1.1 trillion | 21.1 minutes |
 | 11 | 17.6 trillion | 5.6 hours |
 
 These are probabilistic averages, not maximums. GPU model, cooling, power
-limits, and other workloads affect actual throughput.
+limits, and other workloads affect actual throughput. Controlled trials of
+alternate register limits, batch sizes, launch sizes, comparison packing,
+larger per-lane walks, and fast-math flags found no repeatable improvement over
+the shipped 128-register, 128-thread, 16-blocks-per-SM, 4096-attempt,
+32-point-batch configuration.
 
 ## Continuous rare-key collector
 
@@ -166,17 +190,33 @@ patterns. Every individual pattern constrains ten hexadecimal characters:
 - The first ten decimal digits of pi appear at the beginning:
   `3141592653` (`prefix-pi-3141592653`).
 
-At the measured 880M keys/s, one specific ten-character rule averages roughly
-20.8 minutes. The repeated-prefix rule accepts 14 valid repeated digits, so it
-averages about 89 seconds. Across the 5 rule categories—18 effective
+These defaults live in [`rare_rules.json`](rare_rules.json), which is the single
+source used by both Python verification and the generated fast CUDA classifier.
+To experiment without modifying the installed defaults, copy that file, edit
+the copy, and launch with `--rare-rules PATH` (this also works with `--gui`).
+Supported rule kinds are `bookend`, `mirror`, `repeat-prefix`,
+`literal-prefix`, and `sequence-prefix`. Rule order is significant: the first
+matching enabled rule supplies the numeric CUDA trigger, while CPU analysis
+still records every matching trait.
+
+Custom files are strictly validated before GPU work starts. They are limited to
+32 rules and 256 KiB, must use canonical lowercase hexadecimal values and valid
+MeshCore prefixes, and cannot configure an individual or combined hit rate high
+enough to overwhelm incidental-result handling. Each search freezes one parsed
+ruleset; its semantic ID and SHA-256 fingerprint are written into every new
+rare-key record.
+
+At the measured 870M keys/s, one specific ten-character rule averages roughly
+21.1 minutes. The repeated-prefix rule accepts 14 valid repeated digits, so it
+averages about 90 seconds. Across the 5 rule categories—18 effective
 ten-character possibilities—some incidental match is expected approximately
-every 69 seconds. Random search times vary widely, and a short run may still
+every 70 seconds. Random search times vary widely, and a short run may still
 find none.
 
 Each JSONL record keeps the matching pair together:
 
 ```json
-{"schema_version":2,"found_at":"2026-09-08T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized"}
+{"schema_version":3,"found_at":"2026-09-08T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized","ruleset_id":"meshcore-default","ruleset_fingerprint":"..."}
 ```
 
 The ten-character GPU rules remain the collection threshold, but CPU analysis
@@ -198,13 +238,14 @@ File locking prevents concurrent searches from corrupting or interleaving
 records. Collection stops when the requested key is found or the search is
 cancelled; rare keys already written remain saved. At the measured rate and
 current criteria, continuous searching averages about 1,250 new records per
-day. The GUI keeps its live count in memory and the browser bounds memory use to
-the newest 10,000 valid records. Upgrading does not rewrite or delete legacy
+day. The GUI keeps its live count in memory, reads history backward from the
+file tail, and presents at most 500 rows per page from the newest 10,000 valid
+records. Upgrading does not rewrite or delete legacy
 records; their basic rarity metadata is inferred when displayed. Legacy suffix
 records created by v1.0.x and records from later-removed phrase categories
-remain visible, but those patterns are no longer collected. Version-2 records
-are larger than the original minimal records, so storage growth depends on how
-many traits each key matches.
+remain visible, but those patterns are no longer collected. Version-2 and newer
+records are larger than the original minimal records, so storage growth depends
+on how many traits each key matches.
 
 ## Audit saved identities
 
@@ -251,8 +292,11 @@ shared-secret test includes an independent Python implementation of the
 conversion and Montgomery ladder used by MeshCore at upstream commit
 `d92964352441e53b93e8667b802e04f6e072b39e`. The
 opt-in GPU suite exercises repeated incremental point addition, tests both CUDA
-engines, verifies generated identities, and confirms cancellation leaves no
-child process behind.
+engines, compares CUDA rare-rule classification with Python, exercises the
+real-kernel readiness probe, verifies generated identities, and confirms
+cancellation leaves no child process behind. The CPU suite also checks strict
+rule parsing, generated-header freshness, build configuration changes, GUI
+worker failure paths, bounded history loading, and pagination.
 
 For v1.0.0, a CUDA-generated `c0dec0…` identity was also imported into a
 RAK4631 running MeshCore v1.17.1. The device exported the exact private key,

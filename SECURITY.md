@@ -18,6 +18,11 @@ generation weakness. Do not include real MeshCore private keys in any report.
   key-exchange-validated on CPU.
 - Optimized CUDA lanes are derived independently and at most one identity is
   retained from each lane's bounded scalar walk.
+- Rare-key policies are strictly parsed, frozen for each search, and recorded by
+  semantic fingerprint; every CUDA WATCH result is reclassified and fully
+  key-validated by Python against that same policy before it is persisted.
+- CUDA readiness is based on a versioned, key-free bounded smoke launch through
+  the selected real scan engine rather than device enumeration alone.
 - v1.0.0 was interoperability-tested on physical RAK4631 MeshCore firmware.
 
 ## v1.5.1-and-earlier saved-key audit

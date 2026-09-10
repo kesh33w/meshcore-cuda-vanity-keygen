@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "ruleset_id": "meshcore-default",
+  "rules": [
+    {
+      "id": "bookend",
+      "kind": "bookend",
+      "enabled": true,
+      "minimum_nibbles": 10
+    },
+    {
+      "id": "mirror",
+      "kind": "mirror",
+      "enabled": true,
+      "minimum_nibbles": 10
+    },
+    {
+      "id": "repeat-prefix",
+      "kind": "repeat-prefix",
+      "enabled": true,
+      "minimum_nibbles": 10,
+      "excluded_nibbles": "0f"
+    },
+    {
+      "id": "prefix-1337133713",
+      "kind": "literal-prefix",
+      "enabled": true,
+      "value": "1337133713"
+    },
+    {
+      "id": "pi",
+      "kind": "sequence-prefix",
+      "enabled": true,
+      "minimum_nibbles": 10,
+      "value": "3141592653589793238462643383279502884197169399375105820974944592"
+    }
+  ]
+}

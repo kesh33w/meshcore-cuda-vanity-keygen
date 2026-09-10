@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## 1.6.0 — 2026-09-10
+
+- Keep all Tk updates on the GUI event thread while moving GPU
+  discovery/readiness work, searches, and rare-history loading to background
+  workers; propagate CPU worker failures and perform bounded CUDA child cleanup
+  during cancel and window close.
+- Read large JSONL histories backward from the tail and add debounced filtering
+  plus 500-row pagination for the newest 10,000 valid records.
+- Add a canonical, strictly validated `rare_rules.json` configuration shared by
+  Python verification and CUDA, with `--rare-rules PATH` for frozen per-search
+  custom policies and semantic ruleset fingerprints in new schema-3 records.
+- Preserve the original stored analysis for versioned historical records even
+  after rules are retired or customized.
+- Add a native, key-free CUDA readiness protocol that initializes the selected
+  device and executes a bounded synchronized smoke launch through the selected
+  real scan engine; Python validates and caches the response instead of assuming
+  that a listed GPU can run the engine.
+- Build native code for every visible GPU architecture plus forward-compatible
+  PTX for the newest, track included CUDA headers, and fingerprint all source
+  and tuning inputs so stale binaries are rebuilt across configuration changes.
+- Add strict CUDA rule-protocol parsing, generated-default and generic runtime
+  classifiers, and CPU/GPU parity coverage without exposing key material.
+- Benchmark register limits, batch sizes, launch sizes, packed comparisons,
+  longer walks, and fast-math on the RTX 4070 Ti; retain the existing secure
+  configuration because no alternative produced a repeatable improvement over
+  its approximately 866–870 million keys/second.
+
 ## 1.5.2 — 2026-09-10
 
 - Derive a separate pseudorandom expanded Ed25519 private key for every

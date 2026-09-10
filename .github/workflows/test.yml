@@ -32,5 +32,7 @@ jobs:
         run: apt-get update && apt-get install -y g++ make python3 libsodium23
       - name: Compile CUDA engine without requiring a GPU
         run: make CUDA_ARCH=sm_75 HOST_CXX=/usr/bin/g++
+      - name: Test native command protocols without a GPU
+        run: make test
       - name: Test clean application installation
-        run: make install-smoke
+        run: make install-smoke CUDA_ARCH=sm_75 HOST_CXX=/usr/bin/g++
