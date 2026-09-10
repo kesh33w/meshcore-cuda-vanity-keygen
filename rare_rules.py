@@ -13,7 +13,7 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Mapping, Optional
+from typing import Iterable, Mapping, Optional
 
 
 RULESET_SCHEMA_VERSION = 1
@@ -361,6 +361,31 @@ def load_ruleset(path: Optional[Path] = None) -> RareRuleset:
     return parse_ruleset(value)
 
 
+def select_rules(ruleset: RareRuleset, enabled_ids: Iterable[str]) -> RareRuleset:
+    """Return a revalidated immutable ruleset with exactly these rules enabled."""
+    requested = tuple(enabled_ids)
+    if not requested:
+        raise RuleConfigError("select at least one rare-key rule")
+    if any(not isinstance(rule_id, str) or not rule_id for rule_id in requested):
+        raise RuleConfigError("selected rule identifiers must be non-empty strings")
+    if len(set(requested)) != len(requested):
+        raise RuleConfigError("selected rule identifiers must be unique")
+    configured = {rule.id for rule in ruleset.rules}
+    unknown = set(requested) - configured
+    if unknown:
+        raise RuleConfigError(
+            f"unknown selected rule(s): {', '.join(sorted(unknown))}"
+        )
+    selected = set(requested)
+    document = ruleset.normalized()
+    raw_rules = document["rules"]
+    assert isinstance(raw_rules, list)
+    for raw_rule in raw_rules:
+        assert isinstance(raw_rule, dict)
+        raw_rule["enabled"] = raw_rule["id"] in selected
+    return parse_ruleset(document)
+
+
 def _rule_matches_threshold(rule: RareRule, public_hex: str) -> bool:
     length = rule.threshold_length
     if rule.kind == "bookend":
@@ -451,4 +476,5 @@ __all__ = (
     "classify",
     "load_ruleset",
     "parse_ruleset",
+    "select_rules",
 )

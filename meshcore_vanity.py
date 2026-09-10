@@ -28,9 +28,11 @@ from rare_rules import (
     CUDA_RULE_PROTOCOL_VERSION,
     DEFAULT_RULESET as DEFAULT_RARE_RULESET,
     RareMatch,
+    RareRule,
     RareRuleset,
     RuleConfigError,
     load_ruleset,
+    select_rules,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -40,9 +42,22 @@ DEFAULT_RESULTS_DIR = Path(
     os.environ.get("MESHCORE_VANITY_RESULTS_DIR", str(APP_DIR / "results"))
 ).expanduser().resolve()
 DEFAULT_WATCH_PATH = DEFAULT_RESULTS_DIR / "rare-keys.jsonl"
+_xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+DEFAULT_GUI_SETTINGS_PATH = Path(
+    os.environ.get(
+        "MESHCORE_VANITY_SETTINGS_PATH",
+        str(
+            (Path(_xdg_config_home).expanduser() if _xdg_config_home
+             else Path.home() / ".config")
+            / "meshcore-vanity-keygen" / "settings.json"
+        ),
+    )
+).expanduser()
 REFERENCE_CUDA_RATE = 870_000_000.0
 ICON_PATH = APP_DIR / "assets" / "meshcore-vanity-keygen.png"
-RARE_LOG_SCHEMA = 3
+RARE_LOG_SCHEMA = 4
+GUI_SETTINGS_SCHEMA = 1
+GUI_SETTINGS_MAX_BYTES = 64 * 1024
 RARE_BROWSER_LIMIT = 10_000
 RARE_BROWSER_PAGE_SIZE = 500
 RARE_READ_BLOCK_SIZE = 64 * 1024
@@ -747,6 +762,132 @@ def atomic_write_json(record: object, path: Path, overwrite: bool = False) -> No
             pass
 
 
+def active_rule_ids(ruleset: RareRuleset) -> tuple[str, ...]:
+    return tuple(rule.id for rule in ruleset.active_rules)
+
+
+def rare_rule_short_name(rule: RareRule) -> str:
+    if rule.kind == "bookend":
+        return "Bookends"
+    if rule.kind == "mirror":
+        return "Mirrors"
+    if rule.kind == "repeat-prefix":
+        return "Repeated prefix"
+    if rule.kind == "literal-prefix" and rule.value == "1337133713":
+        return "1337133713"
+    if rule.kind == "sequence-prefix" and rule.id == "pi":
+        return "Pi"
+    return rule.id
+
+
+def rare_rule_choice_label(rule: RareRule) -> str:
+    length = rule.threshold_length
+    if rule.kind == "bookend":
+        detail = f"first {length}+ hex characters match the end"
+    elif rule.kind == "mirror":
+        detail = f"first {length}+ mirror the final characters"
+    elif rule.kind == "repeat-prefix":
+        detail = (
+            f"{length}+ identical starting characters; excludes "
+            f"{', '.join(rule.excluded_nibbles)}"
+        )
+    elif rule.kind == "literal-prefix":
+        detail = f"public key begins with {rule.value}"
+    else:
+        preview = rule.value[:length]
+        detail = f"public key begins with {preview} from the {rule.id} sequence"
+    return (
+        f"{rare_rule_short_name(rule)} — {detail} "
+        f"({rule.rarity_bits:.1f} rarity bits)"
+    )
+
+
+def rare_rule_selection_summary(ruleset: RareRuleset) -> str:
+    active = ruleset.active_rules
+    total = len(ruleset.rules)
+    if len(active) == total:
+        return f"All {total} selected"
+    if len(active) <= 3:
+        names = ", ".join(rare_rule_short_name(rule) for rule in active)
+        return f"{len(active)} of {total} selected: {names}"
+    inactive = [rule for rule in ruleset.rules if not rule.enabled]
+    if len(inactive) <= 2:
+        names = ", ".join(rare_rule_short_name(rule) for rule in inactive)
+        return f"{len(active)} of {total} selected; excluding {names}"
+    return f"{len(active)} of {total} selected"
+
+
+def load_gui_rule_selection(
+        base_ruleset: RareRuleset,
+        path: Optional[Path] = None,
+) -> RareRuleset:
+    """Load a bounded built-in GUI preference, falling back safely if stale."""
+    settings_path = DEFAULT_GUI_SETTINGS_PATH if path is None else path
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(
+            settings_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > GUI_SETTINGS_MAX_BYTES):
+            os.close(descriptor)
+            descriptor = None
+            return base_ruleset
+        with os.fdopen(descriptor, "rb") as file:
+            descriptor = None
+            raw = file.read(GUI_SETTINGS_MAX_BYTES + 1)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return base_ruleset
+    if len(raw) > GUI_SETTINGS_MAX_BYTES:
+        return base_ruleset
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError("duplicate settings field")
+            value[name] = item
+        return value
+
+    try:
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+        if (not isinstance(document, dict)
+                or set(document) != {
+                    "schema_version", "base_ruleset_fingerprint", "enabled_rule_ids",
+                }
+                or isinstance(document.get("schema_version"), bool)
+                or document.get("schema_version") != GUI_SETTINGS_SCHEMA
+                or document.get("base_ruleset_fingerprint") != base_ruleset.fingerprint
+                or not isinstance(document.get("enabled_rule_ids"), list)):
+            return base_ruleset
+        return select_rules(base_ruleset, document["enabled_rule_ids"])
+    except (
+        UnicodeDecodeError, json.JSONDecodeError, RecursionError,
+        RuleConfigError, ValueError,
+    ):
+        return base_ruleset
+
+
+def save_gui_rule_selection(
+        base_ruleset: RareRuleset, selected_ruleset: RareRuleset,
+        path: Optional[Path] = None,
+) -> None:
+    """Persist the non-secret built-in GUI rule choice without editing defaults."""
+    settings_path = DEFAULT_GUI_SETTINGS_PATH if path is None else path
+    atomic_write_json({
+        "schema_version": GUI_SETTINGS_SCHEMA,
+        "base_ruleset_fingerprint": base_ruleset.fingerprint,
+        "enabled_rule_ids": list(active_rule_ids(selected_ruleset)),
+    }, settings_path, overwrite=True)
+
+
 def save_result(result: Result, path: Path, overwrite: bool = False) -> None:
     atomic_write_json(asdict(result), path, overwrite)
 
@@ -882,6 +1023,19 @@ def _history_attempts(value: object, fallback: str = "0") -> str:
     return fallback
 
 
+def _history_rule_ids(value: object) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 32:
+        return []
+    result: list[str] = []
+    for rule_id in value:
+        if (not isinstance(rule_id, str)
+                or re.fullmatch(r"[a-z][a-z0-9-]{0,47}", rule_id) is None
+                or rule_id in result):
+            return []
+        result.append(rule_id)
+    return result
+
+
 def _sanitize_stored_match(value: object) -> Optional[dict[str, object]]:
     if not isinstance(value, dict):
         return None
@@ -935,6 +1089,9 @@ def normalize_interesting_record(
             or not re.fullmatch(r"[0-9a-f]{128}", private_hex)):
         return None
     normalized = dict(record)
+    normalized["active_rule_ids"] = _history_rule_ids(
+        normalized.get("active_rule_ids"),
+    )
     stored_primary = _stored_rare_analysis(normalized)
     if stored_primary is not None:
         # A recorded ruleset may later be disabled or changed. Preserve the
@@ -1094,6 +1251,7 @@ def select_interesting_page(
         if not normalized_query or normalized_query in " ".join((
             str(record.get("found_at", "")), str(record.get("reason", "")),
             str(record.get("public_key", "")),
+            " ".join(_history_rule_ids(record.get("active_rule_ids"))),
         )).lower()
     ]
     if sort_column == "length":
@@ -1145,6 +1303,7 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
         "engine": engine,
         "ruleset_id": ruleset.ruleset_id,
         "ruleset_fingerprint": ruleset.fingerprint,
+        "active_rule_ids": list(active_rule_ids(ruleset)),
     }
     with os.fdopen(descriptor, "a", encoding="utf-8") as file:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX)
@@ -1208,7 +1367,10 @@ def _run_gui_mainloop(
     return 0
 
 
-def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
+def run_gui(
+        ruleset: RareRuleset = DEFAULT_RARE_RULESET, *,
+        persist_rule_selection: bool = True,
+) -> int:
     try:
         import tkinter as tk
         import tkinter.font as tkfont
@@ -1217,6 +1379,9 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
         print("Tk is unavailable. Install python3-tk or use the command line.", file=sys.stderr)
         return 2
 
+    active_ruleset = (
+        load_gui_rule_selection(ruleset) if persist_rule_selection else ruleset
+    )
     root = tk.Tk(className="MeshCoreVanityKeygen")
     root.title(f"MeshCore Vanity Key Generator {APP_VERSION}")
     if ICON_PATH.is_file():
@@ -1225,7 +1390,7 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
             root.iconphoto(True, window_icon)
         except tk.TclError:
             window_icon = None
-    root.minsize(780, 620)
+    root.minsize(780, 660)
     frame = ttk.Frame(root, padding=16)
     frame.grid(sticky="nsew")
     root.columnconfigure(0, weight=1)
@@ -1289,16 +1454,28 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
     )
     collector_checkbox.grid(row=6, column=2, sticky="e")
 
+    rare_rule_summary = tk.StringVar(
+        value=rare_rule_selection_summary(active_ruleset),
+    )
+    ttk.Label(frame, text="Rare keys to keep").grid(
+        row=7, column=0, sticky="w", pady=3,
+    )
+    ttk.Label(frame, textvariable=rare_rule_summary).grid(
+        row=7, column=1, sticky="w", pady=3,
+    )
+    rare_rule_button = ttk.Button(frame, text="Choose…", state="disabled")
+    rare_rule_button.grid(row=7, column=2, padx=(7, 0))
+
     output_directory = tk.StringVar(value=str(DEFAULT_RESULTS_DIR))
-    ttk.Label(frame, text="Results folder").grid(row=7, column=0, sticky="w", pady=3)
-    ttk.Entry(frame, textvariable=output_directory).grid(row=7, column=1, sticky="ew", pady=3)
+    ttk.Label(frame, text="Results folder").grid(row=8, column=0, sticky="w", pady=3)
+    ttk.Entry(frame, textvariable=output_directory).grid(row=8, column=1, sticky="ew", pady=3)
 
     def choose_output_directory() -> None:
         selected = filedialog.askdirectory(initialdir=output_directory.get() or str(DEFAULT_RESULTS_DIR))
         if selected:
             output_directory.set(selected)
 
-    ttk.Button(frame, text="Choose…", command=choose_output_directory).grid(row=7, column=2, padx=(7, 0))
+    ttk.Button(frame, text="Choose…", command=choose_output_directory).grid(row=8, column=2, padx=(7, 0))
 
     diagnostic_text = tk.StringVar(
         value=(
@@ -1307,15 +1484,15 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
         )
     )
     ttk.Label(frame, textvariable=diagnostic_text).grid(
-        row=8, column=0, columnspan=3, sticky="w", pady=(8, 3),
+        row=9, column=0, columnspan=3, sticky="w", pady=(8, 3),
     )
     status = tk.StringVar(value="Discovering CUDA devices and checking compatibility…")
-    ttk.Label(frame, textvariable=status).grid(row=9, column=0, columnspan=3, sticky="w", pady=3)
+    ttk.Label(frame, textvariable=status).grid(row=10, column=0, columnspan=3, sticky="w", pady=3)
     incidental = tk.StringVar(value="Saved rare incidental keys: counting…")
-    ttk.Label(frame, textvariable=incidental).grid(row=10, column=0, columnspan=3, sticky="w", pady=(0, 3))
+    ttk.Label(frame, textvariable=incidental).grid(row=11, column=0, columnspan=3, sticky="w", pady=(0, 3))
     output = tk.Text(frame, width=86, height=10, state="disabled", wrap="word")
-    output.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=5)
-    frame.rowconfigure(11, weight=1)
+    output.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=5)
+    frame.rowconfigure(12, weight=1)
     state: dict[str, object] = {
         "result": None, "cancel": threading.Event(), "searching": False,
         "process": None, "closing": False, "saved_path": None,
@@ -1333,6 +1510,138 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
     history_load_cancels: set[threading.Event] = set()
     process_lock = threading.Lock()
     active_process: list[Optional[subprocess.Popen[str]]] = [None]
+
+    def open_rare_rule_selector() -> None:
+        if state["searching"]:
+            return
+        chooser = tk.Toplevel(root)
+        chooser.title("Rare Keys to Keep")
+        chooser.geometry("800x540")
+        chooser.minsize(620, 420)
+        chooser.transient(root)
+        chooser.columnconfigure(0, weight=1)
+        chooser.rowconfigure(1, weight=1)
+        if ICON_PATH.is_file():
+            try:
+                chooser.iconphoto(True, window_icon)
+            except (tk.TclError, UnboundLocalError):
+                pass
+
+        introduction = (
+            "Choose which rare identities are saved during vanity searches and "
+            "continuous collection. This affects new discoveries only; saved "
+            "history is never removed."
+        )
+        if not persist_rule_selection:
+            introduction += " Choices from this custom rules file last for this app session."
+        ttk.Label(
+            chooser, text=introduction, wraplength=740, justify="left",
+            padding=(14, 14, 14, 8),
+        ).grid(row=0, column=0, sticky="ew")
+
+        list_frame = ttk.Frame(chooser, padding=(14, 0, 14, 8))
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        background = ttk.Style(chooser).lookup("TFrame", "background") or "#d9d9d9"
+        canvas = tk.Canvas(
+            list_frame, highlightthickness=0, background=background,
+        )
+        scrollbar = ttk.Scrollbar(
+            list_frame, orient="vertical", command=canvas.yview,
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        choices = ttk.Frame(canvas)
+        choices.columnconfigure(0, weight=1)
+        choices_window = canvas.create_window(
+            (0, 0), window=choices, anchor="nw",
+        )
+
+        def resize_choices(_event: object = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def resize_choices_width(event: object) -> None:
+            width = getattr(event, "width", 0)
+            if isinstance(width, int) and width > 0:
+                canvas.itemconfigure(choices_window, width=width)
+
+        choices.bind("<Configure>", resize_choices)
+        canvas.bind("<Configure>", resize_choices_width)
+        selected_ids = set(active_rule_ids(active_ruleset))
+        choice_vars: dict[str, tk.BooleanVar] = {}
+        validation_text = tk.StringVar()
+        for row, rule in enumerate(ruleset.rules):
+            variable = tk.BooleanVar(value=rule.id in selected_ids)
+            choice_vars[rule.id] = variable
+            ttk.Checkbutton(
+                choices, text=rare_rule_choice_label(rule), variable=variable,
+                command=lambda: validation_text.set(""),
+            ).grid(row=row, column=0, sticky="w", padx=6, pady=7)
+
+        def set_choices(enabled: bool) -> None:
+            for variable in choice_vars.values():
+                variable.set(enabled)
+            validation_text.set("")
+
+        def restore_configured_defaults() -> None:
+            defaults = {rule.id for rule in ruleset.active_rules}
+            for rule_id, variable in choice_vars.items():
+                variable.set(rule_id in defaults)
+            validation_text.set("")
+
+        def close_chooser() -> None:
+            try:
+                chooser.grab_release()
+            except tk.TclError:
+                pass
+            chooser.destroy()
+
+        def apply_choices() -> None:
+            nonlocal active_ruleset
+            enabled = [
+                rule.id for rule in ruleset.rules if choice_vars[rule.id].get()
+            ]
+            try:
+                selected = select_rules(ruleset, enabled)
+            except RuleConfigError as error:
+                validation_text.set(str(error).capitalize())
+                return
+            active_ruleset = selected
+            rare_rule_summary.set(rare_rule_selection_summary(selected))
+            if persist_rule_selection:
+                try:
+                    save_gui_rule_selection(ruleset, selected)
+                except (OSError, ValueError) as error:
+                    messagebox.showwarning(
+                        "Selection not remembered",
+                        "The selection is active for this session, but could not be "
+                        f"saved for the next launch.\n\n{error}",
+                        parent=chooser,
+                    )
+            close_chooser()
+
+        chooser.bind("<Escape>", lambda _event: close_chooser())
+        footer = ttk.Frame(chooser, padding=(14, 4, 14, 14))
+        footer.grid(row=2, column=0, sticky="ew")
+        ttk.Button(
+            footer, text="Select all", command=lambda: set_choices(True),
+        ).pack(side="left")
+        ttk.Button(
+            footer, text="Restore configured defaults",
+            command=restore_configured_defaults,
+        ).pack(side="left", padx=7)
+        ttk.Label(footer, textvariable=validation_text).pack(side="left", padx=8)
+        ttk.Button(footer, text="Cancel", command=close_chooser).pack(side="right")
+        ttk.Button(footer, text="Apply", command=apply_choices).pack(
+            side="right", padx=(0, 7),
+        )
+        chooser.protocol("WM_DELETE_WINDOW", close_chooser)
+        chooser.grab_set()
+        chooser.focus_set()
+
+    rare_rule_button.configure(command=open_rare_rule_selector, state="normal")
 
     def post_ui(callback: Callable[..., None], *args: object) -> None:
         """Queue a callback for execution by Tk's main thread."""
@@ -1382,6 +1691,7 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
             return
         pending = bool(state["discovery_pending"])
         searching = bool(state["searching"])
+        rare_rule_button.configure(state="disabled" if searching else "normal")
         if pending or searching:
             button.configure(state="disabled")
             collector_checkbox.configure(state="disabled")
@@ -1558,6 +1868,7 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
             status.set("CUDA discovery is still in progress; please wait")
             return
         collecting = collector_mode.get()
+        search_ruleset = active_ruleset
         selected_device = selected_device_index()
         if selected_device is None:
             selected_device = 0
@@ -1651,7 +1962,7 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
             ) + 1
             session_count = int(state["collector_session_count"])
             if collecting:
-                analyzed = interesting_matches(public_key, ruleset)
+                analyzed = interesting_matches(public_key, search_ruleset)
                 rarity_bits = analyzed[0].rarity_bits if analyzed else 0.0
                 if rarity_bits > float(state.get("collector_best_bits", 0.0)):
                     state["collector_best_bits"] = rarity_bits
@@ -1696,7 +2007,7 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
                                          engine=selected_engine,
                                          collect_only=collecting,
                                          process_update=process_progress,
-                                         ruleset=ruleset)
+                                         ruleset=search_ruleset)
                 else:
                     result = search(**values, workers=worker_count, update=progress,
                                     cancel=cancel_event)
@@ -1886,7 +2197,7 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
                 stretch=column == "public",
             )
 
-        detail = tk.Text(browser, height=7, state="disabled", wrap="char")
+        detail = tk.Text(browser, height=8, state="disabled", wrap="char")
         detail.grid(row=2, column=0, sticky="ew", padx=10, pady=(5, 5))
         browser_state: dict[str, object] = {
             "records": [], "visible": {}, "sort": "found", "reverse": True,
@@ -1931,13 +2242,15 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
                     str(item.get("reason")) for item in match_items
                     if isinstance(item, dict) and item.get("reason")
                 ]
+                saved_policy = _history_rule_ids(record.get("active_rule_ids"))
                 detail.insert(
                     "1.0",
                     f"Public key: {record['public_key']}\n"
                     f"Private key: {private}\n"
                     f"Rarity: {_history_rarity(record.get('rarity_bits', 0)):.1f} bits"
                     f"  •  Match length: {_history_length(record.get('match_length', 0))}"
-                    f"  •  All matches: {', '.join(match_names) or record.get('reason', 'unknown')}",
+                    f"  •  All matches: {', '.join(match_names) or record.get('reason', 'unknown')}\n"
+                    f"Saved policy: {', '.join(saved_policy) if saved_policy else 'not recorded'}",
                 )
             detail.configure(state="disabled")
 
@@ -2215,9 +2528,9 @@ def run_gui(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> int:
         reload_records()
 
     activity = ttk.Progressbar(frame, mode="indeterminate", length=620)
-    activity.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(7, 3))
+    activity.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(7, 3))
     controls = ttk.Frame(frame)
-    controls.grid(row=13, column=0, columnspan=3, sticky="ew")
+    controls.grid(row=14, column=0, columnspan=3, sticky="ew")
     button = ttk.Button(
         controls, text="Find vanity key", command=start_search, state="disabled",
     )
@@ -2309,7 +2622,9 @@ def main() -> int:
         print(json.dumps(report, indent=2))
         return 0
     if args.gui:
-        return run_gui(ruleset)
+        return run_gui(
+            ruleset, persist_rule_selection=args.rare_rules is None,
+        )
     try:
         prefix, suffix, contains = (valid_pattern(getattr(args, name), name) for name in ("prefix", "suffix", "contains"))
         if args.collect_rare and any((prefix, suffix, contains)):

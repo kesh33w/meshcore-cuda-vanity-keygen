@@ -317,6 +317,31 @@ class ReliabilityTests(unittest.TestCase):
         assert normalized is not None
         self.assertEqual(normalized["rarity_bits"], 40.0)
 
+    def test_history_sanitizes_and_filters_active_rule_ids(self):
+        valid_match = {
+            "reason": "retired-rule", "kind": "literal-prefix", "length": 10,
+            "rarity_bits": 40.0, "mean_attempts": str(16 ** 10),
+        }
+        record = {
+            **rare_record(1), "schema_version": 4, "matches": [valid_match],
+            "active_rule_ids": ["mirror", "pi"],
+        }
+        normalized = vanity.normalize_interesting_record(record)
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(normalized["active_rule_ids"], ["mirror", "pi"])
+        selected, matching, _, _ = vanity.select_interesting_page(
+            [normalized], "pi", "found", False, 0,
+        )
+        self.assertEqual((selected, matching), ([normalized], 1))
+
+        malformed = vanity.normalize_interesting_record({
+            **record, "active_rule_ids": ["pi", "pi"],
+        })
+        self.assertIsNotNone(malformed)
+        assert malformed is not None
+        self.assertEqual(malformed["active_rule_ids"], [])
+
     def test_numeric_history_sort_is_defensive(self):
         records = [
             {"public_key": "a", "match_length": object(), "rarity_bits": None},

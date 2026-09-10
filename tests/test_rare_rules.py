@@ -130,6 +130,45 @@ class RareRulesTests(unittest.TestCase):
         )
         self.assertLessEqual(max(map(len, ruleset.cuda_arguments())), 80)
 
+    def test_selection_preserves_order_indices_and_default_fingerprint(self):
+        default = rare_rules.DEFAULT_RULESET
+        selected = rare_rules.select_rules(default, ("pi", "mirror"))
+        self.assertEqual(
+            tuple(rule.id for rule in selected.active_rules), ("mirror", "pi"),
+        )
+        self.assertEqual(
+            selected.watch_reasons,
+            ("mirror-10", "prefix-pi-3141592653"),
+        )
+        self.assertEqual(
+            selected.classify("abcde12345" + "2" * 44 + "54321edcba"), 0,
+        )
+        self.assertEqual(selected.classify("3141592653" + "2" * 54), 1)
+
+        all_ids = tuple(rule.id for rule in default.rules)
+        all_selected = rare_rules.select_rules(default, reversed(all_ids))
+        restored = rare_rules.select_rules(selected, all_ids)
+        self.assertEqual(all_selected.fingerprint, default.fingerprint)
+        self.assertEqual(restored.fingerprint, default.fingerprint)
+        self.assertEqual(all_selected.cuda_arguments(), default.cuda_arguments())
+
+    def test_selection_rejects_empty_duplicate_unknown_and_unsafe_sets(self):
+        default = rare_rules.DEFAULT_RULESET
+        for selected in ((), ("pi", "pi"), ("not-configured",)):
+            with self.subTest(selected=selected), self.assertRaises(
+                    rare_rules.RuleConfigError):
+                rare_rules.select_rules(default, selected)
+
+        rules = tuple(
+            literal_rule(f"rule-{index}", f"a{index:07x}", enabled=index == 0)
+            for index in range(17)
+        )
+        base = rare_rules.parse_ruleset(document_with(*rules))
+        enabled_two = rare_rules.select_rules(base, ("rule-0", "rule-1"))
+        self.assertEqual(len(enabled_two.active_rules), 2)
+        with self.assertRaisesRegex(rare_rules.RuleConfigError, "combined rules"):
+            rare_rules.select_rules(base, (rule.id for rule in base.rules))
+
     def test_fingerprint_is_semantic_deterministic_and_order_sensitive(self):
         first = literal_rule("first", "123456789a")
         second = literal_rule("second", "abcdef1234")
@@ -358,8 +397,14 @@ class NativeCudaRareProtocolTests(unittest.TestCase):
             "1" * 64,
         )
 
+        pi_only = rare_rules.select_rules(rare_rules.DEFAULT_RULESET, ("pi",))
+        mirror_and_pi = rare_rules.select_rules(
+            rare_rules.DEFAULT_RULESET, ("pi", "mirror"),
+        )
         for ruleset, samples, expect_fast in (
                 (rare_rules.DEFAULT_RULESET, default_samples, True),
+                (pi_only, default_samples, False),
+                (mirror_and_pi, default_samples, False),
                 (custom, custom_samples, False)):
             arguments: list[str] = []
             for sample in samples:

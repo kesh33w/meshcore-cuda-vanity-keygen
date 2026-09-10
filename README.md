@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.6.0**. Generated identities have been validated
+The current release is **v1.7.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -147,7 +147,8 @@ the shipped 128-register, 128-thread, 16-blocks-per-SM, 4096-attempt,
 Select **Continuous rare collector** in the GUI and click **Start rare
 collector** to collect built-in rare keys indefinitely without inventing an
 astronomically difficult vanity target. Pattern fields are disabled in this
-mode. The live display reports candidates tested, runtime, keys per second,
+mode. Use **Rare keys to keep → Choose…** to select the categories collected.
+The live display reports candidates tested, runtime, keys per second,
 discoveries during the current session, and the best session rarity. Press
 **Cancel** whenever you want to stop; every completed discovery has already
 been verified and saved.
@@ -167,8 +168,18 @@ material does not.
 ## Automatic rare-key collection
 
 Every CUDA search checks each generated public key both for the requested
-pattern and for the built-in rare-key rules. The second check is automatic; no
-extra option is required and it does not interrupt the requested search. When
+pattern and for the selected rare-key rules. The second check is automatic; no
+extra option is required and it does not interrupt the requested search. In the
+GUI, **Rare keys to keep → Choose…** opens a checkbox for every configured
+category. At least one category must remain selected. The selection is frozen
+when a search starts and applies to new incidental discoveries as well as the
+continuous collector. It does not delete or hide anything already saved.
+
+Built-in GUI choices are remembered in the non-secret preferences file
+`~/.config/meshcore-vanity-keygen/settings.json`. If the rule configuration
+changes or that file is unreadable, the app safely restores the configured
+defaults. Choices made while using a custom `--rare-rules` file last only for
+that GUI session, so they cannot silently rewrite the custom policy. When
 an incidental rare match appears, its public/private relationship, rare rule,
 and MeshCore validity are independently verified on the CPU and it is
 immediately appended to `results/rare-keys.jsonl`. The GUI shows a live count,
@@ -204,9 +215,11 @@ Custom files are strictly validated before GPU work starts. They are limited to
 MeshCore prefixes, and cannot configure an individual or combined hit rate high
 enough to overwhelm incidental-result handling. Each search freezes one parsed
 ruleset; its semantic ID and SHA-256 fingerprint are written into every new
-rare-key record.
+rare-key record. The GUI chooser revalidates every selected subset with the same
+safety limits, including rules that were initially disabled in a custom file.
 
-At the measured 870M keys/s, one specific ten-character rule averages roughly
+With all five defaults selected, at the measured 870M keys/s, one specific
+ten-character rule averages roughly
 21.1 minutes. The repeated-prefix rule accepts 14 valid repeated digits, so it
 averages about 90 seconds. Across the 5 rule categories—18 effective
 ten-character possibilities—some incidental match is expected approximately
@@ -216,7 +229,7 @@ find none.
 Each JSONL record keeps the matching pair together:
 
 ```json
-{"schema_version":3,"found_at":"2026-09-08T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized","ruleset_id":"meshcore-default","ruleset_fingerprint":"..."}
+{"schema_version":4,"found_at":"2026-09-08T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized","ruleset_id":"meshcore-default","ruleset_fingerprint":"...","active_rule_ids":["bookend","mirror","repeat-prefix","prefix-1337133713","pi"]}
 ```
 
 The ten-character GPU rules remain the collection threshold, but CPU analysis
@@ -225,7 +238,10 @@ with 13 identical characters is labeled `repeat-prefix-13`, and a pi prefix
 continuing for 15 digits records all 15 rather than being flattened to ten.
 When one key has multiple interesting traits, the strongest becomes `reason`
 and every trait is retained under `matches`. Rarity is expressed as equivalent
-random-search bits, making unlike patterns sortable on one scale.
+random-search bits, making unlike patterns sortable on one scale. Schema-4
+records also retain the active rule IDs so the history browser can show the
+policy that was in force when each key was found. Older records remain fully
+readable and display that policy as not recorded.
 
 The file is created with owner-only permissions (`0600`) when the search starts;
 an empty file means no rare key has been found. A source checkout stores it
@@ -296,7 +312,8 @@ engines, compares CUDA rare-rule classification with Python, exercises the
 real-kernel readiness probe, verifies generated identities, and confirms
 cancellation leaves no child process behind. The CPU suite also checks strict
 rule parsing, generated-header freshness, build configuration changes, GUI
-worker failure paths, bounded history loading, and pagination.
+rule selection and preference validation, worker failure paths, bounded history
+loading, and pagination.
 
 For v1.0.0, a CUDA-generated `c0dec0…` identity was also imported into a
 RAK4631 running MeshCore v1.17.1. The device exported the exact private key,

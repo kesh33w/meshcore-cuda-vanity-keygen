@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## 1.7.0 — 2026-09-10
+
+- Add a scrollable **Rare keys to keep** chooser to the GUI, with a checkbox
+  and plain-language description for every configured rare-key rule.
+- Remember built-in rule choices across GUI launches while keeping custom
+  `--rare-rules` choices session-only and treating stale or malformed settings
+  as a safe request to restore the configured defaults.
+- Freeze the selected, revalidated ruleset when each search starts so CUDA
+  trigger indices, CPU verification, saved metadata, and live reporting remain
+  consistent for the entire run.
+- Record the active rule IDs in new schema-4 rare-key records and show that
+  saved policy in the history browser without altering or hiding older records.
+- Verify subset classification and compact CUDA trigger mapping on the CPU and
+  GPU; selecting all defaults retains the generated fast path, while measured
+  subsets retain the same approximately 870-million-keys/second throughput.
+
 ## 1.6.0 — 2026-09-10
 
 - Keep all Tk updates on the GUI event thread while moving GPU

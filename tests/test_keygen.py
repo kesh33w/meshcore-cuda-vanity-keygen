@@ -94,6 +94,81 @@ class KeygenTests(unittest.TestCase):
             rare_rules.DEFAULT_RULESET.fingerprint,
         )
 
+    def test_gui_rule_selection_settings_roundtrip_and_fail_safe(self):
+        base = rare_rules.DEFAULT_RULESET
+        selected = rare_rules.select_rules(base, ("mirror", "pi"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            vanity.save_gui_rule_selection(base, selected, path)
+            loaded = vanity.load_gui_rule_selection(base, path)
+            self.assertEqual(loaded.fingerprint, selected.fingerprint)
+            self.assertEqual(vanity.active_rule_ids(loaded), ("mirror", "pi"))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["base_ruleset_fingerprint"] = "0" * 64
+            path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertIs(vanity.load_gui_rule_selection(base, path), base)
+
+            path.write_text("not json", encoding="utf-8")
+            self.assertIs(vanity.load_gui_rule_selection(base, path), base)
+
+            path.write_bytes(b" " * (vanity.GUI_SETTINGS_MAX_BYTES + 1))
+            self.assertIs(vanity.load_gui_rule_selection(base, path), base)
+
+            path.write_text(
+                '{"schema_version":1,"schema_version":1,\n'
+                '"base_ruleset_fingerprint":"unused","enabled_rule_ids":["pi"]}',
+                encoding="utf-8",
+            )
+            self.assertIs(vanity.load_gui_rule_selection(base, path), base)
+
+            target = Path(directory) / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            link = Path(directory) / "settings-link.json"
+            link.symlink_to(target)
+            self.assertIs(vanity.load_gui_rule_selection(base, link), base)
+            with self.assertRaises(ValueError):
+                vanity.save_gui_rule_selection(base, selected, link)
+
+            fifo = Path(directory) / "settings-fifo"
+            os.mkfifo(fifo)
+            loaded_fifo: list[rare_rules.RareRuleset] = []
+            reader = threading.Thread(
+                target=lambda: loaded_fifo.append(
+                    vanity.load_gui_rule_selection(base, fifo)
+                ),
+                daemon=True,
+            )
+            reader.start()
+            reader.join(1.0)
+            self.assertFalse(reader.is_alive(), "FIFO preference path blocked GUI startup")
+            self.assertEqual(loaded_fifo, [base])
+
+            with mock.patch.object(vanity.json, "loads", side_effect=RecursionError):
+                path.write_text("{}", encoding="utf-8")
+                self.assertIs(vanity.load_gui_rule_selection(base, path), base)
+
+    def test_gui_rule_labels_and_summary_are_human_readable(self):
+        base = rare_rules.DEFAULT_RULESET
+        labels = [vanity.rare_rule_choice_label(rule) for rule in base.rules]
+        self.assertTrue(any("Bookends" in label for label in labels))
+        self.assertTrue(any("Mirrors" in label for label in labels))
+        self.assertTrue(any("1337133713" in label for label in labels))
+        self.assertTrue(any("Pi" in label for label in labels))
+        custom_literal = rare_rules.RareRule(
+            "bookend", "literal-prefix", True, 0, "abcdef1234",
+        )
+        self.assertTrue(
+            vanity.rare_rule_choice_label(custom_literal).startswith("bookend —"),
+        )
+        self.assertEqual(vanity.rare_rule_selection_summary(base), "All 5 selected")
+        subset = rare_rules.select_rules(base, ("mirror", "pi"))
+        self.assertEqual(
+            vanity.rare_rule_selection_summary(subset),
+            "2 of 5 selected: Mirrors, Pi",
+        )
+
     def test_cuda_rare_rules_match_python_rules(self):
         root = Path(vanity.__file__).resolve().parent
         cuda_source = (root / "cuda_vanity.cu").read_text(encoding="utf-8")
@@ -262,6 +337,10 @@ class KeygenTests(unittest.TestCase):
                 second = vanity.append_interesting(path, 0, public, private)
                 self.assertEqual(first["schema_version"], vanity.RARE_LOG_SCHEMA)
                 self.assertEqual(first["trigger"], "bookend-10")
+                self.assertEqual(
+                    first["active_rule_ids"],
+                    [rule.id for rule in vanity.DEFAULT_RARE_RULESET.active_rules],
+                )
                 self.assertEqual(second["match_length"], 10)
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(records), 2)
@@ -317,6 +396,23 @@ class KeygenTests(unittest.TestCase):
             self.assertEqual(record["trigger"], "prefix-abcdef1234")
             self.assertEqual(record["ruleset_id"], ruleset.ruleset_id)
             self.assertEqual(record["ruleset_fingerprint"], ruleset.fingerprint)
+            self.assertEqual(record["active_rule_ids"], ["custom-prefix"])
+
+    def test_selected_rule_watch_index_is_compact_and_saved(self):
+        ruleset = rare_rules.select_rules(
+            rare_rules.DEFAULT_RULESET, ("pi",),
+        )
+        public = "3141592653" + "1" * 54
+        private = "22" * 64
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(vanity, "verify_expanded_key", return_value=True):
+            record = vanity.append_interesting(
+                Path(directory) / "rare.jsonl", 0, public, private,
+                ruleset=ruleset,
+            )
+        self.assertEqual(record["trigger"], "prefix-pi-3141592653")
+        self.assertEqual(record["active_rule_ids"], ["pi"])
+        self.assertEqual(record["ruleset_fingerprint"], ruleset.fingerprint)
 
     def test_schema_v2_and_newer_history_preserves_stored_analysis(self):
         stored_matches = [{
@@ -326,7 +422,7 @@ class KeygenTests(unittest.TestCase):
             "rarity_bits": 40.0,
             "mean_attempts": str(16 ** 10),
         }]
-        for schema_version in (2, 3):
+        for schema_version in (2, 3, 4):
             record = {
                 "schema_version": schema_version,
                 "reason": "prefix-fadefade00",
@@ -393,6 +489,17 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(status, 0)
         loader.assert_called_once_with(Path("/tmp/test-rules.json"))
         self.assertIs(search.call_args.kwargs["ruleset"], ruleset)
+
+    def test_gui_custom_rules_are_session_only(self):
+        ruleset = self.custom_ruleset()
+        with mock.patch("sys.argv", [
+                "meshcore_vanity.py", "--gui",
+                "--rare-rules", "/tmp/test-rules.json",
+        ]), mock.patch.object(vanity, "load_ruleset", return_value=ruleset), \
+                mock.patch.object(vanity, "run_gui", return_value=0) as gui:
+            status = vanity.main()
+        self.assertEqual(status, 0)
+        gui.assert_called_once_with(ruleset, persist_rule_selection=False)
 
     def test_installer_includes_canonical_rule_sources(self):
         install_script = (Path(vanity.__file__).resolve().parent / "install.sh").read_text(
