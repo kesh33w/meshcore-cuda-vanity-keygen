@@ -710,6 +710,34 @@ def start_temperature_monitor(
     return thread
 
 
+def drain_callback_queue(
+        events: queue.SimpleQueue[
+            tuple[Callable[..., None], tuple[object, ...]]
+        ],
+        limit: int = 256,
+        on_error: Optional[Callable[[Exception], None]] = None,
+) -> int:
+    """Run a bounded UI-event batch without one callback stopping the queue."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("callback drain limit must be a positive integer")
+    processed = 0
+    for _index in range(limit):
+        try:
+            callback, arguments = events.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            callback(*arguments)
+        except Exception as error:
+            if on_error is not None:
+                try:
+                    on_error(error)
+                except Exception:
+                    pass
+        processed += 1
+    return processed
+
+
 def cuda_executable() -> Path:
     return Path(__file__).resolve().with_name("meshcore_cuda_vanity")
 
@@ -718,12 +746,14 @@ CUDA_PROBE_PROTOCOL = "meshcore-cuda-probe-v2"
 SUPPORTED_CUDA_PROBE_PROTOCOLS = frozenset((
     "meshcore-cuda-probe-v1", CUDA_PROBE_PROTOCOL,
 ))
+INTERACTIVE_CUDA_ATTEMPTS = {"optimized": 2048, "baseline": 32}
 _CUDA_PROBE_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
 _CUDA_PROBE_LOCK = threading.Lock()
 
 
 def cuda_probe(device: int = 0, engine: str = "optimized", *,
-               refresh: bool = False, timeout: float = 5.0) -> dict[str, object]:
+               interactive: bool = False, refresh: bool = False,
+               timeout: float = 5.0) -> dict[str, object]:
     """Exercise a real kernel and return a validated, key-free readiness report."""
     if device < 0:
         raise ValueError("CUDA device must be zero or greater")
@@ -731,6 +761,8 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
         engine = "optimized"
     if engine not in ("optimized", "baseline"):
         raise ValueError("CUDA engine must be optimized or baseline")
+    if not isinstance(interactive, bool):
+        raise ValueError("CUDA interactive profile must be boolean")
     executable = cuda_executable()
     base: dict[str, object] = {
         "schema": 1,
@@ -747,7 +779,7 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
         return {**base, "error": str(error)}
     cache_key = (
         str(executable.resolve()), metadata.st_dev, metadata.st_ino,
-        metadata.st_size, metadata.st_mtime_ns, device, engine,
+        metadata.st_size, metadata.st_mtime_ns, device, engine, interactive,
     )
     with _CUDA_PROBE_LOCK:
         cached = _CUDA_PROBE_CACHE.get(cache_key)
@@ -755,8 +787,14 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
         return dict(cached)
 
     try:
+        command = [
+            str(executable), "--probe", "--device", str(device),
+            "--engine", engine,
+        ]
+        if interactive:
+            command.append("--interactive")
         completed = subprocess.run(
-            [str(executable), "--probe", "--device", str(device), "--engine", engine],
+            command,
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=timeout, check=False,
         )
@@ -767,6 +805,7 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
                 or not isinstance(payload.get("schema"), int)
                 or payload.get("schema") != 1
                 or payload.get("protocol") not in SUPPORTED_CUDA_PROBE_PROTOCOLS
+                or (interactive and payload.get("protocol") != CUDA_PROBE_PROTOCOL)
                 or isinstance(payload.get("device"), bool)
                 or not isinstance(payload.get("device"), int)
                 or payload.get("device") != device or payload.get("engine") != engine
@@ -807,6 +846,11 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
                     or not isinstance(payload.get("max_registers"), int)
                     or int(payload["max_registers"]) < 0):
                 raise ValueError("probe readiness details are malformed")
+            if (interactive
+                    and (int(payload["blocks_per_sm"]) > 4
+                         or int(payload["attempts_per_thread"])
+                         != INTERACTIVE_CUDA_ATTEMPTS[engine])):
+                raise ValueError("probe interactive scheduling details are malformed")
         else:
             if completed.returncode == 0 or not isinstance(payload.get("error"), str):
                 raise ValueError("probe failure details are malformed")
@@ -823,7 +867,7 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
         # long-running GUIs cannot accumulate obsolete probe responses.
         for previous_key in tuple(_CUDA_PROBE_CACHE):
             if (previous_key[0] == cache_key[0]
-                    and previous_key[-2:] == cache_key[-2:]
+                    and previous_key[-3:] == cache_key[-3:]
                     and previous_key != cache_key):
                 del _CUDA_PROBE_CACHE[previous_key]
         # Initialization and driver failures can be transient. Retaining them
@@ -836,10 +880,12 @@ def cuda_probe(device: int = 0, engine: str = "optimized", *,
 
 
 def cuda_available(device: int = 0, engine: str = "optimized", *,
-                   refresh: bool = False) -> bool:
+                   interactive: bool = False, refresh: bool = False) -> bool:
     if cuda_device_count() <= device:
         return False
-    return bool(cuda_probe(device, engine, refresh=refresh).get("ready"))
+    return bool(cuda_probe(
+        device, engine, interactive=interactive, refresh=refresh,
+    ).get("ready"))
 
 
 def cuda_device_names() -> list[str]:
@@ -880,11 +926,14 @@ def terminate_process(process: subprocess.Popen[str], timeout: float = 2.0) -> N
         process.wait()
 
 
-def diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object]:
+def diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET, *,
+                interactive: bool = False) -> dict[str, object]:
     devices = cuda_device_count()
     names = cuda_device_names()
     firmware_vector = firmware_compatibility_test()
-    probes = [cuda_probe(index) for index in range(devices)]
+    probes = [
+        cuda_probe(index, interactive=interactive) for index in range(devices)
+    ]
     return {
         "version": APP_VERSION,
         "firmware_vector": firmware_vector,
@@ -901,7 +950,7 @@ def diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object
 
 def gui_diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object]:
     """Collect every GUI CUDA-engine readiness result without touching Tk."""
-    details = diagnostics(ruleset)
+    details = diagnostics(ruleset, interactive=True)
     device_count = int(details.get("cuda_devices", 0))
     engine_probes: dict[tuple[int, str], dict[str, object]] = {}
     existing = details.get("cuda_probes", [])
@@ -917,7 +966,9 @@ def gui_diagnostics(ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, ob
     for device_index in range(device_count):
         for engine in ("optimized", "baseline"):
             if (device_index, engine) not in engine_probes:
-                engine_probes[(device_index, engine)] = cuda_probe(device_index, engine)
+                engine_probes[(device_index, engine)] = cuda_probe(
+                    device_index, engine, interactive=True,
+                )
     details["cuda_engine_probes"] = engine_probes
     details["cuda_ready"] = any(
         bool(probe.get("ready")) for probe in engine_probes.values()
@@ -984,6 +1035,7 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 device: int = 0,
                 engine: str = "optimized",
                 collect_only: bool = False,
+                interactive: bool = False,
                 process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
                 ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> Result:
     executable = cuda_executable()
@@ -993,7 +1045,11 @@ def search_cuda(prefix: str, suffix: str, contains: str,
         engine = "optimized"
     if engine not in ("optimized", "baseline"):
         raise ValueError("CUDA engine must be optimized or baseline")
+    if not isinstance(interactive, bool):
+        raise ValueError("CUDA interactive profile must be boolean")
     command = [str(executable), "--device", str(device), "--engine", engine]
+    if interactive:
+        command.append("--interactive")
     command.extend(ruleset.cuda_arguments())
     if collect_only:
         if any((prefix, suffix, contains)):
@@ -2186,16 +2242,23 @@ def run_gui(
     def poll_ui_events() -> None:
         if state["closing"]:
             return
-        # Bound each drain so a burst of progress events cannot starve Tk.
-        for _index in range(256):
-            try:
-                callback, arguments = ui_events.get_nowait()
-            except queue.Empty:
-                break
-            callback(*arguments)
-            if state["closing"]:
-                return
-        root.after(25, poll_ui_events)
+        def report_callback_error(error: Exception) -> None:
+            print(
+                f"GUI update callback failed: {type(error).__name__}",
+                file=sys.stderr,
+            )
+            if not state["closing"]:
+                status.set(
+                    "A background interface update failed; the GUI remains usable"
+                )
+
+        try:
+            # Bound each drain so a burst of progress events cannot starve Tk.
+            drain_callback_queue(ui_events, on_error=report_callback_error)
+        finally:
+            # A failed callback must never permanently stop UI event delivery.
+            if not state["closing"]:
+                root.after(25, poll_ui_events)
 
     initial_count_generation = int(state["rare_count_generation"])
 
@@ -2434,6 +2497,7 @@ def run_gui(
                                          watch_path=watch_path, watch_update=watch_progress,
                                          device=selected_device,
                                          engine=selected_engine,
+                                         interactive=True,
                                          collect_only=collecting,
                                          process_update=process_progress,
                                          ruleset=search_ruleset)
@@ -2951,8 +3015,10 @@ def run_gui(
             browser_controls, text="Previous", command=lambda: change_page(-1), state="disabled"
         )
         previous_button.pack(side="right")
-        page_status = ttk.Label(browser_controls, text="Page 1 of 1")
-        page_status.pack(side="right", padx=8)
+        page_status = tk.StringVar(value="Page 1 of 1")
+        ttk.Label(browser_controls, textvariable=page_status).pack(
+            side="right", padx=8,
+        )
         browser.protocol("WM_DELETE_WINDOW", close_browser)
         reload_records()
 

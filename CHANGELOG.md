@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## 1.8.1 — 2026-09-10
+
+- Fix the saved-rare-key browser's page indicator so opening or refreshing the
+  browser cannot stop delivery of GUI progress, completion, temperature, and
+  cancellation updates.
+- Isolate background interface callbacks and unconditionally reschedule the
+  bounded event pump after a callback error, keeping later terminal updates
+  deliverable even if one update fails.
+- Add an automatically selected interactive CUDA launch profile for GUI work,
+  reducing optimized progress batches from about 575 ms to 74 ms and retaining
+  about 97% of maximum throughput in an A/B/A test on the RTX 4070 Ti. Direct
+  CLI searches retain the maximum-throughput profile.
+- Add live-GPU coverage for both launch profiles and both engines, along with a
+  regression test that delivers a terminal update after a failed GUI callback.
+
 ## 1.8.0 — 2026-09-10
 
 - Add live CPU-package and selected-GPU temperature readings to the GUI in

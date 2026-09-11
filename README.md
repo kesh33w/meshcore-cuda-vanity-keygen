@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.8.0**. Generated identities have been validated
+The current release is **v1.8.1**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -123,13 +123,15 @@ not thermal protection or fan/power control; unavailable readings appear as
 `—`. CPU sensors are read directly from Linux sysfs, while one bounded
 `nvidia-smi` query covers all NVIDIA GPUs. GPU discovery, real-kernel readiness
 checks, temperature sampling, history loading, and key searching all run
-outside Tk's event thread, so the window remains responsive.
+outside Tk's event thread. GUI searches also use shorter CUDA batches to keep
+progress and cancellation responsive; direct command-line searches retain the
+maximum-throughput launch profile.
 
 ### Measured performance
 
-On the development RTX 4070 Ti, the secured optimized engine processes about
-866–870 million keys per second, compared with about 29 million for the
-retained baseline:
+On the development RTX 4070 Ti, the secured optimized engine's
+maximum-throughput command-line profile processes about 866–870 million keys
+per second, compared with about 29 million for the retained baseline:
 roughly a 30× speedup. Approximate average search times at 870M/s are:
 
 | Hex characters | Possibilities | Average time |
@@ -145,7 +147,10 @@ limits, and other workloads affect actual throughput. Controlled trials of
 alternate register limits, batch sizes, launch sizes, comparison packing,
 larger per-lane walks, and fast-math flags found no repeatable improvement over
 the shipped 128-register, 128-thread, 16-blocks-per-SM, 4096-attempt,
-32-point-batch configuration.
+32-point-batch command-line configuration. The GUI's responsive profile measured
+845 million keys per second versus 873 million for that maximum-throughput
+profile in an A/B/A test on the same GPU, with progress intervals reduced from
+about 575 ms to 74 ms.
 
 ## Continuous rare-key collector
 
@@ -168,7 +173,8 @@ Use `Ctrl+C` for a clean stop. `--watch-output PATH`, `--device N`, and
 `--cuda-engine optimized|baseline` remain available. Collector mode requires
 CUDA and cannot be combined with a vanity prefix, suffix, or substring.
 Progress statistics and rare-match names appear in the terminal, but key
-material does not.
+material does not. For an unattended collector, this command-line mode also
+retains the maximum-throughput CUDA launch profile.
 
 ## Automatic rare-key collection
 
@@ -315,10 +321,11 @@ conversion and Montgomery ladder used by MeshCore at upstream commit
 opt-in GPU suite exercises repeated incremental point addition, tests both CUDA
 engines, compares CUDA rare-rule classification with Python, exercises the
 real-kernel readiness probe, verifies generated identities, and confirms
-cancellation leaves no child process behind. The CPU suite also checks strict
+cancellation leaves no child process behind. It validates both responsive-GUI
+and maximum-throughput CUDA launch profiles. The CPU suite also checks strict
 rule parsing, generated-header freshness, build configuration changes, GUI
-rule selection and preference validation, worker failure paths, bounded history
-loading, and pagination.
+rule selection and preference validation, callback-queue recovery, worker
+failure paths, bounded history loading, and pagination.
 Temperature tests additionally cover CPU sensor selection, multi-GPU PCI
 mapping, stale and malformed readings, subprocess time/output limits, and
 monitor shutdown. The live GPU suite checks both versions of the key-free

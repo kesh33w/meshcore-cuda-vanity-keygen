@@ -34,6 +34,9 @@ constexpr int kBlocksPerSm = MC_BLOCKS_PER_SM;
 #define MC_ATTEMPTS_PER_THREAD 256
 #endif
 constexpr int kAttemptsPerThread = MC_ATTEMPTS_PER_THREAD;
+constexpr int kInteractiveBlocksPerSm = 4;
+constexpr int kInteractiveOptimizedAttemptsPerThread = 2048;
+constexpr int kInteractiveBaselineAttemptsPerThread = 32;
 #ifndef MC_MAX_REGISTERS
 #define MC_MAX_REGISTERS 0
 #endif
@@ -59,6 +62,13 @@ static_assert(kThreads > 0 && kThreads <= 1024 && kThreads % 32 == 0,
               "MC_THREADS must be a positive warp multiple no greater than 1024");
 static_assert(kAttemptsPerThread > 0 && kAttemptsPerThread % 32 == 0,
               "MC_ATTEMPTS_PER_THREAD must be a positive multiple of 32");
+static_assert(kInteractiveBlocksPerSm > 0,
+              "interactive blocks per SM must be positive");
+static_assert(kInteractiveOptimizedAttemptsPerThread > 0
+                  && kInteractiveOptimizedAttemptsPerThread % 32 == 0,
+              "interactive optimized attempts must be a positive multiple of 32");
+static_assert(kInteractiveBaselineAttemptsPerThread > 0,
+              "interactive baseline attempts must be positive");
 
 __constant__ char gpu_prefix[kMaxPattern + 1];
 __constant__ char gpu_suffix[kMaxPattern + 1];
@@ -365,7 +375,7 @@ __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResul
     bool lane_has_watch = false;
     const unsigned long long lane = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     for (int i = 0; i < 32; ++i) seed[i] = base_seed[i];
-    increment_seed(seed, lane * kAttemptsPerThread);
+    increment_seed(seed, lane * AttemptCount);
 
     for (int attempt = 0; attempt < AttemptCount; ++attempt) {
         if ((attempt % kResultCheckInterval) == 0 && result->found) return;
@@ -473,6 +483,38 @@ __global__ void scan_kernel_optimized(const unsigned char *lane_private_keys,
         ge_madd(&next, &points[31], &base[0][7]);
         ge_p1p1_to_p3(&points[0], &next);
     }
+}
+
+struct LaunchProfile {
+    int blocks_per_sm;
+    int attempts_per_thread;
+};
+
+cudaError_t select_launch_profile(const std::string &engine, bool interactive,
+                                  LaunchProfile &profile) {
+    profile = {kBlocksPerSm, kAttemptsPerThread};
+    if (!interactive) return cudaSuccess;
+
+    int resident_blocks = 0;
+    cudaError_t status = engine == "optimized"
+        ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &resident_blocks,
+              scan_kernel_optimized<kInteractiveOptimizedAttemptsPerThread>,
+              kThreads, 0)
+        : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &resident_blocks,
+              scan_kernel_baseline<kInteractiveBaselineAttemptsPerThread>,
+              kThreads, 0);
+    if (status != cudaSuccess) return status;
+    if (resident_blocks < 1) return cudaErrorInvalidConfiguration;
+    const int interactive_limit = kInteractiveBlocksPerSm < kBlocksPerSm
+        ? kInteractiveBlocksPerSm : kBlocksPerSm;
+    profile.blocks_per_sm = resident_blocks < interactive_limit
+        ? resident_blocks : interactive_limit;
+    profile.attempts_per_thread = engine == "optimized"
+        ? kInteractiveOptimizedAttemptsPerThread
+        : kInteractiveBaselineAttemptsPerThread;
+    return cudaSuccess;
 }
 
 bool valid_hex(const std::string &value) {
@@ -916,7 +958,8 @@ int emit_probe_failure(int selected_device, const std::string &engine,
     return 2;
 }
 
-int run_readiness_probe(int selected_device, const std::string &engine) {
+int run_readiness_probe(int selected_device, const std::string &engine,
+                        bool interactive) {
     int device_count = 0;
     cudaError_t status = cudaGetDeviceCount(&device_count);
     if (status != cudaSuccess) {
@@ -959,7 +1002,15 @@ int run_readiness_probe(int selected_device, const std::string &engine) {
         (void)cudaGetLastError();
     }
 
-    const int production_blocks = properties.multiProcessorCount * kBlocksPerSm;
+    LaunchProfile profile{};
+    status = select_launch_profile(engine, interactive, profile);
+    if (status != cudaSuccess) {
+        return emit_probe_failure(
+            selected_device, engine,
+            std::string("select launch profile: ") + cudaGetErrorString(status));
+    }
+    const int production_blocks =
+        properties.multiProcessorCount * profile.blocks_per_sm;
     const unsigned long long production_lane_count =
         static_cast<unsigned long long>(production_blocks) * kThreads;
     if (production_blocks <= 0 || production_lane_count == 0) {
@@ -1044,7 +1095,7 @@ int run_readiness_probe(int selected_device, const std::string &engine) {
 
     // Exercise one full configured block of the selected production kernel.
     // This validates its real block geometry and register feasibility while
-    // remaining bounded to kThreads * kAttemptsPerThread public candidates.
+    // remaining bounded to one block of the selected profile.
     if (engine == "optimized") {
         derive_lane_private_keys<<<1, kThreads>>>(
             device_input, device_lane_state, production_lane_count);
@@ -1052,11 +1103,22 @@ int run_readiness_probe(int selected_device, const std::string &engine) {
         if (status != cudaSuccess) return fail("probe launch lane derivation", status);
         status = cudaDeviceSynchronize();
         if (status != cudaSuccess) return fail("probe synchronize lane derivation", status);
-        scan_kernel_optimized<kAttemptsPerThread><<<1, kThreads>>>(
-            device_lane_state, production_lane_count, device_result, device_watch);
+        if (interactive) {
+            scan_kernel_optimized<kInteractiveOptimizedAttemptsPerThread>
+                <<<1, kThreads>>>(device_lane_state, production_lane_count,
+                                  device_result, device_watch);
+        } else {
+            scan_kernel_optimized<kAttemptsPerThread><<<1, kThreads>>>(
+                device_lane_state, production_lane_count, device_result, device_watch);
+        }
     } else {
-        scan_kernel_baseline<kAttemptsPerThread><<<1, kThreads>>>(
-            device_input, device_result, device_watch);
+        if (interactive) {
+            scan_kernel_baseline<kInteractiveBaselineAttemptsPerThread>
+                <<<1, kThreads>>>(device_input, device_result, device_watch);
+        } else {
+            scan_kernel_baseline<kAttemptsPerThread><<<1, kThreads>>>(
+                device_input, device_result, device_watch);
+        }
     }
     status = cudaGetLastError();
     if (status != cudaSuccess) return fail("probe launch selected scan engine", status);
@@ -1113,8 +1175,8 @@ int run_readiness_probe(int selected_device, const std::string &engine) {
         meshcore_rare_generated::kRulesetFingerprint, selected_device,
         json_escape(properties.name).c_str(), pci_json.c_str(),
         properties.major, properties.minor,
-        engine.c_str(), kBuildFingerprint, kBuildArches, kThreads, kBlocksPerSm,
-        kAttemptsPerThread, kMaxRegisters);
+        engine.c_str(), kBuildFingerprint, kBuildArches, kThreads,
+        profile.blocks_per_sm, profile.attempts_per_thread, kMaxRegisters);
     std::fflush(stdout);
     return 0;
 }
@@ -1200,9 +1262,9 @@ int run_lane_isolation_self_test(int selected_device) {
 
 void usage(const char *program) {
     std::fprintf(stderr,
-                 "Usage: %s [--engine optimized|baseline] [--device N] [--collect-only] [--prefix HEX] [--suffix HEX] [--contains HEX]\n"
+                 "Usage: %s [--engine optimized|baseline] [--device N] [--interactive] [--collect-only] [--prefix HEX] [--suffix HEX] [--contains HEX]\n"
                  "          [--rare-rules-v1 FINGERPRINT [--rare-rule-v1 SPEC]...]\n"
-                 "       %s --probe [--device N] [--engine optimized|baseline]\n",
+                 "       %s --probe [--device N] [--engine optimized|baseline] [--interactive]\n",
                  program, program);
 }
 
@@ -1218,6 +1280,7 @@ int main(int argc, char **argv) {
     std::string engine = "optimized";
     int selected_device = 0;
     bool collect_only = false;
+    bool interactive = false;
     bool lane_isolation_self_test = false;
     bool rare_parser_self_test = false;
     bool probe = false;
@@ -1263,6 +1326,11 @@ int main(int argc, char **argv) {
         if (option == "--collect-only") {
             if (collect_only) option_error = true;
             collect_only = true;
+            continue;
+        }
+        if (option == "--interactive") {
+            if (interactive) option_error = true;
+            interactive = true;
             continue;
         }
         if (option == "--internal-test-lane-isolation") {
@@ -1344,10 +1412,10 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 2;
         }
-        return run_readiness_probe(selected_device, engine);
+        return run_readiness_probe(selected_device, engine, interactive);
     }
     if (lane_isolation_self_test) {
-        if (option_error || collect_only || rare_parser_self_test
+        if (option_error || collect_only || interactive || rare_parser_self_test
                 || !classifier_values.empty() || rare_protocol_seen
                 || !prefix.empty() || !suffix.empty() || !contains.empty()
                 || engine != "optimized" || engine_option_seen) {
@@ -1357,7 +1425,7 @@ int main(int argc, char **argv) {
         return run_lane_isolation_self_test(selected_device);
     }
     if (rare_parser_self_test) {
-        if (option_error || collect_only || !classifier_values.empty()
+        if (option_error || collect_only || interactive || !classifier_values.empty()
                 || device_option_seen || engine_option_seen
                 || !prefix.empty() || !suffix.empty() || !contains.empty()) {
             usage(argv[0]);
@@ -1366,7 +1434,7 @@ int main(int argc, char **argv) {
         return run_rare_rule_parser_test(rare_rules, use_generated_default);
     }
     if (!classifier_values.empty()) {
-        if (option_error || collect_only || engine_option_seen
+        if (option_error || collect_only || interactive || engine_option_seen
                 || !prefix.empty() || !suffix.empty() || !contains.empty()) {
             usage(argv[0]);
             return 2;
@@ -1413,7 +1481,10 @@ int main(int argc, char **argv) {
     cuda_check(cudaMemcpyToSymbol(gpu_collect_only, &collect_only_value, sizeof(int)),
                "copy collector mode");
 
-    int blocks = properties.multiProcessorCount * kBlocksPerSm;
+    LaunchProfile profile{};
+    cuda_check(select_launch_profile(engine, interactive, profile),
+               "select launch profile");
+    int blocks = properties.multiProcessorCount * profile.blocks_per_sm;
     const unsigned long long lane_count =
         static_cast<unsigned long long>(blocks) * kThreads;
     unsigned char *device_seed = nullptr;
@@ -1428,9 +1499,13 @@ int main(int argc, char **argv) {
     cuda_check(cudaMalloc(&device_watch, sizeof(WatchBatch)), "cudaMalloc watch results");
     unsigned long long attempts = 0;
     auto started = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "GPU %d: %s, engine %s, mode %s, %d blocks x %d threads\n",
+    std::fprintf(stderr,
+                 "GPU %d: %s, engine %s, mode %s, scheduling %s, "
+                 "%d blocks x %d threads x %d attempts\n",
                  selected_device, properties.name, engine.c_str(),
-                 collect_only ? "collector" : "vanity", blocks, kThreads);
+                 collect_only ? "collector" : "vanity",
+                 interactive ? "interactive" : "throughput",
+                 blocks, kThreads, profile.attempts_per_thread);
 
     for (;;) {
         std::array<unsigned char, 32> seed{};
@@ -1444,11 +1519,22 @@ int main(int argc, char **argv) {
             derive_lane_private_keys<<<blocks, kThreads>>>(
                 device_seed, device_lane_private_keys, lane_count);
             cuda_check(cudaGetLastError(), "launch lane derivation kernel");
-            scan_kernel_optimized<kAttemptsPerThread><<<blocks, kThreads>>>(
-                device_lane_private_keys, lane_count, device_result, device_watch);
+            if (interactive) {
+                scan_kernel_optimized<kInteractiveOptimizedAttemptsPerThread>
+                    <<<blocks, kThreads>>>(device_lane_private_keys, lane_count,
+                                           device_result, device_watch);
+            } else {
+                scan_kernel_optimized<kAttemptsPerThread><<<blocks, kThreads>>>(
+                    device_lane_private_keys, lane_count, device_result, device_watch);
+            }
         } else {
-            scan_kernel_baseline<kAttemptsPerThread><<<blocks, kThreads>>>(
-                device_seed, device_result, device_watch);
+            if (interactive) {
+                scan_kernel_baseline<kInteractiveBaselineAttemptsPerThread>
+                    <<<blocks, kThreads>>>(device_seed, device_result, device_watch);
+            } else {
+                scan_kernel_baseline<kAttemptsPerThread><<<blocks, kThreads>>>(
+                    device_seed, device_result, device_watch);
+            }
         }
         cuda_check(cudaGetLastError(), "launch scan kernel");
         cuda_check(cudaMemcpy(&result, device_result, sizeof(result), cudaMemcpyDeviceToHost), "copy result");
@@ -1475,7 +1561,8 @@ int main(int argc, char **argv) {
                          hex(watch.results[i].private_key, 64).c_str());
         }
         std::fflush(stderr);
-        attempts += static_cast<unsigned long long>(blocks) * kThreads * kAttemptsPerThread;
+        attempts += static_cast<unsigned long long>(blocks) * kThreads
+                    * profile.attempts_per_thread;
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (result.found) {
             std::printf("{\"public_key\":\"%s\",\"private_key\":\"%s\",\"engine\":\"%s\",\"attempts\":%llu,\"elapsed_seconds\":%.6f}\n",

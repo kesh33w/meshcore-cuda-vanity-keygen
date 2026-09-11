@@ -30,6 +30,26 @@ def make_dry_run(*assignments: str, env: dict[str, str] | None = None) -> str:
 
 
 class BuildHardeningTests(unittest.TestCase):
+    def test_release_version_is_consistent_across_user_facing_files(self) -> None:
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        current_release = re.search(
+            r"^The current release is \*\*v([^*]+)\*\*\.",
+            readme,
+            re.MULTILINE,
+        )
+        newest_changelog = re.search(
+            r"^## ([0-9]+\.[0-9]+\.[0-9]+) — ",
+            changelog,
+            re.MULTILINE,
+        )
+        self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertIsNotNone(current_release)
+        self.assertIsNotNone(newest_changelog)
+        self.assertEqual(current_release.group(1), version)
+        self.assertEqual(newest_changelog.group(1), version)
+
     def test_explicit_arch_remains_cross_buildable_without_a_gpu(self) -> None:
         output = make_dry_run("CUDA_ARCH=sm_75")
         self.assertIn("-arch=sm_75", output)
@@ -152,7 +172,21 @@ class ProbeInterfaceTests(unittest.TestCase):
         )
         self.assertIn("production_lane_count * 64", CUDA_SOURCE)
         self.assertIn(
-            "properties.multiProcessorCount * kBlocksPerSm", CUDA_SOURCE
+            "properties.multiProcessorCount * profile.blocks_per_sm", CUDA_SOURCE
+        )
+        self.assertIn(
+            "scan_kernel_optimized<kInteractiveOptimizedAttemptsPerThread>",
+            CUDA_SOURCE,
+        )
+        self.assertIn(
+            "scan_kernel_baseline<kInteractiveBaselineAttemptsPerThread>",
+            CUDA_SOURCE,
+        )
+        self.assertIn("increment_seed(seed, lane * AttemptCount)", CUDA_SOURCE)
+        self.assertIn("cudaOccupancyMaxActiveBlocksPerMultiprocessor", CUDA_SOURCE)
+        self.assertIn("constexpr int kInteractiveBlocksPerSm = 4", CUDA_SOURCE)
+        self.assertIn(
+            "resident_blocks < interactive_limit", CUDA_SOURCE,
         )
         self.assertIn("cudaDeviceSynchronize()", CUDA_SOURCE)
         self.assertIn("meshcore-cuda-probe-v2", CUDA_SOURCE)
@@ -177,6 +211,7 @@ class ProbeInterfaceTests(unittest.TestCase):
             ("--probe", "--engine", "incremental"),
             ("--probe", "--device", "0", "--device", "1"),
             ("--probe", "--probe"),
+            ("--probe", "--interactive", "--interactive"),
         )
         for command in invalid_commands:
             with self.subTest(command=command):
@@ -198,33 +233,56 @@ class ProbeInterfaceTests(unittest.TestCase):
     )
     def test_live_probe_reports_key_free_json_for_both_engines(self) -> None:
         self.assertTrue(BINARY.is_file(), "build meshcore_cuda_vanity first")
+        expected_interactive_attempts = {"optimized": 2048, "baseline": 32}
         for engine in ("optimized", "baseline"):
-            with self.subTest(engine=engine):
-                completed = subprocess.run(
-                    [str(BINARY), "--probe", "--device", "0", "--engine", engine],
-                    cwd=ROOT,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5,
-                    check=True,
-                )
-                payload = json.loads(completed.stdout)
-                self.assertTrue(payload["ready"])
-                self.assertEqual(payload["schema"], 1)
-                self.assertEqual(payload["protocol"], "meshcore-cuda-probe-v2")
-                self.assertEqual(payload["engine"], engine)
-                self.assertRegex(payload["compute_capability"], r"^\d+\.\d+$")
-                if "pci_bus_id" in payload:
-                    self.assertRegex(
-                        payload["pci_bus_id"],
-                        r"^(?:[0-9a-fA-F]{4}|[0-9a-fA-F]{8}):"
-                        r"[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$",
+            for interactive in (False, True):
+                with self.subTest(engine=engine, interactive=interactive):
+                    command = [
+                        str(BINARY), "--probe", "--device", "0",
+                        "--engine", engine,
+                    ]
+                    if interactive:
+                        command.append("--interactive")
+                    completed = subprocess.run(
+                        command,
+                        cwd=ROOT,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                        check=True,
                     )
-                self.assertRegex(payload["build_fingerprint"], r"^[0-9a-f]{16}$")
-                self.assertNotIn("public_key", payload)
-                self.assertNotIn("private_key", payload)
-                self.assertNotIn("seed", payload)
+                    payload = json.loads(completed.stdout)
+                    self.assertTrue(payload["ready"])
+                    self.assertEqual(payload["schema"], 1)
+                    self.assertEqual(
+                        payload["protocol"], "meshcore-cuda-probe-v2",
+                    )
+                    self.assertEqual(payload["engine"], engine)
+                    if interactive:
+                        self.assertLessEqual(payload["blocks_per_sm"], 4)
+                        self.assertEqual(
+                            payload["attempts_per_thread"],
+                            expected_interactive_attempts[engine],
+                        )
+                    else:
+                        self.assertEqual(payload["blocks_per_sm"], 16)
+                        self.assertEqual(payload["attempts_per_thread"], 4096)
+                    self.assertRegex(
+                        payload["compute_capability"], r"^\d+\.\d+$",
+                    )
+                    if "pci_bus_id" in payload:
+                        self.assertRegex(
+                            payload["pci_bus_id"],
+                            r"^(?:[0-9a-fA-F]{4}|[0-9a-fA-F]{8}):"
+                            r"[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$",
+                        )
+                    self.assertRegex(
+                        payload["build_fingerprint"], r"^[0-9a-f]{16}$",
+                    )
+                    self.assertNotIn("public_key", payload)
+                    self.assertNotIn("private_key", payload)
+                    self.assertNotIn("seed", payload)
 
 
 if __name__ == "__main__":

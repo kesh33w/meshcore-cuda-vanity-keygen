@@ -8,7 +8,8 @@ from unittest import mock
 import meshcore_vanity as vanity
 
 
-def successful_probe(device: int = 0, engine: str = "optimized") -> dict[str, object]:
+def successful_probe(device: int = 0, engine: str = "optimized", *,
+                     interactive: bool = False) -> dict[str, object]:
     return {
         "schema": 1,
         "protocol": vanity.CUDA_PROBE_PROTOCOL,
@@ -21,8 +22,11 @@ def successful_probe(device: int = 0, engine: str = "optimized") -> dict[str, ob
         "build_fingerprint": "0123456789abcdef",
         "build_arches": "sm_89",
         "threads": 128,
-        "blocks_per_sm": 16,
-        "attempts_per_thread": 4096,
+        "blocks_per_sm": 4 if interactive else 16,
+        "attempts_per_thread": (
+            vanity.INTERACTIVE_CUDA_ATTEMPTS[engine]
+            if interactive else 4096
+        ),
         "max_registers": 128,
         "rare_rule_protocol": 1,
         "default_ruleset_fingerprint": "a" * 64,
@@ -53,6 +57,52 @@ class PythonCudaProbeTests(unittest.TestCase):
         self.assertTrue(first["ready"])
         self.assertEqual(first, second)
         run.assert_called_once()
+
+    def test_interactive_probe_is_negotiated_and_cached_separately(self) -> None:
+        def run(command, **_kwargs):
+            interactive = "--interactive" in command
+            return subprocess.CompletedProcess(
+                command, 0,
+                stdout=json.dumps(successful_probe(interactive=interactive)),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch(mode=0o700)
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(vanity.subprocess, "run", side_effect=run) as invoked:
+                throughput = vanity.cuda_probe()
+                interactive = vanity.cuda_probe(interactive=True)
+                self.assertEqual(throughput, vanity.cuda_probe())
+                self.assertEqual(
+                    interactive, vanity.cuda_probe(interactive=True),
+                )
+
+        self.assertTrue(throughput["ready"])
+        self.assertTrue(interactive["ready"])
+        self.assertEqual(invoked.call_count, 2)
+        self.assertNotIn("--interactive", invoked.call_args_list[0].args[0])
+        self.assertIn("--interactive", invoked.call_args_list[1].args[0])
+
+    def test_interactive_probe_rejects_legacy_or_unsafe_geometry(self) -> None:
+        invalid = (
+            {**successful_probe(interactive=True),
+             "protocol": "meshcore-cuda-probe-v1"},
+            {**successful_probe(interactive=True), "blocks_per_sm": 16},
+            {**successful_probe(interactive=True), "attempts_per_thread": 4096},
+        )
+        for response in invalid:
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                executable = Path(directory) / "engine"
+                executable.touch(mode=0o700)
+                completed = subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(response), stderr="",
+                )
+                with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                        mock.patch.object(vanity.subprocess, "run", return_value=completed):
+                    result = vanity.cuda_probe(interactive=True)
+            self.assertFalse(result["ready"])
 
     def test_probe_rejects_unexpected_or_key_bearing_fields(self) -> None:
         response = successful_probe()
@@ -205,7 +255,9 @@ class PythonCudaProbeTests(unittest.TestCase):
                 mock.patch.object(vanity, "cuda_probe", return_value={"ready": False}) as probe:
             self.assertFalse(vanity.cuda_available(0, "optimized"))
             self.assertFalse(vanity.cuda_available(1, "optimized"))
-        probe.assert_called_once_with(0, "optimized", refresh=False)
+        probe.assert_called_once_with(
+            0, "optimized", interactive=False, refresh=False,
+        )
 
     def test_diagnostics_reports_native_probe_result(self) -> None:
         response = successful_probe()

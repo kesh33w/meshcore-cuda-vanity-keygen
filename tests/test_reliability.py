@@ -1,6 +1,7 @@
 import contextlib
 import fcntl
 import json
+import queue
 import subprocess
 import tempfile
 import threading
@@ -23,6 +24,26 @@ def rare_record(index: int) -> dict[str, object]:
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_callback_queue_continues_after_failed_update(self):
+        events: queue.SimpleQueue[
+            tuple[object, tuple[object, ...]]
+        ] = queue.SimpleQueue()
+        delivered: list[str] = []
+        errors: list[str] = []
+
+        def fail() -> None:
+            raise RuntimeError("simulated UI callback failure")
+
+        events.put((fail, ()))
+        events.put((delivered.append, ("terminal update",)))
+        processed = vanity.drain_callback_queue(
+            events, on_error=lambda error: errors.append(type(error).__name__),
+        )
+
+        self.assertEqual(processed, 2)
+        self.assertEqual(errors, ["RuntimeError"])
+        self.assertEqual(delivered, ["terminal update"])
+
     def test_gui_mainloop_keyboard_interrupt_uses_cleanup_path(self):
         closed: list[bool] = []
 
@@ -74,10 +95,13 @@ class ReliabilityTests(unittest.TestCase):
             "firmware_vector": True,
         }
 
-        def probe(device, engine):
+        def probe(device, engine, *, interactive=False):
+            self.assertTrue(interactive)
             return {"device": device, "engine": engine, "ready": True}
 
-        with mock.patch.object(vanity, "diagnostics", return_value=base), \
+        with mock.patch.object(
+                vanity, "diagnostics", return_value=base,
+        ) as diagnostics, \
                 mock.patch.object(vanity, "cuda_probe", side_effect=probe) as cuda_probe:
             discovered = vanity.gui_diagnostics()
 
@@ -88,7 +112,11 @@ class ReliabilityTests(unittest.TestCase):
         )
         self.assertEqual(
             cuda_probe.call_args_list,
-            [mock.call(0, "baseline"), mock.call(1, "baseline")],
+            [mock.call(0, "baseline", interactive=True),
+             mock.call(1, "baseline", interactive=True)],
+        )
+        diagnostics.assert_called_once_with(
+            vanity.DEFAULT_RARE_RULESET, interactive=True,
         )
 
     def test_cpu_worker_failure_wakes_coordinator_and_propagates(self):

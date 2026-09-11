@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import json
 import os
 import stat
@@ -275,6 +276,45 @@ class KeygenTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "invalid result"):
                     vanity.search_cuda("cafe", "", "", watch_path=Path(directory) / "rare.jsonl")
 
+    def test_gui_cuda_search_uses_explicit_interactive_profile(self):
+        class FakeProcess:
+            def __init__(self):
+                self.stderr = StringIO("")
+                self.stdout = StringIO("not-json\n")
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "engine"
+            executable.touch()
+            with mock.patch.object(vanity, "cuda_executable", return_value=executable), \
+                    mock.patch.object(
+                        vanity.subprocess, "Popen", side_effect=lambda *_args, **_kwargs: FakeProcess(),
+                    ) as popen:
+                for interactive in (False, True):
+                    with self.subTest(interactive=interactive), self.assertRaisesRegex(
+                            RuntimeError, "invalid result"):
+                        vanity.search_cuda(
+                            "cafe", "", "", interactive=interactive,
+                            watch_path=Path(directory) / f"rare-{interactive}.jsonl",
+                        )
+                    command = popen.call_args.args[0]
+                    self.assertEqual("--interactive" in command, interactive)
+
+        gui_source = inspect.getsource(vanity.run_gui)
+        self.assertIn("interactive=True", gui_source)
+        self.assertIn('page_status = tk.StringVar(value="Page 1 of 1")', gui_source)
+
     def test_cuda_collector_termination_is_reported_as_cancellation(self):
         cancel = threading.Event()
 
@@ -537,7 +577,7 @@ class KeygenTests(unittest.TestCase):
             # exercising repeated point addition rather than only initialization.
             result = vanity.search_cuda("abc1234", "", "",
                                         watch_path=Path(directory) / "rare.jsonl",
-                                        engine="optimized")
+                                        engine="optimized", interactive=True)
         self.assertTrue(result.public_key.startswith("abc1234"))
         self.assertEqual(result.engine, "optimized")
         self.assertEqual(vanity.SODIUM.derive_public(bytes.fromhex(result.private_key)[:32]).hex(),
@@ -553,7 +593,7 @@ class KeygenTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = vanity.search_cuda("a", "", "",
                                         watch_path=Path(directory) / "rare.jsonl",
-                                        engine="baseline")
+                                        engine="baseline", interactive=True)
         self.assertTrue(result.public_key.startswith("a"))
         self.assertEqual(result.engine, "baseline")
         self.assertTrue(vanity.verify_expanded_key(
@@ -590,6 +630,7 @@ class KeygenTests(unittest.TestCase):
                 with self.assertRaises(vanity.SearchCancelled):
                     vanity.search_cuda("", "", "", cancel=cancel, collect_only=True,
                                        watch_path=Path(directory) / "rare.jsonl",
+                                       interactive=True,
                                        process_update=lambda process: child.append(process))
         finally:
             timer.cancel()
