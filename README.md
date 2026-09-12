@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.8.1**. Generated identities have been validated
+The current release is **v1.9.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -182,17 +182,20 @@ Every CUDA search checks each generated public key both for the requested
 pattern and for the selected rare-key rules. The second check is automatic; no
 extra option is required and it does not interrupt the requested search. In the
 GUI, **Rare keys to keep → Choose…** opens a checkbox for every configured
-category. At least one category must remain selected. The selection is frozen
-when a search starts and applies to new incidental discoveries as well as the
-continuous collector. It does not delete or hide anything already saved.
+category and a **Minimum matching hex characters** selector with choices 10,
+11, and 12. At least one eligible category must remain selected. The complete
+policy is frozen when a search starts and applies to new incidental discoveries
+as well as the continuous collector. It does not delete or hide anything
+already saved.
 
-Built-in GUI choices are remembered in the non-secret preferences file
-`~/.config/meshcore-vanity-keygen/settings.json`. If the rule configuration
-changes or that file is unreadable, the app safely restores the configured
-defaults. Choices made while using a custom `--rare-rules` file last only for
-that GUI session, so they cannot silently rewrite the custom policy. When
-an incidental rare match appears, its public/private relationship, rare rule,
-and MeshCore validity are independently verified on the CPU and it is
+Built-in GUI choices and the minimum are remembered in the non-secret
+preferences file `~/.config/meshcore-vanity-keygen/settings.json`. Existing
+preference files are migrated with their original 10-character minimum. If the
+rule configuration changes or that file is unreadable, the app safely restores
+the configured defaults. Choices made while using a custom `--rare-rules` file
+last only for that GUI session, so they cannot silently rewrite the custom
+policy. When an incidental rare match appears, its public/private relationship,
+rare rule, and MeshCore validity are independently verified on the CPU and it is
 immediately appended to `results/rare-keys.jsonl`. The GUI shows a live count,
 the latest rule matched, and a public-key preview. Its **Rare keys…** browser can
 filter and sort the saved history by date, match, length, rarity, or public key.
@@ -201,16 +204,25 @@ or owner-only export. Incidental collection is a CUDA feature; the slower CPU
 fallback only searches for the requested pattern.
 
 The built-in rules are deliberately much harder than four-character vanity
-patterns. Every individual pattern constrains ten hexadecimal characters:
+patterns. Their default minimum is ten hexadecimal characters:
 
-- First ten characters equal the last ten (`bookend-10`).
-- First ten characters equal the reverse of the last ten (`mirror-10`).
-- The first ten characters are identical (`repeat-prefix-10`), such as
+- At least ten leading characters equal the same number of trailing characters
+  (`bookend-10`). The longest matching bookend is recorded.
+- At least ten leading characters equal the reverse of the final characters
+  (`mirror-10`).
+- At least ten starting characters are identical (`repeat-prefix-10`), such as
   `aaaaaaaaaa`. Repeated `0` and `f` prefixes are excluded because MeshCore
   rejects identities beginning with bytes `00` and `ff`.
 - The exact phrase `1337133713` appears at the beginning.
 - The first ten decimal digits of pi appear at the beginning:
   `3141592653` (`prefix-pi-3141592653`).
+
+Selecting 11 or 12 raises the structural, repeated-prefix, and pi rules to that
+minimum before work reaches the GPU. The fixed `1337133713` phrase is visibly
+inactive above 10 because adding arbitrary characters would not make that
+10-character phrase rarer. Its checkbox preference is retained, so it becomes
+active again if the minimum returns to 10. Rules in a custom file that already
+require more characters are never weakened.
 
 These defaults live in [`rare_rules.json`](rare_rules.json), which is the single
 source used by both Python verification and the generated fast CUDA classifier.
@@ -221,6 +233,10 @@ Supported rule kinds are `bookend`, `mirror`, `repeat-prefix`,
 matching enabled rule supplies the numeric CUDA trigger, while CPU analysis
 still records every matching trait.
 
+New custom files use ruleset schema 2. Schema-1 files remain accepted and are
+migrated in memory to schema-2 semantics and fingerprints; the source file is
+not rewritten.
+
 Custom files are strictly validated before GPU work starts. They are limited to
 32 rules and 256 KiB, must use canonical lowercase hexadecimal values and valid
 MeshCore prefixes, and cannot configure an individual or combined hit rate high
@@ -229,30 +245,36 @@ ruleset; its semantic ID and SHA-256 fingerprint are written into every new
 rare-key record. The GUI chooser revalidates every selected subset with the same
 safety limits, including rules that were initially disabled in a custom file.
 
-With all five defaults selected, at the measured 870M keys/s, one specific
-ten-character rule averages roughly
-21.1 minutes. The repeated-prefix rule accepts 14 valid repeated digits, so it
-averages about 90 seconds. Across the 5 rule categories—18 effective
-ten-character possibilities—some incidental match is expected approximately
-every 70 seconds. Random search times vary widely, and a short run may still
-find none.
+With all defaults selected, the approximate average discovery cadence at the
+measured 870M keys/s is:
+
+| Minimum | Active categories | Average time between finds |
+| ---: | ---: | ---: |
+| 10 | 5 | 70 seconds |
+| 11 | 4 | 19.7 minutes |
+| 12 | 4 | 5.3 hours |
+
+The fixed phrase accounts for the fifth category at 10. Bookend probability is
+calculated across every possible matching width from the selected minimum
+through 32. Random search times vary widely, and a run can be much shorter or
+longer than the average.
 
 Each JSONL record keeps the matching pair together:
 
 ```json
-{"schema_version":4,"found_at":"2026-09-08T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized","ruleset_id":"meshcore-default","ruleset_fingerprint":"...","active_rule_ids":["bookend","mirror","repeat-prefix","prefix-1337133713","pi"]}
+{"schema_version":5,"found_at":"2026-09-12T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized","ruleset_id":"meshcore-default","ruleset_fingerprint":"...","active_rule_ids":["bookend","mirror","repeat-prefix","prefix-1337133713","pi"],"minimum_match_nibbles":10}
 ```
 
-The ten-character GPU rules remain the collection threshold, but CPU analysis
+The selected GPU minimum remains the collection threshold, but CPU analysis
 preserves stronger properties of a retained key. For example, a key beginning
 with 13 identical characters is labeled `repeat-prefix-13`, and a pi prefix
 continuing for 15 digits records all 15 rather than being flattened to ten.
 When one key has multiple interesting traits, the strongest becomes `reason`
 and every trait is retained under `matches`. Rarity is expressed as equivalent
-random-search bits, making unlike patterns sortable on one scale. Schema-4
-records also retain the active rule IDs so the history browser can show the
-policy that was in force when each key was found. Older records remain fully
-readable and display that policy as not recorded.
+random-search bits, making unlike patterns sortable on one scale. Schema-5
+records retain the active rule IDs and minimum so the history browser can show
+the complete policy that was in force when each key was found. Older records
+remain fully readable and display unavailable policy details as not recorded.
 
 The file is created with owner-only permissions (`0600`) when the search starts;
 an empty file means no rare key has been found. A source checkout stores it
@@ -325,7 +347,9 @@ cancellation leaves no child process behind. It validates both responsive-GUI
 and maximum-throughput CUDA launch profiles. The CPU suite also checks strict
 rule parsing, generated-header freshness, build configuration changes, GUI
 rule selection and preference validation, callback-queue recovery, worker
-failure paths, bounded history loading, and pagination.
+failure paths, bounded history loading, and pagination. Threshold tests cover
+all three GUI minimums, settings migration, fixed-rule eligibility, and
+non-nested longer bookends on both Python and CUDA.
 Temperature tests additionally cover CPU sensor selection, multi-GPU PCI
 mapping, stale and malformed readings, subprocess time/output limits, and
 monitor shutdown. The live GPU suite checks both versions of the key-free

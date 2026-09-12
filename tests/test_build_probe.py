@@ -191,6 +191,11 @@ class ProbeInterfaceTests(unittest.TestCase):
         self.assertIn("cudaDeviceSynchronize()", CUDA_SOURCE)
         self.assertIn("meshcore-cuda-probe-v2", CUDA_SOURCE)
         self.assertIn("constexpr int kProbeSchemaVersion = 1;", CUDA_SOURCE)
+        self.assertIn("constexpr int kRareRulesetSchemaVersion = 2;", CUDA_SOURCE)
+        self.assertIn("constexpr int kRareRuleProtocolVersion = 2;", CUDA_SOURCE)
+        self.assertIn("--rare-rules-v2", CUDA_SOURCE)
+        self.assertIn("--rare-rule-v2", CUDA_SOURCE)
+        self.assertIn("protocol v1 is unsupported", CUDA_SOURCE)
         self.assertEqual(
             CUDA_SOURCE.count("kProbeSchemaVersion, kRareRuleProtocolVersion"),
             2,

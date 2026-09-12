@@ -351,15 +351,21 @@ class ReliabilityTests(unittest.TestCase):
             "rarity_bits": 40.0, "mean_attempts": str(16 ** 10),
         }
         record = {
-            **rare_record(1), "schema_version": 4, "matches": [valid_match],
+            **rare_record(1), "schema_version": 5, "matches": [valid_match],
             "active_rule_ids": ["mirror", "pi"],
+            "minimum_match_nibbles": 12,
         }
         normalized = vanity.normalize_interesting_record(record)
         self.assertIsNotNone(normalized)
         assert normalized is not None
         self.assertEqual(normalized["active_rule_ids"], ["mirror", "pi"])
+        self.assertEqual(normalized["minimum_match_nibbles"], 12)
         selected, matching, _, _ = vanity.select_interesting_page(
             [normalized], "pi", "found", False, 0,
+        )
+        self.assertEqual((selected, matching), ([normalized], 1))
+        selected, matching, _, _ = vanity.select_interesting_page(
+            [normalized], "12", "found", False, 0,
         )
         self.assertEqual((selected, matching), ([normalized], 1))
 
@@ -369,6 +375,13 @@ class ReliabilityTests(unittest.TestCase):
         self.assertIsNotNone(malformed)
         assert malformed is not None
         self.assertEqual(malformed["active_rule_ids"], [])
+
+        malformed_minimum = vanity.normalize_interesting_record({
+            **record, "minimum_match_nibbles": True,
+        })
+        self.assertIsNotNone(malformed_minimum)
+        assert malformed_minimum is not None
+        self.assertIsNone(malformed_minimum["minimum_match_nibbles"])
 
     def test_numeric_history_sort_is_defensive(self):
         records = [

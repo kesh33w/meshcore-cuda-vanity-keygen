@@ -101,7 +101,7 @@ class RareRulesTests(unittest.TestCase):
         self.assertGreaterEqual(
             ruleset.rarity_bits_lower_bound, rare_rules.MIN_RULESET_RARITY_BITS
         )
-        self.assertAlmostEqual(ruleset.rarity_bits_lower_bound, 35.83, places=2)
+        self.assertAlmostEqual(ruleset.rarity_bits_lower_bound, 35.82, places=2)
 
     def test_custom_rules_classify_and_serialize_in_active_order(self):
         ruleset = rare_rules.parse_ruleset(document_with(
@@ -120,11 +120,11 @@ class RareRulesTests(unittest.TestCase):
         self.assertEqual(
             ruleset.cuda_arguments(),
             (
-                "--rare-rules-v1",
+                "--rare-rules-v2",
                 ruleset.fingerprint,
-                "--rare-rule-v1",
+                "--rare-rule-v2",
                 "3:10:0000:123456789a",
-                "--rare-rule-v1",
+                "--rare-rule-v2",
                 "2:10:8001:",
             ),
         )
@@ -169,6 +169,154 @@ class RareRulesTests(unittest.TestCase):
         with self.assertRaisesRegex(rare_rules.RuleConfigError, "combined rules"):
             rare_rules.select_rules(base, (rule.id for rule in base.rules))
 
+    def test_minimum_configuration_preserves_default_and_raises_thresholds(self):
+        default = rare_rules.DEFAULT_RULESET
+        all_ids = tuple(rule.id for rule in default.rules)
+
+        unchanged = rare_rules.configure_rules(default, all_ids, 10)
+        self.assertEqual(unchanged.fingerprint, default.fingerprint)
+        self.assertEqual(unchanged.cuda_arguments(), default.cuda_arguments())
+
+        eleven = rare_rules.configure_rules(default, all_ids, 11)
+        twelve = rare_rules.configure_rules(default, all_ids, 12)
+        for configured, minimum in ((eleven, 11), (twelve, 12)):
+            with self.subTest(minimum=minimum):
+                self.assertEqual(
+                    tuple(rule.id for rule in configured.active_rules),
+                    ("bookend", "mirror", "repeat-prefix", "pi"),
+                )
+                self.assertEqual(
+                    tuple(rule.threshold_length for rule in configured.active_rules),
+                    (minimum,) * 4,
+                )
+                self.assertNotEqual(configured.fingerprint, default.fingerprint)
+                self.assertNotIn("prefix-1337133713", configured.watch_reasons)
+
+        # Configuring a derivative always starts from its own immutable base.
+        self.assertEqual(
+            tuple(rule.threshold_length for rule in default.active_rules),
+            (10, 10, 10, 10, 10),
+        )
+        self.assertEqual(default.fingerprint, unchanged.fingerprint)
+
+        # Bookend widths are not nested: a 12-character match need not match at
+        # width 10 or 11, but every configured minimum through 12 must find it.
+        non_nested_bookend = "abcdef123456" + "2" * 40 + "abcdef123456"
+        self.assertNotEqual(non_nested_bookend[:10], non_nested_bookend[-10:])
+        self.assertNotEqual(non_nested_bookend[:11], non_nested_bookend[-11:])
+        for minimum in (10, 11, 12):
+            configured = rare_rules.configure_rules(default, all_ids, minimum)
+            with self.subTest(bookend_minimum=minimum):
+                self.assertEqual(configured.classify(non_nested_bookend), 0)
+                self.assertEqual(
+                    configured.analyze(non_nested_bookend)[0].reason, "bookend-12"
+                )
+
+    def test_minimum_configuration_classifies_only_at_effective_threshold(self):
+        configured = rare_rules.configure_rules(
+            rare_rules.DEFAULT_RULESET,
+            tuple(rule.id for rule in rare_rules.DEFAULT_RULESET.rules),
+            12,
+        )
+        misses = (
+            "abcdef12345" + "2" * 42 + "abcdef12345",
+            "abcdef12345" + "1" + "2" * 40 + "3" + "54321fedcba",
+            "b" * 11 + "2" * 53,
+            "1337133713" + "2" * 54,
+            "31415926535" + "2" * 53,
+        )
+        for public_hex in misses:
+            with self.subTest(public_hex=public_hex):
+                self.assertEqual(configured.classify(public_hex), -1)
+
+        hits = (
+            ("abcdef123456" + "2" * 40 + "abcdef123456", "bookend-12"),
+            ("abcdef123456" + "1" + "2" * 38 + "3" + "654321fedcba",
+             "mirror-12"),
+            ("b" * 12 + "2" * 52, "repeat-prefix-12"),
+            ("314159265358" + "2" * 52, "prefix-pi-314159265358"),
+        )
+        for expected_index, (public_hex, reason) in enumerate(hits):
+            with self.subTest(reason=reason):
+                self.assertEqual(configured.classify(public_hex), expected_index)
+                self.assertEqual(configured.analyze(public_hex)[0].reason, reason)
+
+    def test_minimum_configuration_keeps_stricter_custom_rule_thresholds(self):
+        base = rare_rules.parse_ruleset(document_with(
+            {
+                "id": "bookend", "kind": "bookend", "enabled": True,
+                "minimum_nibbles": 14,
+            },
+            {
+                "id": "sequence", "kind": "sequence-prefix", "enabled": True,
+                "minimum_nibbles": 15,
+                "value": "271828182845904523536028747135266249775724709369995",
+            },
+            literal_rule("fixed", "abcdef123456"),
+        ))
+        original = copy.deepcopy(base.normalized())
+
+        configured = rare_rules.configure_rules(
+            base, ("bookend", "sequence", "fixed"), 11,
+        )
+        self.assertEqual(
+            tuple(rule.threshold_length for rule in configured.active_rules),
+            (14, 15, 12),
+        )
+        self.assertEqual(base.normalized(), original)
+
+        raised = rare_rules.configure_rules(
+            base, ("bookend", "sequence", "fixed"), 13,
+        )
+        self.assertEqual(
+            tuple(rule.id for rule in raised.active_rules),
+            ("bookend", "sequence"),
+        )
+        self.assertEqual(
+            tuple(rule.threshold_length for rule in raised.active_rules),
+            (14, 15),
+        )
+
+    def test_minimum_eligibility_and_configuration_validation(self):
+        rules = {rule.id: rule for rule in rare_rules.DEFAULT_RULESET.rules}
+        for minimum in (10, 11, 12):
+            with self.subTest(minimum=minimum):
+                self.assertTrue(
+                    rare_rules.rule_can_meet_minimum(rules["bookend"], minimum)
+                )
+                self.assertTrue(
+                    rare_rules.rule_can_meet_minimum(rules["mirror"], minimum)
+                )
+                self.assertTrue(
+                    rare_rules.rule_can_meet_minimum(rules["repeat-prefix"], minimum)
+                )
+                self.assertEqual(
+                    rare_rules.rule_can_meet_minimum(
+                        rules["prefix-1337133713"], minimum,
+                    ),
+                    minimum == 10,
+                )
+                self.assertTrue(rare_rules.rule_can_meet_minimum(rules["pi"], minimum))
+
+        default = rare_rules.DEFAULT_RULESET
+        invalid_selections = (
+            (),
+            ("pi", "pi"),
+            ("not-configured",),
+            ("",),
+        )
+        for selected in invalid_selections:
+            with self.subTest(selected=selected), self.assertRaises(
+                    rare_rules.RuleConfigError):
+                rare_rules.configure_rules(default, selected, 10)
+
+        with self.assertRaisesRegex(rare_rules.RuleConfigError, "none of the selected"):
+            rare_rules.configure_rules(default, ("prefix-1337133713",), 11)
+        for invalid_minimum in (True, 0, 65, 10.0):
+            with self.subTest(minimum=invalid_minimum), self.assertRaises(
+                    rare_rules.RuleConfigError):
+                rare_rules.configure_rules(default, ("pi",), invalid_minimum)
+
     def test_fingerprint_is_semantic_deterministic_and_order_sensitive(self):
         first = literal_rule("first", "123456789a")
         second = literal_rule("second", "abcdef1234")
@@ -185,6 +333,16 @@ class RareRulesTests(unittest.TestCase):
         self.assertNotEqual(a.fingerprint, c.fingerprint)
         self.assertRegex(a.fingerprint, r"[0-9a-f]{64}\Z")
 
+    def test_schema_one_is_migrated_to_semantic_schema_two(self):
+        legacy = document_with(literal_rule("legacy", "12345678"))
+        migrated = rare_rules.parse_ruleset(legacy)
+        semantic = copy.deepcopy(legacy)
+        semantic["schema_version"] = rare_rules.RULESET_SCHEMA_VERSION
+        current = rare_rules.parse_ruleset(semantic)
+        self.assertEqual(migrated.schema_version, 2)
+        self.assertEqual(migrated.normalized(), current.normalized())
+        self.assertEqual(migrated.fingerprint, current.fingerprint)
+
     def test_strict_schema_rejects_invalid_documents(self):
         valid = document_with(literal_rule("valid", "12345678"))
         invalid_documents: list[object] = []
@@ -194,7 +352,7 @@ class RareRulesTests(unittest.TestCase):
         invalid_documents.append(unknown_root)
 
         wrong_schema = copy.deepcopy(valid)
-        wrong_schema["schema_version"] = 2
+        wrong_schema["schema_version"] = 3
         invalid_documents.append(wrong_schema)
 
         invalid_documents.extend((
@@ -313,10 +471,10 @@ class NativeCudaRareProtocolTests(unittest.TestCase):
         self.assertFalse(json.loads(mismatch.stdout)["default_fast_path"])
 
     def test_host_parser_accepts_32_ordered_rules(self):
-        arguments = ["--rare-rules-v1", "1" * 64]
+        arguments = ["--rare-rules-v2", "1" * 64]
         for index in range(32):
             arguments.extend((
-                "--rare-rule-v1", f"3:16:0000:1{index:015x}",
+                "--rare-rule-v2", f"3:16:0000:1{index:015x}",
             ))
         completed = self.run_parser(*arguments)
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -324,30 +482,39 @@ class NativeCudaRareProtocolTests(unittest.TestCase):
         self.assertEqual(payload["rules"], 32)
         self.assertFalse(payload["default_fast_path"])
 
+    def test_protocol_v1_is_explicitly_rejected(self):
+        completed = self.run_parser(
+            "--rare-rules-v1", "1" * 64,
+            "--rare-rule-v1", "3:10:0000:123456789a",
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, "")
+        self.assertIn("protocol v1 is unsupported", completed.stderr)
+
     def test_malformed_protocol_is_rejected_before_cuda(self):
         fingerprint = "a" * 64
         valid = "3:10:0000:123456789a"
         invalid_commands = (
-            ("--rare-rules-v1", fingerprint),
-            ("--rare-rules-v1", fingerprint.upper(), "--rare-rule-v1", valid),
-            ("--rare-rule-v1", valid),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "03:10:0000:123456789a"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:010:0000:123456789a"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:10:0000:123456789A"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:10:0000:123456789a:extra"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "0:33:0000:"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "2:10:0001:"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:9:0000:123456789a"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:10:0000:003456789a"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", "3:7:0000:1234567"),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", valid,
-             "--collect-only", "--rare-rule-v1", valid),
-            ("--rare-rules-v1", fingerprint, "--rare-rule-v1", valid,
-             "--rare-rules-v1", fingerprint),
+            ("--rare-rules-v2", fingerprint),
+            ("--rare-rules-v2", fingerprint.upper(), "--rare-rule-v2", valid),
+            ("--rare-rule-v2", valid),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "03:10:0000:123456789a"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "3:010:0000:123456789a"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "3:10:0000:123456789A"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "3:10:0000:123456789a:extra"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "0:33:0000:"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "2:10:0001:"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "3:9:0000:123456789a"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "3:10:0000:003456789a"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", "3:7:0000:1234567"),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", valid,
+             "--collect-only", "--rare-rule-v2", valid),
+            ("--rare-rules-v2", fingerprint, "--rare-rule-v2", valid,
+             "--rare-rules-v2", fingerprint),
         )
-        too_many = ["--rare-rules-v1", fingerprint]
+        too_many = ["--rare-rules-v2", fingerprint]
         for index in range(33):
-            too_many.extend(("--rare-rule-v1", f"3:16:0000:1{index:015x}"))
+            too_many.extend(("--rare-rule-v2", f"3:16:0000:1{index:015x}"))
 
         for arguments in (*invalid_commands, tuple(too_many)):
             with self.subTest(arguments=arguments):
@@ -401,11 +568,34 @@ class NativeCudaRareProtocolTests(unittest.TestCase):
         mirror_and_pi = rare_rules.select_rules(
             rare_rules.DEFAULT_RULESET, ("pi", "mirror"),
         )
+        all_default_ids = tuple(
+            rule.id for rule in rare_rules.DEFAULT_RULESET.rules
+        )
+        minimum_eleven = rare_rules.configure_rules(
+            rare_rules.DEFAULT_RULESET, all_default_ids, 11,
+        )
+        minimum_twelve = rare_rules.configure_rules(
+            rare_rules.DEFAULT_RULESET, all_default_ids, 12,
+        )
+        threshold_samples = (
+            # Exercise the rolling matcher's odd-offset branch at width 11.
+            "abcdef12345" + "2" * 42 + "abcdef12345",
+            # A 12-wide bookend that deliberately fails at widths 10 and 11.
+            "abcdef123456" + "2" * 40 + "abcdef123456",
+            "abcdef123456" + "1" + "2" * 38 + "3" + "654321fedcba",
+            "b" * 12 + "2" * 52,
+            "314159265358" + "2" * 52,
+            "1337133713" + "2" * 54,
+            "31415926535" + "2" * 53,
+            "123456789a" + "2" * 54,
+        )
         for ruleset, samples, expect_fast in (
                 (rare_rules.DEFAULT_RULESET, default_samples, True),
                 (pi_only, default_samples, False),
                 (mirror_and_pi, default_samples, False),
-                (custom, custom_samples, False)):
+                (custom, custom_samples, False),
+                (minimum_eleven, threshold_samples, False),
+                (minimum_twelve, threshold_samples, False)):
             arguments: list[str] = []
             for sample in samples:
                 arguments.extend(("--internal-test-rare-classifier", sample))

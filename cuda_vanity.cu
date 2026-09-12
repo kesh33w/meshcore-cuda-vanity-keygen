@@ -50,7 +50,8 @@ constexpr int kMaxRegisters = MC_MAX_REGISTERS;
 constexpr const char *kBuildArches = MC_BUILD_ARCHES;
 constexpr const char *kBuildFingerprint = MC_BUILD_FINGERPRINT;
 constexpr int kProbeSchemaVersion = 1;
-constexpr int kRareRuleProtocolVersion = 1;
+constexpr int kRareRulesetSchemaVersion = 2;
+constexpr int kRareRuleProtocolVersion = 2;
 constexpr int kMaxRareRules = 32;
 constexpr int kMaxRareRuleValueNibbles = 64;
 constexpr int kMaxRareClassifierInputs = 256;
@@ -180,14 +181,73 @@ __device__ __forceinline__ unsigned char rare_nibble_at(
     return (index & 1) ? (key[index / 2] & 15) : (key[index / 2] >> 4);
 }
 
-template<int Length>
-__device__ __forceinline__ bool rare_static_bookend(const unsigned char *key) {
-    bool matches = true;
-#pragma unroll
-    for (int i = 0; i < Length; ++i)
-        if (rare_nibble_at(key, i) != rare_nibble_at(key, 64 - Length + i))
-            matches = false;
-    return matches;
+__device__ __forceinline__ unsigned int rare_eight_nibble_window(
+        const unsigned char *key, int offset) {
+    const int byte = offset >> 1;
+    if ((offset & 1) == 0) {
+        return (static_cast<unsigned int>(key[byte]) << 24)
+            | (static_cast<unsigned int>(key[byte + 1]) << 16)
+            | (static_cast<unsigned int>(key[byte + 2]) << 8)
+            | static_cast<unsigned int>(key[byte + 3]);
+    }
+    return (static_cast<unsigned int>(key[byte] & 15) << 28)
+        | (static_cast<unsigned int>(key[byte + 1]) << 20)
+        | (static_cast<unsigned int>(key[byte + 2]) << 12)
+        | (static_cast<unsigned int>(key[byte + 3]) << 4)
+        | (static_cast<unsigned int>(key[byte + 4]) >> 4);
+}
+
+// Keep the effectively-never-taken slow path outside the scan kernel. A call
+// occurs only after eight nibbles already matched (roughly once per 2^32
+// alignments), so inlining this variable-length comparison would add register
+// pressure and instructions to every generated candidate for no steady-state
+// benefit.
+__device__ __noinline__ bool rare_bookend_remainder_matches(
+        const unsigned char *key, int suffix_start, int length) {
+    for (int index = 8; index < length; ++index) {
+        if (rare_nibble_at(key, index)
+                != rare_nibble_at(key, suffix_start + index)) return false;
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool rare_bookend_minimum(
+        const unsigned char *key, int minimum_length) {
+    // A longer bookend starts earlier in the suffix, so widths are not nested:
+    // matching width 12 does not imply matching width 10. Search every possible
+    // suffix alignment with a rolling, collision-free eight-nibble window. The
+    // safety floor guarantees minimum_length >= 9; consequently the slower
+    // remainder comparison is reached only after a 32-bit exact match.
+    const unsigned int prefix_window = rare_eight_nibble_window(key, 0);
+    unsigned int suffix_window = rare_eight_nibble_window(key, 32);
+    const int last_start = 32 - minimum_length;
+
+    // Advancing two nibble positions consumes exactly one byte. Pairing the
+    // even and odd windows halves the indexed key loads in this hot path.
+    for (int start = 0; start <= last_start; start += 2) {
+        const int even_length = 32 - start;
+        if (prefix_window == suffix_window
+                && rare_bookend_remainder_matches(
+                    key, 32 + start, even_length)) return true;
+
+        if (start == last_start) break;
+        const unsigned char next_byte = key[20 + (start >> 1)];
+        const unsigned int odd_window =
+            (suffix_window << 4) | (static_cast<unsigned int>(next_byte) >> 4);
+        const int odd_length = 31 - start;
+        if (prefix_window == odd_window
+                && rare_bookend_remainder_matches(
+                    key, 33 + start, odd_length)) return true;
+
+        suffix_window = (suffix_window << 8) | next_byte;
+    }
+    return false;
+}
+
+template<int MinimumLength>
+__device__ __forceinline__ bool rare_static_bookend_minimum(
+        const unsigned char *key) {
+    return rare_bookend_minimum(key, MinimumLength);
 }
 
 template<int Length>
@@ -235,6 +295,9 @@ __device__ __forceinline__ bool rare_static_literal(const unsigned char *key) {
 
 #include "generated/rare_rules_default.cuh"
 
+static_assert(meshcore_rare_generated::kSchemaVersion
+                  == kRareRulesetSchemaVersion,
+              "generated rare-rule schema does not match CUDA engine");
 static_assert(meshcore_rare_generated::kCudaRuleProtocolVersion
                   == kRareRuleProtocolVersion,
               "generated rare-rule protocol does not match CUDA engine");
@@ -245,11 +308,7 @@ static_assert(meshcore_rare_generated::kRuleCount > 0
 __device__ __forceinline__ bool rare_generic_rule_matches(
         const unsigned char *key, const CudaRareRuleSpec &rule) {
     if (rule.kind == 0) {
-        for (int i = 0; i < rule.threshold_nibbles; ++i)
-            if (rare_nibble_at(key, i)
-                    != rare_nibble_at(key, 64 - rule.threshold_nibbles + i))
-                return false;
-        return true;
+        return rare_bookend_minimum(key, rule.threshold_nibbles);
     }
     if (rule.kind == 1) {
         for (int i = 0; i < rule.threshold_nibbles; ++i)
@@ -642,6 +701,16 @@ bool parse_rare_rule_specification(const std::string &specification,
     const int alternatives = kind == 2 ? 16 - mask_bit_count(mask) : 1;
     long double probability = static_cast<long double>(alternatives);
     for (int nibble = 0; nibble < length; ++nibble) probability /= 16.0L;
+    if (kind == 0) {
+        // Bookend widths are differently aligned, non-nested events.  Use the
+        // same conservative union bound as Python for protocol validation.
+        long double combined_bookend_probability = 0.0L;
+        for (int width = length; width <= 32; ++width) {
+            combined_bookend_probability += probability;
+            probability /= 16.0L;
+        }
+        probability = combined_bookend_probability;
+    }
     constexpr long double kMaximumIndividualProbability =
         1.0L / 4294967296.0L;  // 2^-32
     if (probability > kMaximumIndividualProbability) {
@@ -662,6 +731,14 @@ long double rare_rule_probability(const HostRareRuleSpec &rule) {
     long double probability = static_cast<long double>(alternatives);
     for (int nibble = 0; nibble < rule.threshold_nibbles; ++nibble)
         probability /= 16.0L;
+    if (rule.kind == 0) {
+        long double combined_bookend_probability = 0.0L;
+        for (int width = rule.threshold_nibbles; width <= 32; ++width) {
+            combined_bookend_probability += probability;
+            probability /= 16.0L;
+        }
+        return combined_bookend_probability;
+    }
     return probability;
 }
 
@@ -760,7 +837,7 @@ bool decode_public_hex(const std::string &value,
 int run_rare_rule_parser_test(const std::vector<HostRareRuleSpec> &rules,
                               bool use_generated_default) {
     std::printf(
-        "{\"protocol\":\"meshcore-cuda-rare-rules-v1\",\"rules\":%zu,"
+        "{\"protocol\":\"meshcore-cuda-rare-rules-v2\",\"rules\":%zu,"
         "\"default_fast_path\":%s}\n",
         rules.size(), use_generated_default ? "true" : "false");
     return 0;
@@ -813,7 +890,7 @@ int run_rare_classifier_test(
     cudaFree(device_public);
 
     std::printf(
-        "{\"protocol\":\"meshcore-cuda-rare-classifier-v1\",\"rules\":%zu,"
+        "{\"protocol\":\"meshcore-cuda-rare-classifier-v2\",\"rules\":%zu,"
         "\"default_fast_path\":%s,\"default_generic_parity\":%s,\"indices\":[",
         rules.size(), use_generated_default ? "true" : "false",
         mismatch ? "false" : "true");
@@ -1263,7 +1340,7 @@ int run_lane_isolation_self_test(int selected_device) {
 void usage(const char *program) {
     std::fprintf(stderr,
                  "Usage: %s [--engine optimized|baseline] [--device N] [--interactive] [--collect-only] [--prefix HEX] [--suffix HEX] [--contains HEX]\n"
-                 "          [--rare-rules-v1 FINGERPRINT [--rare-rule-v1 SPEC]...]\n"
+                 "          [--rare-rules-v2 FINGERPRINT [--rare-rule-v2 SPEC]...]\n"
                  "       %s --probe [--device N] [--engine optimized|baseline] [--interactive]\n",
                  program, program);
 }
@@ -1295,7 +1372,12 @@ int main(int argc, char **argv) {
     std::vector<std::array<unsigned char, 32>> classifier_values;
     for (int i = 1; i < argc;) {
         std::string option = argv[i++];
-        if (option == "--rare-rules-v1") {
+        if (option == "--rare-rules-v1" || option == "--rare-rule-v1") {
+            return rare_protocol_error(
+                argv[0],
+                "protocol v1 is unsupported; use --rare-rules-v2 and --rare-rule-v2");
+        }
+        if (option == "--rare-rules-v2") {
             if (i >= argc) return rare_protocol_error(argv[0], "missing fingerprint");
             const std::string value = argv[i++];
             if (rare_protocol_seen || rare_block_closed)
@@ -1307,7 +1389,7 @@ int main(int argc, char **argv) {
             rare_fingerprint = value;
             continue;
         }
-        if (option == "--rare-rule-v1") {
+        if (option == "--rare-rule-v2") {
             if (i >= argc) return rare_protocol_error(argv[0], "missing rule specification");
             const std::string value = argv[i++];
             if (!rare_protocol_seen || rare_block_closed)

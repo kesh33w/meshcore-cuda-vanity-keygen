@@ -61,7 +61,9 @@ def render_header(ruleset: rare_rules.RareRuleset) -> str:
     ))
     for index, rule in enumerate(active):
         if rule.kind == "bookend":
-            expression = f"rare_static_bookend<{rule.threshold_length}>(key)"
+            expression = (
+                f"rare_static_bookend_minimum<{rule.threshold_length}>(key)"
+            )
         elif rule.kind == "mirror":
             expression = f"rare_static_mirror<{rule.threshold_length}>(key)"
         elif rule.kind == "repeat-prefix":

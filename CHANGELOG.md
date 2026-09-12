@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here.
 
+## 1.9.0 — 2026-09-12
+
+- Add a saved **Minimum matching hex characters** selector to the rare-key GUI,
+  with 10-, 11-, and 12-character choices shared by incidental searches and
+  continuous collection.
+- Raise structural, repeated-prefix, and pi rules before they reach CUDA;
+  visibly deactivate fixed literals that cannot meet the selected minimum while
+  preserving their checkbox preference for a later return to 10.
+- Correct bookends to treat the configured length as a true minimum and retain
+  any matching prefix/suffix width through 32 characters. Version the ruleset
+  and CUDA protocol so an older native binary cannot silently apply the former
+  exact-width behavior.
+- Migrate existing GUI category preferences to the 10-character minimum and
+  save both desired categories and minimum in schema-2 settings without doing
+  filesystem synchronization on Tk's event thread.
+- Record the frozen minimum alongside the active rules and semantic fingerprint
+  in schema-5 rare-key history, with older records remaining readable.
+- Add CPU, native-parser, GPU-parity, settings-migration, history-sanitization,
+  and generated-classifier coverage for all three minimums.
+
 ## 1.8.1 — 2026-09-10
 
 - Fix the saved-rare-key browser's page indicator so opening or refreshing the

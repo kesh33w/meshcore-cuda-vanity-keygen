@@ -33,8 +33,9 @@ from rare_rules import (
     RareRule,
     RareRuleset,
     RuleConfigError,
+    configure_rules,
     load_ruleset,
-    select_rules,
+    rule_can_meet_minimum,
 )
 
 APP_DIR = Path(__file__).resolve().parent
@@ -57,9 +58,11 @@ DEFAULT_GUI_SETTINGS_PATH = Path(
 ).expanduser()
 REFERENCE_CUDA_RATE = 870_000_000.0
 ICON_PATH = APP_DIR / "assets" / "meshcore-vanity-keygen.png"
-RARE_LOG_SCHEMA = 4
-GUI_SETTINGS_SCHEMA = 1
+RARE_LOG_SCHEMA = 5
+GUI_SETTINGS_SCHEMA = 2
 GUI_SETTINGS_MAX_BYTES = 64 * 1024
+RARE_MINIMUM_CHOICES = (10, 11, 12)
+DEFAULT_RARE_MINIMUM_NIBBLES = 10
 RARE_BROWSER_LIMIT = 10_000
 RARE_BROWSER_PAGE_SIZE = 500
 RARE_READ_BLOCK_SIZE = 64 * 1024
@@ -1037,7 +1040,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 collect_only: bool = False,
                 interactive: bool = False,
                 process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
-                ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> Result:
+                ruleset: RareRuleset = DEFAULT_RARE_RULESET,
+                minimum_match_nibbles: Optional[int] = None) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
         raise RuntimeError("CUDA engine is not built; run 'make'")
@@ -1093,6 +1097,7 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                     record = append_interesting(
                         watch_path, rule_number, public_hex, private_hex, engine,
                         ruleset=ruleset,
+                        minimum_match_nibbles=minimum_match_nibbles,
                     )
                     if watch_update:
                         watch_update(rule_number, str(record["reason"]), public_hex, watch_path)
@@ -1222,8 +1227,25 @@ def rare_rule_short_name(rule: RareRule) -> str:
     return rule.id
 
 
-def rare_rule_choice_label(rule: RareRule) -> str:
-    length = rule.threshold_length
+def rare_rule_choice_label(
+        rule: RareRule,
+        minimum_match_nibbles: int = DEFAULT_RARE_MINIMUM_NIBBLES,
+) -> str:
+    length = (
+        rule.threshold_length if rule.kind == "literal-prefix"
+        else max(rule.minimum_nibbles, minimum_match_nibbles)
+    )
+    if not rule_can_meet_minimum(rule, minimum_match_nibbles):
+        if rule.kind == "literal-prefix":
+            limitation = f"fixed at {len(rule.value)} hex characters"
+        elif rule.kind == "sequence-prefix":
+            limitation = f"sequence contains only {len(rule.value)} hex characters"
+        else:
+            limitation = "matching operation cannot reach this length"
+        return (
+            f"{rare_rule_short_name(rule)} — {limitation}; inactive when the "
+            f"minimum is {minimum_match_nibbles}"
+        )
     if rule.kind == "bookend":
         detail = f"first {length}+ hex characters match the end"
     elif rule.kind == "mirror":
@@ -1238,15 +1260,28 @@ def rare_rule_choice_label(rule: RareRule) -> str:
     else:
         preview = rule.value[:length]
         detail = f"public key begins with {preview} from the {rule.id} sequence"
+    if rule.kind == "bookend":
+        probability = sum(16.0 ** -width for width in range(length, 33))
+        rarity_bits = -math.log2(probability)
+    else:
+        rarity_bits = length * 4.0 - math.log2(rule.alternatives)
     return (
         f"{rare_rule_short_name(rule)} — {detail} "
-        f"({rule.rarity_bits:.1f} rarity bits)"
+        f"({rarity_bits:.1f} rarity bits)"
     )
 
 
-def rare_rule_selection_summary(ruleset: RareRuleset) -> str:
+def rare_rule_selection_summary(
+        ruleset: RareRuleset,
+        minimum_match_nibbles: Optional[int] = None,
+) -> str:
     active = ruleset.active_rules
     total = len(ruleset.rules)
+    if minimum_match_nibbles is not None:
+        noun = "character" if minimum_match_nibbles == 1 else "characters"
+        return (
+            f"{len(active)} active • minimum {minimum_match_nibbles} hex {noun}"
+        )
     if len(active) == total:
         return f"All {total} selected"
     if len(active) <= 3:
@@ -1259,11 +1294,87 @@ def rare_rule_selection_summary(ruleset: RareRuleset) -> str:
     return f"{len(active)} of {total} selected"
 
 
-def load_gui_rule_selection(
+@dataclass(frozen=True)
+class GuiRareSettings:
+    """Non-secret GUI policy stored separately from a derived ruleset."""
+
+    desired_rule_ids: tuple[str, ...]
+    minimum_match_nibbles: int
+
+
+def default_gui_rare_settings(base_ruleset: RareRuleset) -> GuiRareSettings:
+    return GuiRareSettings(
+        active_rule_ids(base_ruleset), DEFAULT_RARE_MINIMUM_NIBBLES,
+    )
+
+
+def default_custom_gui_rare_settings(
+        base_ruleset: RareRuleset,
+) -> GuiRareSettings:
+    """Choose a usable session floor without weakening custom rules.
+
+    Valid custom rules may deliberately use an eight- or nine-character fixed
+    pattern.  Built-in persistent preferences stay restricted to 10/11/12, but
+    a custom GUI must still be able to open with its configured policy intact.
+    """
+    desired = active_rule_ids(base_ruleset)
+    configured_floor = min(
+        rule.threshold_length for rule in base_ruleset.active_rules
+    )
+    return GuiRareSettings(
+        desired, min(DEFAULT_RARE_MINIMUM_NIBBLES, configured_floor),
+    )
+
+
+def gui_rare_minimum_choices(
+        base_ruleset: RareRuleset, persist_rule_selection: bool,
+) -> tuple[int, ...]:
+    choices = set(RARE_MINIMUM_CHOICES)
+    if not persist_rule_selection:
+        # A custom file may contain an initially disabled, valid eight- or
+        # nine-character literal. Include its native floor so the chooser can
+        # enable every configured category as promised.
+        choices.update(
+            rule.threshold_length for rule in base_ruleset.rules
+            if rule.threshold_length < DEFAULT_RARE_MINIMUM_NIBBLES
+        )
+    return tuple(sorted(choices))
+
+
+def _schema_one_ruleset_fingerprint(ruleset: RareRuleset) -> str:
+    """Recreate the v1 semantic hash solely for GUI-settings migration."""
+    document = ruleset.normalized()
+    document["schema_version"] = 1
+    encoded = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_gui_rare_settings(
+        base_ruleset: RareRuleset, desired_rule_ids: object,
+        minimum_match_nibbles: object,
+) -> GuiRareSettings:
+    if (isinstance(minimum_match_nibbles, bool)
+            or not isinstance(minimum_match_nibbles, int)
+            or minimum_match_nibbles not in RARE_MINIMUM_CHOICES):
+        choices = ", ".join(str(value) for value in RARE_MINIMUM_CHOICES)
+        raise RuleConfigError(f"rare-key minimum must be one of: {choices}")
+    if not isinstance(desired_rule_ids, (list, tuple)):
+        raise RuleConfigError("selected rule identifiers must be an array")
+    requested = tuple(desired_rule_ids)
+    # Deriving the ruleset is also the authoritative validation for unknown,
+    # duplicate, unsafe, or entirely ineligible selections.
+    configure_rules(base_ruleset, requested, minimum_match_nibbles)
+    return GuiRareSettings(requested, minimum_match_nibbles)
+
+
+def load_gui_rare_settings(
         base_ruleset: RareRuleset,
         path: Optional[Path] = None,
-) -> RareRuleset:
-    """Load a bounded built-in GUI preference, falling back safely if stale."""
+) -> GuiRareSettings:
+    """Load bounded GUI preferences, including schema-1 migration to floor 10."""
+    fallback = default_gui_rare_settings(base_ruleset)
     settings_path = DEFAULT_GUI_SETTINGS_PATH if path is None else path
     descriptor: Optional[int] = None
     try:
@@ -1279,16 +1390,16 @@ def load_gui_rule_selection(
                 or metadata.st_size > GUI_SETTINGS_MAX_BYTES):
             os.close(descriptor)
             descriptor = None
-            return base_ruleset
+            return fallback
         with os.fdopen(descriptor, "rb") as file:
             descriptor = None
             raw = file.read(GUI_SETTINGS_MAX_BYTES + 1)
     except OSError:
         if descriptor is not None:
             os.close(descriptor)
-        return base_ruleset
+        return fallback
     if len(raw) > GUI_SETTINGS_MAX_BYTES:
-        return base_ruleset
+        return fallback
 
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         value: dict[str, object] = {}
@@ -1300,34 +1411,81 @@ def load_gui_rule_selection(
 
     try:
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
-        if (not isinstance(document, dict)
-                or set(document) != {
-                    "schema_version", "base_ruleset_fingerprint", "enabled_rule_ids",
-                }
-                or isinstance(document.get("schema_version"), bool)
-                or document.get("schema_version") != GUI_SETTINGS_SCHEMA
-                or document.get("base_ruleset_fingerprint") != base_ruleset.fingerprint
-                or not isinstance(document.get("enabled_rule_ids"), list)):
-            return base_ruleset
-        return select_rules(base_ruleset, document["enabled_rule_ids"])
+        if not isinstance(document, dict):
+            return fallback
+        schema = document.get("schema_version")
+        if isinstance(schema, bool) or schema not in (1, GUI_SETTINGS_SCHEMA):
+            return fallback
+        required = {
+            "schema_version", "base_ruleset_fingerprint", "enabled_rule_ids",
+        }
+        if schema == GUI_SETTINGS_SCHEMA:
+            required.add("minimum_match_nibbles")
+        fingerprint = document.get("base_ruleset_fingerprint")
+        compatible_fingerprints = (
+            {base_ruleset.fingerprint, _schema_one_ruleset_fingerprint(base_ruleset)}
+            if schema == 1 else {base_ruleset.fingerprint}
+        )
+        if (set(document) != required
+                or fingerprint not in compatible_fingerprints):
+            return fallback
+        minimum = (
+            DEFAULT_RARE_MINIMUM_NIBBLES if schema == 1
+            else document.get("minimum_match_nibbles")
+        )
+        return _validate_gui_rare_settings(
+            base_ruleset, document.get("enabled_rule_ids"), minimum,
+        )
     except (
         UnicodeDecodeError, json.JSONDecodeError, RecursionError,
         RuleConfigError, ValueError,
     ):
+        return fallback
+
+
+def save_gui_rare_settings(
+        base_ruleset: RareRuleset, settings: GuiRareSettings,
+        path: Optional[Path] = None,
+) -> None:
+    """Persist the desired categories and minimum without editing defaults."""
+    validated = _validate_gui_rare_settings(
+        base_ruleset, settings.desired_rule_ids, settings.minimum_match_nibbles,
+    )
+    settings_path = DEFAULT_GUI_SETTINGS_PATH if path is None else path
+    atomic_write_json({
+        "schema_version": GUI_SETTINGS_SCHEMA,
+        "base_ruleset_fingerprint": base_ruleset.fingerprint,
+        "enabled_rule_ids": list(validated.desired_rule_ids),
+        "minimum_match_nibbles": validated.minimum_match_nibbles,
+    }, settings_path, overwrite=True)
+
+
+def load_gui_rule_selection(
+        base_ruleset: RareRuleset,
+        path: Optional[Path] = None,
+) -> RareRuleset:
+    """Compatibility wrapper returning the derived effective ruleset."""
+    settings = load_gui_rare_settings(base_ruleset, path)
+    fallback = default_gui_rare_settings(base_ruleset)
+    if settings == fallback:
         return base_ruleset
+    return configure_rules(
+        base_ruleset, settings.desired_rule_ids, settings.minimum_match_nibbles,
+    )
 
 
 def save_gui_rule_selection(
         base_ruleset: RareRuleset, selected_ruleset: RareRuleset,
         path: Optional[Path] = None,
 ) -> None:
-    """Persist the non-secret built-in GUI rule choice without editing defaults."""
-    settings_path = DEFAULT_GUI_SETTINGS_PATH if path is None else path
-    atomic_write_json({
-        "schema_version": GUI_SETTINGS_SCHEMA,
-        "base_ruleset_fingerprint": base_ruleset.fingerprint,
-        "enabled_rule_ids": list(active_rule_ids(selected_ruleset)),
-    }, settings_path, overwrite=True)
+    """Compatibility wrapper for callers using the original floor-10 API."""
+    save_gui_rare_settings(
+        base_ruleset,
+        GuiRareSettings(
+            active_rule_ids(selected_ruleset), DEFAULT_RARE_MINIMUM_NIBBLES,
+        ),
+        path,
+    )
 
 
 def save_result(result: Result, path: Path, overwrite: bool = False) -> None:
@@ -1478,6 +1636,13 @@ def _history_rule_ids(value: object) -> list[str]:
     return result
 
 
+def _history_minimum_match_nibbles(value: object) -> Optional[int]:
+    if (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= 64):
+        return value
+    return None
+
+
 def _sanitize_stored_match(value: object) -> Optional[dict[str, object]]:
     if not isinstance(value, dict):
         return None
@@ -1533,6 +1698,9 @@ def normalize_interesting_record(
     normalized = dict(record)
     normalized["active_rule_ids"] = _history_rule_ids(
         normalized.get("active_rule_ids"),
+    )
+    normalized["minimum_match_nibbles"] = _history_minimum_match_nibbles(
+        normalized.get("minimum_match_nibbles"),
     )
     stored_primary = _stored_rare_analysis(normalized)
     if stored_primary is not None:
@@ -1694,6 +1862,9 @@ def select_interesting_page(
             str(record.get("found_at", "")), str(record.get("reason", "")),
             str(record.get("public_key", "")),
             " ".join(_history_rule_ids(record.get("active_rule_ids"))),
+            str(_history_minimum_match_nibbles(
+                record.get("minimum_match_nibbles"),
+            ) or ""),
         )).lower()
     ]
     if sort_column == "length":
@@ -1715,7 +1886,9 @@ def select_interesting_page(
 
 def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
                        engine: str = "optimized", *,
-                       ruleset: RareRuleset = DEFAULT_RARE_RULESET) -> dict[str, object]:
+                       ruleset: RareRuleset = DEFAULT_RARE_RULESET,
+                       minimum_match_nibbles: Optional[int] = None,
+) -> dict[str, object]:
     private = bytes.fromhex(private_hex)
     public = bytes.fromhex(public_hex)
     if (rule < 0 or rule >= len(ruleset.watch_reasons)
@@ -1728,6 +1901,17 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
     if not matches_found:
         raise RuntimeError("An incidental CUDA result failed rarity analysis")
     primary = matches_found[0]
+    if minimum_match_nibbles is None:
+        minimum_match_nibbles = min(
+            active_rule.threshold_length for active_rule in ruleset.active_rules
+        )
+    if _history_minimum_match_nibbles(minimum_match_nibbles) is None:
+        raise ValueError("rare-key minimum must be an integer from 1 through 64")
+    if any(
+        active_rule.threshold_length < minimum_match_nibbles
+        for active_rule in ruleset.active_rules
+    ):
+        raise ValueError("rare-key minimum is stricter than the active ruleset")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = secure_open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
     record = {
@@ -1746,6 +1930,7 @@ def append_interesting(path: Path, rule: int, public_hex: str, private_hex: str,
         "ruleset_id": ruleset.ruleset_id,
         "ruleset_fingerprint": ruleset.fingerprint,
         "active_rule_ids": list(active_rule_ids(ruleset)),
+        "minimum_match_nibbles": minimum_match_nibbles,
     }
     with os.fdopen(descriptor, "a", encoding="utf-8") as file:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX)
@@ -1821,8 +2006,18 @@ def run_gui(
         print("Tk is unavailable. Install python3-tk or use the command line.", file=sys.stderr)
         return 2
 
-    active_ruleset = (
-        load_gui_rule_selection(ruleset) if persist_rule_selection else ruleset
+    gui_rare_settings = (
+        load_gui_rare_settings(ruleset)
+        if persist_rule_selection else default_custom_gui_rare_settings(ruleset)
+    )
+    desired_rule_ids = gui_rare_settings.desired_rule_ids
+    rare_minimum_nibbles = gui_rare_settings.minimum_match_nibbles
+    configured_default_minimum = rare_minimum_nibbles
+    gui_minimum_choices = gui_rare_minimum_choices(
+        ruleset, persist_rule_selection,
+    )
+    active_ruleset = configure_rules(
+        ruleset, desired_rule_ids, rare_minimum_nibbles,
     )
     root = tk.Tk(className="MeshCoreVanityKeygen")
     root.title(f"MeshCore Vanity Key Generator {APP_VERSION}")
@@ -1897,7 +2092,9 @@ def run_gui(
     collector_checkbox.grid(row=6, column=2, sticky="e")
 
     rare_rule_summary = tk.StringVar(
-        value=rare_rule_selection_summary(active_ruleset),
+        value=rare_rule_selection_summary(
+            active_ruleset, rare_minimum_nibbles,
+        ),
     )
     ttk.Label(frame, text="Rare keys to keep").grid(
         row=7, column=0, sticky="w", pady=3,
@@ -1950,7 +2147,7 @@ def run_gui(
         "collector_started": None, "collector_session_count": 0,
         "collector_best_bits": 0.0, "collector_best_reason": None,
         "discovery_pending": True, "discovery_error": None,
-        "cuda_probes": {},
+        "cuda_probes": {}, "rare_settings_generation": 0,
     }
     ui_events: queue.SimpleQueue[
         tuple[Callable[..., None], tuple[object, ...]]
@@ -1958,6 +2155,7 @@ def run_gui(
     shutdown_event = threading.Event()
     history_load_cancels: set[threading.Event] = set()
     process_lock = threading.Lock()
+    settings_write_lock = threading.Lock()
     active_process: list[Optional[subprocess.Popen[str]]] = [None]
     temperature_cache = TemperatureCache()
     temperature_update_lock = threading.Lock()
@@ -1969,11 +2167,11 @@ def run_gui(
             return
         chooser = tk.Toplevel(root)
         chooser.title("Rare Keys to Keep")
-        chooser.geometry("800x540")
-        chooser.minsize(620, 420)
+        chooser.geometry("840x610")
+        chooser.minsize(680, 500)
         chooser.transient(root)
         chooser.columnconfigure(0, weight=1)
-        chooser.rowconfigure(1, weight=1)
+        chooser.rowconfigure(2, weight=1)
         if ICON_PATH.is_file():
             try:
                 chooser.iconphoto(True, window_icon)
@@ -1992,8 +2190,29 @@ def run_gui(
             padding=(14, 14, 14, 8),
         ).grid(row=0, column=0, sticky="ew")
 
+        minimum_var = tk.StringVar(value=str(rare_minimum_nibbles))
+        policy_preview = tk.StringVar()
+        policy_frame = ttk.Frame(chooser, padding=(14, 0, 14, 10))
+        policy_frame.grid(row=1, column=0, sticky="ew")
+        policy_frame.columnconfigure(2, weight=1)
+        ttk.Label(policy_frame, text="Minimum matching hex characters").grid(
+            row=0, column=0, sticky="w",
+        )
+        minimum_combo = ttk.Combobox(
+            policy_frame, width=5, state="readonly", textvariable=minimum_var,
+            values=tuple(str(value) for value in gui_minimum_choices),
+        )
+        minimum_combo.grid(row=0, column=1, sticky="w", padx=(8, 12))
+        ttk.Label(
+            policy_frame,
+            text="Applies to every checked category; stricter configured rules stay stricter.",
+        ).grid(row=0, column=2, sticky="w")
+        ttk.Label(policy_frame, textvariable=policy_preview).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(5, 0),
+        )
+
         list_frame = ttk.Frame(chooser, padding=(14, 0, 14, 8))
-        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.grid(row=2, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         background = ttk.Style(chooser).lookup("TFrame", "background") or "#d9d9d9"
@@ -2022,27 +2241,70 @@ def run_gui(
 
         choices.bind("<Configure>", resize_choices)
         canvas.bind("<Configure>", resize_choices_width)
-        selected_ids = set(active_rule_ids(active_ruleset))
+        selected_ids = set(desired_rule_ids)
         choice_vars: dict[str, tk.BooleanVar] = {}
+        choice_labels: dict[str, tk.StringVar] = {}
+        choice_buttons: dict[str, ttk.Checkbutton] = {}
         validation_text = tk.StringVar()
         for row, rule in enumerate(ruleset.rules):
             variable = tk.BooleanVar(value=rule.id in selected_ids)
+            label = tk.StringVar()
             choice_vars[rule.id] = variable
-            ttk.Checkbutton(
-                choices, text=rare_rule_choice_label(rule), variable=variable,
-                command=lambda: validation_text.set(""),
-            ).grid(row=row, column=0, sticky="w", padx=6, pady=7)
+            choice_labels[rule.id] = label
+            checkbutton = ttk.Checkbutton(
+                choices, textvariable=label, variable=variable,
+            )
+            choice_buttons[rule.id] = checkbutton
+            checkbutton.grid(row=row, column=0, sticky="w", padx=6, pady=7)
+
+        def selected_minimum() -> int:
+            value = int(minimum_var.get())
+            if value not in gui_minimum_choices:
+                raise RuleConfigError("Choose a supported rare-key minimum")
+            return value
+
+        def refresh_policy_controls(_event: object = None) -> None:
+            validation_text.set("")
+            try:
+                minimum = selected_minimum()
+            except (RuleConfigError, ValueError):
+                policy_preview.set("Choose a valid minimum.")
+                return
+            requested: list[str] = []
+            for rule in ruleset.rules:
+                eligible = rule_can_meet_minimum(rule, minimum)
+                choice_labels[rule.id].set(rare_rule_choice_label(rule, minimum))
+                choice_buttons[rule.id].configure(
+                    state="normal" if eligible else "disabled",
+                )
+                if choice_vars[rule.id].get():
+                    requested.append(rule.id)
+            try:
+                preview_ruleset = configure_rules(ruleset, requested, minimum)
+            except RuleConfigError:
+                policy_preview.set(
+                    "No checked category can meet this minimum; choose another "
+                    "category or a lower minimum."
+                )
+                return
+            attempts = 1.0 / preview_ruleset.hit_probability_upper_bound
+            policy_preview.set(
+                f"Current selection averages about one find every "
+                f"{format_duration(attempts / REFERENCE_CUDA_RATE)} at "
+                f"{REFERENCE_CUDA_RATE:,.0f} keys/s."
+            )
 
         def set_choices(enabled: bool) -> None:
             for variable in choice_vars.values():
                 variable.set(enabled)
-            validation_text.set("")
+            refresh_policy_controls()
 
         def restore_configured_defaults() -> None:
             defaults = {rule.id for rule in ruleset.active_rules}
+            minimum_var.set(str(configured_default_minimum))
             for rule_id, variable in choice_vars.items():
                 variable.set(rule_id in defaults)
-            validation_text.set("")
+            refresh_policy_controls()
 
         def close_chooser() -> None:
             try:
@@ -2052,32 +2314,58 @@ def run_gui(
             chooser.destroy()
 
         def apply_choices() -> None:
-            nonlocal active_ruleset
-            enabled = [
+            nonlocal active_ruleset, desired_rule_ids, rare_minimum_nibbles
+            enabled = tuple(
                 rule.id for rule in ruleset.rules if choice_vars[rule.id].get()
-            ]
+            )
             try:
-                selected = select_rules(ruleset, enabled)
-            except RuleConfigError as error:
+                minimum = selected_minimum()
+                selected = configure_rules(ruleset, enabled, minimum)
+            except (RuleConfigError, ValueError) as error:
                 validation_text.set(str(error).capitalize())
                 return
             active_ruleset = selected
-            rare_rule_summary.set(rare_rule_selection_summary(selected))
-            if persist_rule_selection:
-                try:
-                    save_gui_rule_selection(ruleset, selected)
-                except (OSError, ValueError) as error:
-                    messagebox.showwarning(
-                        "Selection not remembered",
-                        "The selection is active for this session, but could not be "
-                        f"saved for the next launch.\n\n{error}",
-                        parent=chooser,
-                    )
+            desired_rule_ids = enabled
+            rare_minimum_nibbles = minimum
+            rare_rule_summary.set(
+                rare_rule_selection_summary(selected, minimum),
+            )
+            settings_snapshot = GuiRareSettings(enabled, minimum)
+            state["rare_settings_generation"] = int(
+                state["rare_settings_generation"]
+            ) + 1
+            settings_generation = int(state["rare_settings_generation"])
             close_chooser()
+            if persist_rule_selection:
+                def persist_settings() -> None:
+                    try:
+                        with settings_write_lock:
+                            if (int(state["rare_settings_generation"])
+                                    != settings_generation):
+                                return
+                            save_gui_rare_settings(
+                                ruleset, settings_snapshot,
+                            )
+                    except (OSError, ValueError) as error:
+                        detail = str(error)
+
+                        def show_persistence_warning() -> None:
+                            if not state["closing"]:
+                                messagebox.showwarning(
+                                    "Selection not remembered",
+                                    "The selection is active for this session, but "
+                                    "could not be saved for the next launch.\n\n"
+                                    f"{detail}",
+                                    parent=root,
+                                )
+
+                        post_ui(show_persistence_warning)
+
+                threading.Thread(target=persist_settings, daemon=True).start()
 
         chooser.bind("<Escape>", lambda _event: close_chooser())
         footer = ttk.Frame(chooser, padding=(14, 4, 14, 14))
-        footer.grid(row=2, column=0, sticky="ew")
+        footer.grid(row=3, column=0, sticky="ew")
         ttk.Button(
             footer, text="Select all", command=lambda: set_choices(True),
         ).pack(side="left")
@@ -2091,6 +2379,10 @@ def run_gui(
             side="right", padx=(0, 7),
         )
         chooser.protocol("WM_DELETE_WINDOW", close_chooser)
+        for checkbutton in choice_buttons.values():
+            checkbutton.configure(command=refresh_policy_controls)
+        minimum_combo.bind("<<ComboboxSelected>>", refresh_policy_controls)
+        refresh_policy_controls()
         chooser.grab_set()
         chooser.focus_set()
 
@@ -2361,6 +2653,7 @@ def run_gui(
             return
         collecting = collector_mode.get()
         search_ruleset = active_ruleset
+        search_minimum_nibbles = rare_minimum_nibbles
         selected_device = selected_device_index()
         if selected_device is None:
             selected_device = 0
@@ -2500,7 +2793,8 @@ def run_gui(
                                          interactive=True,
                                          collect_only=collecting,
                                          process_update=process_progress,
-                                         ruleset=search_ruleset)
+                                         ruleset=search_ruleset,
+                                         minimum_match_nibbles=search_minimum_nibbles)
                 else:
                     result = search(**values, workers=worker_count, update=progress,
                                     cancel=cancel_event)
@@ -2736,6 +3030,13 @@ def run_gui(
                     if isinstance(item, dict) and item.get("reason")
                 ]
                 saved_policy = _history_rule_ids(record.get("active_rule_ids"))
+                saved_minimum = _history_minimum_match_nibbles(
+                    record.get("minimum_match_nibbles"),
+                )
+                saved_minimum_label = (
+                    f"{saved_minimum} hex characters"
+                    if saved_minimum else "not recorded"
+                )
                 detail.insert(
                     "1.0",
                     f"Public key: {record['public_key']}\n"
@@ -2743,7 +3044,8 @@ def run_gui(
                     f"Rarity: {_history_rarity(record.get('rarity_bits', 0)):.1f} bits"
                     f"  •  Match length: {_history_length(record.get('match_length', 0))}"
                     f"  •  All matches: {', '.join(match_names) or record.get('reason', 'unknown')}\n"
-                    f"Saved policy: {', '.join(saved_policy) if saved_policy else 'not recorded'}",
+                    f"Saved policy: {', '.join(saved_policy) if saved_policy else 'not recorded'}"
+                    f"  •  Minimum: {saved_minimum_label}",
                 )
             detail.configure(state="disabled")
 

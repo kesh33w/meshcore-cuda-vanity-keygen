@@ -28,7 +28,7 @@ def successful_probe(device: int = 0, engine: str = "optimized", *,
             if interactive else 4096
         ),
         "max_registers": 128,
-        "rare_rule_protocol": 1,
+        "rare_rule_protocol": vanity.CUDA_RULE_PROTOCOL_VERSION,
         "default_ruleset_fingerprint": "a" * 64,
     }
 
@@ -124,7 +124,8 @@ class PythonCudaProbeTests(unittest.TestCase):
     def test_probe_requires_valid_rare_rule_compatibility_metadata(self) -> None:
         invalid_values = (
             ("rare_rule_protocol", None),
-            ("rare_rule_protocol", 2),
+            ("rare_rule_protocol", 1),
+            ("rare_rule_protocol", 3),
             ("rare_rule_protocol", True),
             ("default_ruleset_fingerprint", None),
             ("default_ruleset_fingerprint", "A" * 64),

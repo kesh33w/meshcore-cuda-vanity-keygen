@@ -16,8 +16,8 @@ import re
 from typing import Iterable, Mapping, Optional
 
 
-RULESET_SCHEMA_VERSION = 1
-CUDA_RULE_PROTOCOL_VERSION = 1
+RULESET_SCHEMA_VERSION = 2
+CUDA_RULE_PROTOCOL_VERSION = 2
 MAX_RULES = 32
 MAX_RULE_VALUE_NIBBLES = 64
 MAX_CONFIG_BYTES = 256 * 1024
@@ -86,10 +86,17 @@ class RareRule:
 
     @property
     def rarity_bits(self) -> float:
-        return self.threshold_length * 4.0 - math.log2(self.alternatives)
+        return -math.log2(self.hit_probability)
 
     @property
     def hit_probability(self) -> float:
+        if self.kind == "bookend":
+            # Different widths compare against differently aligned suffixes, so
+            # they are not nested events.  Their summed probabilities are a
+            # deliberately conservative union bound.
+            return sum(16.0 ** -length for length in range(
+                self.minimum_nibbles, 33
+            ))
         return self.alternatives / (16 ** self.threshold_length)
 
     @property
@@ -115,7 +122,7 @@ class RareRule:
         return result
 
     def cuda_specification(self) -> str:
-        """Return a compact, bounded v1 argument understood by the CUDA host."""
+        """Return a compact, bounded v2 argument understood by the CUDA host."""
         return (
             f"{self.kind_code}:{self.threshold_length}:"
             f"{self.excluded_mask:04x}:{self.value}"
@@ -154,7 +161,10 @@ class RareRuleset:
         """
         arguments = [f"--rare-rules-v{CUDA_RULE_PROTOCOL_VERSION}", self.fingerprint]
         for rule in self.active_rules:
-            arguments.extend(("--rare-rule-v1", rule.cuda_specification()))
+            arguments.extend((
+                f"--rare-rule-v{CUDA_RULE_PROTOCOL_VERSION}",
+                rule.cuda_specification(),
+            ))
         return tuple(arguments)
 
     def classify(self, public_hex: str) -> int:
@@ -295,9 +305,10 @@ def parse_ruleset(value: object) -> RareRuleset:
         raise RuleConfigError("ruleset must be a JSON object")
     _exact_keys(value, {"schema_version", "ruleset_id", "rules"}, "ruleset")
     schema_version = _required_integer(value, "schema_version", "ruleset")
-    if schema_version != RULESET_SCHEMA_VERSION:
+    if schema_version not in (1, RULESET_SCHEMA_VERSION):
         raise RuleConfigError(
-            f"unsupported ruleset schema {schema_version}; expected {RULESET_SCHEMA_VERSION}"
+            f"unsupported ruleset schema {schema_version}; expected 1 or "
+            f"{RULESET_SCHEMA_VERSION}"
         )
     ruleset_id = _required_string(value, "ruleset_id", "ruleset")
     if RULESET_ID_RE.fullmatch(ruleset_id) is None:
@@ -330,10 +341,13 @@ def parse_ruleset(value: object) -> RareRuleset:
             f"minimum is {MIN_RULESET_RARITY_BITS:.0f})"
         )
 
+    # Schema 1 described bookends as a minimum in user-facing configuration,
+    # but its matcher treated the threshold as one exact width.  Parsing into
+    # schema 2 makes the corrected minimum semantics and fingerprint explicit.
     fingerprint = hashlib.sha256(
-        _canonical_bytes(schema_version, ruleset_id, rules)
+        _canonical_bytes(RULESET_SCHEMA_VERSION, ruleset_id, rules)
     ).hexdigest()
-    return RareRuleset(schema_version, ruleset_id, rules, fingerprint)
+    return RareRuleset(RULESET_SCHEMA_VERSION, ruleset_id, rules, fingerprint)
 
 
 def load_ruleset(path: Optional[Path] = None) -> RareRuleset:
@@ -386,10 +400,100 @@ def select_rules(ruleset: RareRuleset, enabled_ids: Iterable[str]) -> RareRulese
     return parse_ruleset(document)
 
 
+def _validate_minimum_match_nibbles(minimum_match_nibbles: int) -> int:
+    if isinstance(minimum_match_nibbles, bool) or not isinstance(
+            minimum_match_nibbles, int):
+        raise RuleConfigError("minimum rare-key match length must be an integer")
+    if not 1 <= minimum_match_nibbles <= MAX_RULE_VALUE_NIBBLES:
+        raise RuleConfigError(
+            "minimum rare-key match length must be between 1 and "
+            f"{MAX_RULE_VALUE_NIBBLES} hexadecimal characters"
+        )
+    return minimum_match_nibbles
+
+
+def rule_can_meet_minimum(rule: RareRule, minimum_match_nibbles: int) -> bool:
+    """Return whether ``rule`` can represent a match at least this long.
+
+    Literal prefixes are fixed-length patterns.  Structural rules and sequence
+    prefixes can raise their threshold until they reach the maximum length that
+    their matching operation supports.
+    """
+    minimum = _validate_minimum_match_nibbles(minimum_match_nibbles)
+    if not isinstance(rule, RareRule):
+        raise RuleConfigError("rare-key rule must be a RareRule")
+    if rule.kind in ("bookend", "mirror"):
+        maximum = 32
+    elif rule.kind == "repeat-prefix":
+        maximum = 64
+    elif rule.kind in ("literal-prefix", "sequence-prefix"):
+        maximum = len(rule.value)
+    else:  # RareRule instances normally originate from the strict parser.
+        raise RuleConfigError(f"unsupported rare-key rule kind: {rule.kind}")
+    return minimum <= maximum
+
+
+def configure_rules(
+        ruleset: RareRuleset,
+        enabled_ids: Iterable[str],
+        minimum_match_nibbles: int,
+) -> RareRuleset:
+    """Return an immutable ruleset selected and raised to a global floor.
+
+    The original configured threshold remains authoritative when it is already
+    stricter than the requested floor.  Fixed literal patterns shorter than the
+    floor, and rules whose matching operation cannot reach it, are disabled.
+    """
+    if not isinstance(ruleset, RareRuleset):
+        raise RuleConfigError("ruleset must be a RareRuleset")
+    minimum = _validate_minimum_match_nibbles(minimum_match_nibbles)
+    requested = tuple(enabled_ids)
+    if not requested:
+        raise RuleConfigError("select at least one rare-key rule")
+    if any(not isinstance(rule_id, str) or not rule_id for rule_id in requested):
+        raise RuleConfigError("selected rule identifiers must be non-empty strings")
+    if len(set(requested)) != len(requested):
+        raise RuleConfigError("selected rule identifiers must be unique")
+    configured = {rule.id for rule in ruleset.rules}
+    unknown = set(requested) - configured
+    if unknown:
+        raise RuleConfigError(
+            f"unknown selected rule(s): {', '.join(sorted(unknown))}"
+        )
+
+    selected = set(requested)
+    eligible_ids = {
+        rule.id for rule in ruleset.rules
+        if rule.id in selected and rule_can_meet_minimum(rule, minimum)
+    }
+    if not eligible_ids:
+        raise RuleConfigError(
+            "none of the selected rare-key rules can meet the minimum match length"
+        )
+
+    document = ruleset.normalized()
+    raw_rules = document["rules"]
+    assert isinstance(raw_rules, list)
+    rules_by_id = {rule.id: rule for rule in ruleset.rules}
+    for raw_rule in raw_rules:
+        assert isinstance(raw_rule, dict)
+        rule_id = raw_rule["id"]
+        assert isinstance(rule_id, str)
+        rule = rules_by_id[rule_id]
+        eligible = rule_can_meet_minimum(rule, minimum)
+        raw_rule["enabled"] = rule_id in eligible_ids
+        if rule.kind != "literal-prefix" and eligible:
+            raw_rule["minimum_nibbles"] = max(rule.minimum_nibbles, minimum)
+    return parse_ruleset(document)
+
+
 def _rule_matches_threshold(rule: RareRule, public_hex: str) -> bool:
     length = rule.threshold_length
     if rule.kind == "bookend":
-        return public_hex[:length] == public_hex[-length:]
+        return any(
+            public_hex[:width] == public_hex[-width:]
+            for width in range(length, 33)
+        )
     if rule.kind == "mirror":
         return public_hex[:length] == public_hex[-length:][::-1]
     if rule.kind == "repeat-prefix":
@@ -470,11 +574,14 @@ __all__ = (
     "RareMatch",
     "RareRule",
     "RareRuleset",
+    "RULESET_SCHEMA_VERSION",
     "RuleConfigError",
     "WATCH_REASONS",
     "analyze",
     "classify",
+    "configure_rules",
     "load_ruleset",
     "parse_ruleset",
+    "rule_can_meet_minimum",
     "select_rules",
 )

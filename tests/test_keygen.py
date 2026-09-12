@@ -97,19 +97,62 @@ class KeygenTests(unittest.TestCase):
 
     def test_gui_rule_selection_settings_roundtrip_and_fail_safe(self):
         base = rare_rules.DEFAULT_RULESET
-        selected = rare_rules.select_rules(base, ("mirror", "pi"))
+        desired = tuple(rule.id for rule in base.rules)
+        settings = vanity.GuiRareSettings(desired, 12)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.json"
-            vanity.save_gui_rule_selection(base, selected, path)
+            vanity.save_gui_rare_settings(base, settings, path)
+            loaded_settings = vanity.load_gui_rare_settings(base, path)
+            self.assertEqual(loaded_settings, settings)
             loaded = vanity.load_gui_rule_selection(base, path)
-            self.assertEqual(loaded.fingerprint, selected.fingerprint)
-            self.assertEqual(vanity.active_rule_ids(loaded), ("mirror", "pi"))
+            self.assertEqual(
+                vanity.active_rule_ids(loaded),
+                ("bookend", "mirror", "repeat-prefix", "pi"),
+            )
+            self.assertEqual(
+                tuple(rule.threshold_length for rule in loaded.active_rules),
+                (12, 12, 12, 12),
+            )
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            document = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(document["minimum_match_nibbles"], 12)
+            # The desired fixed phrase remains remembered even though it is
+            # ineligible at 12, so returning to 10 can restore it.
+            self.assertIn("prefix-1337133713", document["enabled_rule_ids"])
 
+            legacy = {
+                "schema_version": 1,
+                "base_ruleset_fingerprint": (
+                    "d5fa5b9fff3ae21542c10b9dd4e4aa79"
+                    "2520240736f3d6e5cc310a7618539ce7"
+                ),
+                "enabled_rule_ids": ["mirror", "pi"],
+            }
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            migrated = vanity.load_gui_rare_settings(base, path)
+            self.assertEqual(
+                migrated, vanity.GuiRareSettings(("mirror", "pi"), 10),
+            )
+
+            vanity.save_gui_rare_settings(base, settings, path)
             document = json.loads(path.read_text(encoding="utf-8"))
             document["base_ruleset_fingerprint"] = "0" * 64
             path.write_text(json.dumps(document), encoding="utf-8")
             self.assertIs(vanity.load_gui_rule_selection(base, path), base)
+
+            for invalid_minimum in (True, 9, 13, "11"):
+                document = {
+                    "schema_version": 2,
+                    "base_ruleset_fingerprint": base.fingerprint,
+                    "enabled_rule_ids": list(desired),
+                    "minimum_match_nibbles": invalid_minimum,
+                }
+                path.write_text(json.dumps(document), encoding="utf-8")
+                self.assertEqual(
+                    vanity.load_gui_rare_settings(base, path),
+                    vanity.default_gui_rare_settings(base),
+                )
 
             path.write_text("not json", encoding="utf-8")
             self.assertIs(vanity.load_gui_rule_selection(base, path), base)
@@ -130,7 +173,7 @@ class KeygenTests(unittest.TestCase):
             link.symlink_to(target)
             self.assertIs(vanity.load_gui_rule_selection(base, link), base)
             with self.assertRaises(ValueError):
-                vanity.save_gui_rule_selection(base, selected, link)
+                vanity.save_gui_rare_settings(base, settings, link)
 
             fifo = Path(directory) / "settings-fifo"
             os.mkfifo(fifo)
@@ -157,6 +200,15 @@ class KeygenTests(unittest.TestCase):
         self.assertTrue(any("Mirrors" in label for label in labels))
         self.assertTrue(any("1337133713" in label for label in labels))
         self.assertTrue(any("Pi" in label for label in labels))
+        fixed = next(
+            rule for rule in base.rules if rule.id == "prefix-1337133713"
+        )
+        self.assertIn(
+            "inactive when the minimum is 11",
+            vanity.rare_rule_choice_label(fixed, 11),
+        )
+        pi = next(rule for rule in base.rules if rule.id == "pi")
+        self.assertIn("314159265358", vanity.rare_rule_choice_label(pi, 12))
         custom_literal = rare_rules.RareRule(
             "bookend", "literal-prefix", True, 0, "abcdef1234",
         )
@@ -168,6 +220,59 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(
             vanity.rare_rule_selection_summary(subset),
             "2 of 5 selected: Mirrors, Pi",
+        )
+        minimum_subset = rare_rules.configure_rules(base, ("mirror", "pi"), 12)
+        self.assertEqual(
+            vanity.rare_rule_selection_summary(minimum_subset, 12),
+            "2 active • minimum 12 hex characters",
+        )
+
+    def test_custom_gui_keeps_a_valid_short_configured_policy(self):
+        short = rare_rules.parse_ruleset({
+            "schema_version": 2,
+            "ruleset_id": "short-custom",
+            "rules": [
+                {
+                    "id": "short-literal", "kind": "literal-prefix",
+                    "enabled": True, "value": "abcdef12",
+                },
+                {
+                    "id": "long-literal", "kind": "literal-prefix",
+                    "enabled": True, "value": "123456789abc",
+                },
+            ],
+        })
+        settings = vanity.default_custom_gui_rare_settings(short)
+        self.assertEqual(settings.minimum_match_nibbles, 8)
+        effective = rare_rules.configure_rules(
+            short, settings.desired_rule_ids, settings.minimum_match_nibbles,
+        )
+        self.assertEqual(
+            effective.watch_reasons,
+            ("prefix-abcdef12", "prefix-123456789abc"),
+        )
+
+        disabled_short = rare_rules.parse_ruleset({
+            "schema_version": 2,
+            "ruleset_id": "disabled-short-custom",
+            "rules": [
+                {
+                    "id": "long-literal", "kind": "literal-prefix",
+                    "enabled": True, "value": "123456789abc",
+                },
+                {
+                    "id": "short-literal", "kind": "literal-prefix",
+                    "enabled": False, "value": "abcdef12",
+                },
+            ],
+        })
+        self.assertEqual(
+            vanity.gui_rare_minimum_choices(disabled_short, False),
+            (8, 10, 11, 12),
+        )
+        self.assertEqual(
+            vanity.gui_rare_minimum_choices(disabled_short, True),
+            (10, 11, 12),
         )
 
     def test_cuda_rare_rules_match_python_rules(self):
@@ -313,6 +418,8 @@ class KeygenTests(unittest.TestCase):
 
         gui_source = inspect.getsource(vanity.run_gui)
         self.assertIn("interactive=True", gui_source)
+        self.assertIn("minimum_match_nibbles=search_minimum_nibbles", gui_source)
+        self.assertIn('state="readonly"', gui_source)
         self.assertIn('page_status = tk.StringVar(value="Page 1 of 1")', gui_source)
 
     def test_cuda_collector_termination_is_reported_as_cancellation(self):
@@ -381,6 +488,7 @@ class KeygenTests(unittest.TestCase):
                     first["active_rule_ids"],
                     [rule.id for rule in vanity.DEFAULT_RARE_RULESET.active_rules],
                 )
+                self.assertEqual(first["minimum_match_nibbles"], 10)
                 self.assertEqual(second["match_length"], 10)
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(records), 2)
@@ -423,7 +531,9 @@ class KeygenTests(unittest.TestCase):
                         ruleset=ruleset,
                     )
             command = popen.call_args.args[0]
-            offset = command.index("--rare-rules-v1")
+            offset = command.index(
+                f"--rare-rules-v{rare_rules.CUDA_RULE_PROTOCOL_VERSION}"
+            )
             self.assertEqual(
                 tuple(command[offset:offset + len(ruleset.cuda_arguments())]),
                 ruleset.cuda_arguments(),
@@ -437,6 +547,7 @@ class KeygenTests(unittest.TestCase):
             self.assertEqual(record["ruleset_id"], ruleset.ruleset_id)
             self.assertEqual(record["ruleset_fingerprint"], ruleset.fingerprint)
             self.assertEqual(record["active_rule_ids"], ["custom-prefix"])
+            self.assertEqual(record["minimum_match_nibbles"], 10)
 
     def test_selected_rule_watch_index_is_compact_and_saved(self):
         ruleset = rare_rules.select_rules(
@@ -454,6 +565,25 @@ class KeygenTests(unittest.TestCase):
         self.assertEqual(record["active_rule_ids"], ["pi"])
         self.assertEqual(record["ruleset_fingerprint"], ruleset.fingerprint)
 
+    def test_selected_minimum_is_saved_with_the_frozen_policy(self):
+        base = rare_rules.DEFAULT_RULESET
+        ruleset = rare_rules.configure_rules(base, ("pi",), 12)
+        public = "314159265358" + "2" * 52
+        private = "22" * 64
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(vanity, "verify_expanded_key", return_value=True):
+            record = vanity.append_interesting(
+                Path(directory) / "rare.jsonl", 0, public, private,
+                ruleset=ruleset, minimum_match_nibbles=12,
+            )
+        self.assertEqual(record["schema_version"], 5)
+        self.assertEqual(record["minimum_match_nibbles"], 12)
+        self.assertEqual(record["trigger"], "prefix-pi-314159265358")
+        normalized = vanity.normalize_interesting_record(record)
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(normalized["minimum_match_nibbles"], 12)
+
     def test_schema_v2_and_newer_history_preserves_stored_analysis(self):
         stored_matches = [{
             "reason": "prefix-fadefade00",
@@ -462,7 +592,7 @@ class KeygenTests(unittest.TestCase):
             "rarity_bits": 40.0,
             "mean_attempts": str(16 ** 10),
         }]
-        for schema_version in (2, 3, 4):
+        for schema_version in (2, 3, 4, 5):
             record = {
                 "schema_version": schema_version,
                 "reason": "prefix-fadefade00",
