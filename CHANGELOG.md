@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## 1.11.0 — 2026-10-28
+
+- Compute only the y coordinate in the optimized engine's affine walk:
+  y(P ± Q_k) = (y·y_k ± x·x_k) / (1 ∓ t), with the shared denominator product
+  1 − t² formed by squaring. This drops the cost from about 8 to about 5.6
+  field multiplications per key.
+- Compute the sign of x (key bit 255) lazily. Prefix searches whose active
+  rare-key rules never read hex character 62 skip it entirely; other
+  searches check each key with that bit as 0 and as 1 and compute x only if
+  either could match, so no match is missed.
+- Throughput on an RTX 4070 Ti rises from about 2.53G to 3.26G keys/s with
+  default rules (3.79G with bookend and mirror off) on the command line, and
+  to 3.22G / 3.74G in the GUI profile.
+- Extend `--internal-test-affine-walk` to verify the resolved sign bit for
+  every key and that the y-only filter admits every true match, for patterns
+  that do and do not depend on bit 255.
+
 ## 1.10.0 — 2026-10-28
 
 - Replace the optimized CUDA engine's 32-point projective walk with an affine

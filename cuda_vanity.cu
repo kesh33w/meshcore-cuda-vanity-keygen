@@ -89,6 +89,8 @@ __constant__ int gpu_prefix_len;
 __constant__ int gpu_suffix_len;
 __constant__ int gpu_contains_len;
 __constant__ int gpu_collect_only;
+// Set when no active check reads bit 255 of the key (hex nibble 62).
+__constant__ int gpu_sign_free;
 
 struct CudaRareRuleSpec {
     unsigned char kind;
@@ -461,19 +463,22 @@ __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResul
 
 // ------------------------------------------------------------ affine walk
 //
-// Each lane holds an affine centre P = s*B (s = lane scalar + 8c). For the
-// Duif-form table entry Q_k = k*8B = (y+x, y-x, 2dxy), mixed addition gives
-//   P + Q_k = ((A - B) / (2 + C), (A + B) / (2 - C))
-//   P - Q_k = ((A' - B') / (2 - C), (A' + B') / (2 + C))
-// with A = (y+x)(y_k+x_k), B = (y-x)(y_k-x_k), A' and B' using the swapped
-// table pair, and C = 2d x y x_k y_k. Both points share the denominators
-// 2 +/- C, whose product (2 + C)(2 - C) is batch-inverted across the whole
-// span together with the step to the next centre, Q_last = (2M + 1)*8B.
+// Each lane holds an affine centre P = (x, y) = s*B (s = lane scalar + 8c).
+// For a table point Q_k = k*8B = (x_k, y_k) and t = d*x*y*x_k*y_k, the
+// twisted-Edwards addition law gives
+//   y(P + Q_k) = (y*y_k + x*x_k) / (1 - t),  x(P + Q_k) = (x*y_k + y*x_k) / (1 + t)
+//   y(P - Q_k) = (y*y_k - x*x_k) / (1 + t),  x(P - Q_k) = (x*y_k - y*x_k) / (1 - t)
+// so each +/- pair shares the denominators 1 +/- t. Their product 1 - t^2 is
+// batch-inverted across the whole span together with the step to the next
+// centre, Q_last = (2M + 1)*8B.
+//
+// A MeshCore public key is y with the sign of x in bit 255. The walk computes
+// only y; x is computed on demand through the resolver passed to the visitor.
 
 struct AffinePrecomp {
-    fe32 yplusx;
-    fe32 yminusx;
-    fe32 xy2d;
+    fe32 x;
+    fe32 y;
+    fe32 dxy;  // d * x * y
 };
 
 // gpu_affine_table[k - 1] = k*8B for k = 1..M; gpu_affine_table[M] = span*8B.
@@ -501,13 +506,11 @@ __global__ void build_affine_table_kernel(AffinePrecomp *out) {
     fe_invert(z_inverse, point.Z);
     fe_mul(x, point.X, z_inverse);
     fe_mul(y, point.Y, z_inverse);
-    fe_add(value, y, x);
-    fe_to_fe32(out[k].yplusx, value);
-    fe_sub(value, y, x);
-    fe_to_fe32(out[k].yminusx, value);
+    fe_to_fe32(out[k].x, x);
+    fe_to_fe32(out[k].y, y);
     fe_mul(value, x, y);
-    fe_mul(value, value, d2);
-    fe_to_fe32(out[k].xy2d, value);
+    fe_mul(value, value, d);
+    fe_to_fe32(out[k].dxy, value);
 }
 
 // Public constants only; must run on the selected device before any
@@ -527,15 +530,11 @@ cudaError_t upload_affine_table() {
     return status != cudaSuccess ? status : released;
 }
 
-__device__ __forceinline__ void encode_affine(unsigned char *encoded,
-                                              const fe32 &x, const fe32 &y) {
-    fe32_tobytes(encoded, y);
-    encoded[31] ^= fe32_isnegative(x) << 7;
-}
-
 // Visits public keys for scalars s + 8j, j = 0..AttemptCount-1 (in a
-// span-ordered, not ascending, sequence). visit(j, public_key) returns true to
-// stop the lane. stop_flag, when non-null, ends the lane at a centre boundary.
+// span-ordered, not ascending, sequence). visit(j, public_key, resolve_sign)
+// receives the encoded y with bit 255 clear; resolve_sign() returns the true
+// sign bit of x. visit returns true to stop the lane. stop_flag, when
+// non-null, ends the lane at a centre boundary.
 template<int AttemptCount, typename Visitor>
 __device__ __forceinline__ void affine_walk(const unsigned char *lane_scalar,
                                             const int *stop_flag, Visitor visit) {
@@ -564,33 +563,30 @@ __device__ __forceinline__ void affine_walk(const unsigned char *lane_scalar,
         fe_to_fe32(x, affine_x);
         fe_to_fe32(y, affine_y);
     }
-    fe32 two;
-    fe32_set_small(two, 2);
+    fe32 one;
+    fe32_set_small(one, 1);
     fe32 prefix[kAffineHalfSpan + 1];
-    fe32 c_values[kAffineHalfSpan + 1];
+    fe32 t_values[kAffineHalfSpan + 1];
     unsigned char public_key[32];
 
     for (int centre_index = 0; centre_index < kCentres; ++centre_index) {
         if (stop_flag && *reinterpret_cast<const volatile int *>(stop_flag)) return;
         const int centre = kAffineHalfSpan + centre_index * kAffineSpan;
-        fe32 ypx, ymx, xy, accumulator, product, plus_denominator, minus_denominator;
-        fe32_add(ypx, y, x);
-        fe32_sub(ymx, y, x);
+        fe32 xy, accumulator, t_squared, product;
         fe32_mul(xy, x, y);
 
         if (centre < AttemptCount) {
-            encode_affine(public_key, x, y);
-            if (visit(centre, public_key)) return;
+            fe32_tobytes(public_key, y);
+            if (visit(centre, public_key, [&]() { return fe32_isnegative(x); })) return;
         }
 
-        // Forward: exclusive prefix products of E_k = (2 + C_k)(2 - C_k).
-        fe32_set_small(accumulator, 1);
+        // Forward: exclusive prefix products of E_k = 1 - t_k^2.
+        accumulator = one;
 #pragma unroll 4
         for (int k = 0; k <= kAffineHalfSpan; ++k) {
-            fe32_mul(c_values[k], gpu_affine_table[k].xy2d, xy);
-            fe32_add(plus_denominator, two, c_values[k]);
-            fe32_sub(minus_denominator, two, c_values[k]);
-            fe32_mul(product, plus_denominator, minus_denominator);
+            fe32_mul(t_values[k], gpu_affine_table[k].dxy, xy);
+            fe32_sq(t_squared, t_values[k]);
+            fe32_sub(product, one, t_squared);
             prefix[k] = accumulator;
             fe32_mul(accumulator, accumulator, product);
         }
@@ -602,48 +598,83 @@ __device__ __forceinline__ void affine_walk(const unsigned char *lane_scalar,
         fe32 next_x, next_y;
 #pragma unroll 2
         for (int k = kAffineHalfSpan; k >= 0; --k) {
-            fe32 inverse_e, inverse_plus, inverse_minus, a, b, numerator_x,
-                numerator_y, out_x, out_y;
-            fe32_add(plus_denominator, two, c_values[k]);
-            fe32_sub(minus_denominator, two, c_values[k]);
+            fe32 inverse_e, inverse_plus, inverse_minus, sum, difference, yy, xx, out_y;
+            const fe32 &t = t_values[k];
+            fe32_sq(t_squared, t);
+            fe32_sub(product, one, t_squared);
             fe32_mul(inverse_e, inverse, prefix[k]);
-            fe32_mul(product, plus_denominator, minus_denominator);
             fe32_mul(inverse, inverse, product);
-            fe32_mul(inverse_plus, minus_denominator, inverse_e);   // 1 / (2 + C)
-            fe32_mul(inverse_minus, plus_denominator, inverse_e);   // 1 / (2 - C)
+            fe32_add(sum, one, t);
+            fe32_sub(difference, one, t);
+            fe32_mul(inverse_plus, difference, inverse_e);   // 1 / (1 + t)
+            fe32_mul(inverse_minus, sum, inverse_e);         // 1 / (1 - t)
             const AffinePrecomp &q = gpu_affine_table[k];
+            fe32_mul(yy, y, q.y);
+            fe32_mul(xx, x, q.x);
 
-            fe32_mul(a, ypx, q.yplusx);
-            fe32_mul(b, ymx, q.yminusx);
-            fe32_sub(numerator_x, a, b);
-            fe32_add(numerator_y, a, b);
-            fe32_mul(out_x, numerator_x, inverse_plus);
-            fe32_mul(out_y, numerator_y, inverse_minus);
             if (k == kAffineHalfSpan) {
-                next_x = out_x;
-                next_y = out_y;
+                fe32 xy_k, yx_k;
+                fe32_mul(xy_k, x, q.y);
+                fe32_mul(yx_k, y, q.x);
+                fe32_add(sum, xy_k, yx_k);
+                fe32_mul(next_x, sum, inverse_plus);
+                fe32_add(sum, yy, xx);
+                fe32_mul(next_y, sum, inverse_minus);
                 continue;
             }
             const int step = k + 1;
             if (centre + step < AttemptCount) {
-                encode_affine(public_key, out_x, out_y);
-                if (visit(centre + step, public_key)) return;
+                fe32_add(sum, yy, xx);
+                fe32_mul(out_y, sum, inverse_minus);
+                fe32_tobytes(public_key, out_y);
+                const auto resolve_plus = [&]() {
+                    fe32 a, b, out_x;
+                    fe32_mul(a, x, q.y);
+                    fe32_mul(b, y, q.x);
+                    fe32_add(a, a, b);
+                    fe32_mul(out_x, a, inverse_plus);
+                    return fe32_isnegative(out_x);
+                };
+                if (visit(centre + step, public_key, resolve_plus)) return;
             }
-
-            fe32_mul(a, ypx, q.yminusx);
-            fe32_mul(b, ymx, q.yplusx);
-            fe32_sub(numerator_x, a, b);
-            fe32_add(numerator_y, a, b);
-            fe32_mul(out_x, numerator_x, inverse_minus);
-            fe32_mul(out_y, numerator_y, inverse_plus);
             if (centre - step < AttemptCount) {
-                encode_affine(public_key, out_x, out_y);
-                if (visit(centre - step, public_key)) return;
+                fe32_sub(difference, yy, xx);
+                fe32_mul(out_y, difference, inverse_plus);
+                fe32_tobytes(public_key, out_y);
+                const auto resolve_minus = [&]() {
+                    fe32 a, b, out_x;
+                    fe32_mul(a, x, q.y);
+                    fe32_mul(b, y, q.x);
+                    fe32_sub(a, a, b);
+                    fe32_mul(out_x, a, inverse_minus);
+                    return fe32_isnegative(out_x);
+                };
+                if (visit(centre - step, public_key, resolve_minus)) return;
             }
         }
         x = next_x;
         y = next_y;
     }
+}
+
+// Whether a candidate is worth inspecting: requested match or rare rule.
+__device__ __forceinline__ bool candidate_of_interest(const unsigned char *public_key) {
+    if (public_key[0] == 0 || public_key[0] == 255) return false;
+    if (!gpu_collect_only && key_matches(public_key)) return true;
+    return interesting_rule(public_key) >= 0;
+}
+
+// Decide from y alone whether the true key might be of interest. With
+// gpu_sign_free set, no active check reads bit 255 (hex nibble 62), so one
+// evaluation is exact. Otherwise both values of the bit are tried; a key is
+// skipped only if neither could match, so no true match is ever missed.
+__device__ __forceinline__ bool might_be_of_interest(unsigned char *public_key) {
+    if (candidate_of_interest(public_key)) return true;
+    if (gpu_sign_free) return false;
+    public_key[31] |= 0x80;
+    const bool with_sign = candidate_of_interest(public_key);
+    public_key[31] &= 0x7f;
+    return with_sign;
 }
 
 __global__ void derive_lane_private_keys(const unsigned char *batch_seed,
@@ -692,7 +723,9 @@ __global__ void scan_kernel_optimized(const unsigned char *lane_private_keys,
             lane_private_keys[static_cast<unsigned long long>(i) * lane_count + lane];
 
     affine_walk<AttemptCount>(private_key, &result->found,
-                              [&](int index, const unsigned char *public_key) {
+                              [&](int index, unsigned char *public_key, auto resolve_sign) {
+        if (!might_be_of_interest(public_key)) return false;
+        public_key[31] |= static_cast<unsigned char>(resolve_sign() << 7);
         const auto write_private = [&](unsigned char *destination) {
             for (int i = 0; i < 64; ++i) destination[i] = private_key[i];
             increment_seed(destination, 8ULL * static_cast<unsigned int>(index));
@@ -702,17 +735,22 @@ __global__ void scan_kernel_optimized(const unsigned char *lane_private_keys,
     });
 }
 
-// Internal regression: every key of the affine walk must equal the reference
-// ge_scalarmult_base of the same scalar. Public test scalars only.
+// Internal regression: every key of the affine walk (y plus resolved sign)
+// must equal the reference ge_scalarmult_base of the same scalar, and the
+// y-only pre-filter must never reject a key whose true encoding matches the
+// configured pattern. Public test scalars only.
 template<int AttemptCount>
 __global__ void affine_walk_test_kernel(const unsigned char *scalars, int lanes,
-                                        unsigned int *mismatches,
+                                        unsigned int *counters,
                                         unsigned int *visited) {
+    // counters: [0] key mismatches, [1] missed matches, [2] true matches
     const int lane = blockIdx.x * blockDim.x + threadIdx.x;
     if (lane >= lanes) return;
     const unsigned char *base_scalar = scalars + static_cast<size_t>(lane) * 32;
     affine_walk<AttemptCount>(base_scalar, nullptr,
-                              [&](int index, const unsigned char *public_key) {
+                              [&](int index, unsigned char *public_key, auto resolve_sign) {
+        const bool admitted = might_be_of_interest(public_key);
+        public_key[31] |= static_cast<unsigned char>(resolve_sign() << 7);
         unsigned char scalar[32];
         unsigned char expected[32];
         for (int i = 0; i < 32; ++i) scalar[i] = base_scalar[i];
@@ -722,7 +760,11 @@ __global__ void affine_walk_test_kernel(const unsigned char *scalars, int lanes,
         ge_p3_tobytes(expected, &point);
         bool differs = false;
         for (int i = 0; i < 32; ++i) differs |= expected[i] != public_key[i];
-        if (differs) atomicAdd(mismatches, 1U);
+        if (differs) atomicAdd(&counters[0], 1U);
+        if (candidate_of_interest(public_key)) {
+            atomicAdd(&counters[2], 1U);
+            if (!admitted) atomicAdd(&counters[1], 1U);
+        }
         atomicAdd(&visited[static_cast<size_t>(lane) * AttemptCount + index], 1U);
         return false;
     });
@@ -977,6 +1019,21 @@ bool is_generated_default_ruleset(const std::string &fingerprint,
                 || actual.threshold_nibbles != expected.minimum_nibbles
                 || actual.excluded_mask != expected.excluded_mask
                 || actual.value != expected.value) return false;
+    }
+    return true;
+}
+
+// True when no active check can read bit 255 of the public key (the high bit
+// of hex nibble 62), letting the optimized engine skip x for non-matches.
+bool search_is_sign_free(const std::string &prefix, const std::string &suffix,
+                         const std::string &contains,
+                         const std::vector<HostRareRuleSpec> &rules) {
+    if (!suffix.empty() || !contains.empty() || prefix.size() > 62) return false;
+    for (const HostRareRuleSpec &rule : rules) {
+        // Bookends and mirrors compare against the key's final nibbles.
+        if (rule.kind == 0 || rule.kind == 1) return false;
+        // Prefix-anchored rules read nibbles 0..threshold-1.
+        if (rule.threshold_nibbles > 62) return false;
     }
     return true;
 }
@@ -1353,6 +1410,8 @@ int run_readiness_probe(int selected_device, const std::string &engine,
     if (status != cudaSuccess) return fail("probe clear rare rules", status);
     status = cudaMemcpyToSymbol(gpu_use_generated_default_rules, &zero, sizeof(zero));
     if (status != cudaSuccess) return fail("probe clear rare-rule mode", status);
+    status = cudaMemcpyToSymbol(gpu_sign_free, &zero, sizeof(zero));
+    if (status != cudaSuccess) return fail("probe set sign mode", status);
 
     // Exercise one full configured block of the selected production kernel.
     // This validates its real block geometry and register feasibility while
@@ -1447,6 +1506,28 @@ int run_readiness_probe(int selected_device, const std::string &engine,
 // Compares every key of the production affine walk against an independent
 // ge_scalarmult_base, and checks each index 0..AttemptCount-1 is visited
 // exactly once. Uses fixed public scalars; prints no key material.
+void set_test_pattern(const std::string &prefix, const std::string &suffix,
+                      bool sign_free) {
+    const int prefix_len = static_cast<int>(prefix.size());
+    const int suffix_len = static_cast<int>(suffix.size());
+    const int zero = 0;
+    const int flag = sign_free ? 1 : 0;
+    cuda_check(cudaMemcpyToSymbol(gpu_prefix, prefix.c_str(), prefix.size() + 1), "test prefix");
+    cuda_check(cudaMemcpyToSymbol(gpu_suffix, suffix.c_str(), suffix.size() + 1), "test suffix");
+    cuda_check(cudaMemcpyToSymbol(gpu_prefix_len, &prefix_len, sizeof(int)), "test prefix length");
+    cuda_check(cudaMemcpyToSymbol(gpu_suffix_len, &suffix_len, sizeof(int)), "test suffix length");
+    cuda_check(cudaMemcpyToSymbol(gpu_contains_len, &zero, sizeof(int)), "test contains length");
+    cuda_check(cudaMemcpyToSymbol(gpu_collect_only, &zero, sizeof(int)), "test collector mode");
+    cuda_check(cudaMemcpyToSymbol(gpu_rare_rule_count, &zero, sizeof(int)), "test rule count");
+    cuda_check(cudaMemcpyToSymbol(gpu_use_generated_default_rules, &zero, sizeof(int)),
+               "test rule mode");
+    cuda_check(cudaMemcpyToSymbol(gpu_sign_free, &flag, sizeof(int)), "test sign mode");
+}
+
+// Compares every key of the production affine walk against an independent
+// ge_scalarmult_base, checks each index 0..AttemptCount-1 is visited exactly
+// once, and that the y-only pre-filter admits every key that truly matches
+// the configured pattern. Uses fixed public scalars; prints no key material.
 template<int AttemptCount>
 bool affine_walk_case(int lanes, unsigned int seed_byte, std::string &error) {
     std::vector<unsigned char> scalars(static_cast<size_t>(lanes) * 32);
@@ -1463,19 +1544,20 @@ bool affine_walk_case(int lanes, unsigned int seed_byte, std::string &error) {
     scalars[0] = 0xf8;
     unsigned char *device_scalars = nullptr;
     unsigned int *device_counters = nullptr;
+    constexpr size_t kCounters = 3;
     const size_t visits = static_cast<size_t>(lanes) * AttemptCount;
     cuda_check(cudaMalloc(&device_scalars, scalars.size()), "affine test cudaMalloc scalars");
-    cuda_check(cudaMalloc(&device_counters, (visits + 1) * sizeof(unsigned int)),
+    cuda_check(cudaMalloc(&device_counters, (visits + kCounters) * sizeof(unsigned int)),
                "affine test cudaMalloc counters");
     cuda_check(cudaMemcpy(device_scalars, scalars.data(), scalars.size(),
                           cudaMemcpyHostToDevice), "affine test copy scalars");
-    cuda_check(cudaMemset(device_counters, 0, (visits + 1) * sizeof(unsigned int)),
+    cuda_check(cudaMemset(device_counters, 0, (visits + kCounters) * sizeof(unsigned int)),
                "affine test clear counters");
     affine_walk_test_kernel<AttemptCount><<<(lanes + 63) / 64, 64>>>(
-        device_scalars, lanes, device_counters, device_counters + 1);
+        device_scalars, lanes, device_counters, device_counters + kCounters);
     cuda_check(cudaGetLastError(), "affine test launch");
     cuda_check(cudaDeviceSynchronize(), "affine test synchronize");
-    std::vector<unsigned int> counters(visits + 1);
+    std::vector<unsigned int> counters(visits + kCounters);
     cuda_check(cudaMemcpy(counters.data(), device_counters,
                           counters.size() * sizeof(unsigned int), cudaMemcpyDeviceToHost),
                "affine test copy counters");
@@ -1485,10 +1567,18 @@ bool affine_walk_case(int lanes, unsigned int seed_byte, std::string &error) {
         error = std::to_string(counters[0]) + " keys differ from the reference";
         return false;
     }
+    if (counters[1] != 0) {
+        error = std::to_string(counters[1]) + " true matches rejected by the y-only filter";
+        return false;
+    }
+    if (counters[2] == 0) {
+        error = "test pattern produced no matches";
+        return false;
+    }
     for (size_t i = 0; i < visits; ++i) {
-        if (counters[i + 1] != 1) {
+        if (counters[i + kCounters] != 1) {
             error = "walk index " + std::to_string(i % AttemptCount)
-                + " visited " + std::to_string(counters[i + 1]) + " times";
+                + " visited " + std::to_string(counters[i + kCounters]) + " times";
             return false;
         }
     }
@@ -1507,14 +1597,27 @@ int run_affine_walk_self_test(int selected_device) {
     cuda_check(upload_affine_table(), "build affine table");
     constexpr int kLanes = 64;
     std::string error;
-    if (!affine_walk_case<kAttemptsPerThread>(kLanes, 1, error)
-            || !affine_walk_case<kInteractiveOptimizedAttemptsPerThread>(kLanes, 2, error)) {
-        std::fprintf(stderr, "CUDA affine-walk self-test: FAIL (%s)\n", error.c_str());
-        return 1;
+    // "8" in the final two nibbles' high position depends on bit 255 (exact
+    // two-evaluation path); a short prefix exercises the sign-free path.
+    struct Case { const char *prefix; const char *suffix; bool sign_free; };
+    const Case cases[] = {{"", "80", false}, {"", "f", false}, {"8", "", true}, {"c3", "", false}};
+    for (const Case &test : cases) {
+        if (test.sign_free != search_is_sign_free(test.prefix, test.suffix, "", {})
+                && test.sign_free) {
+            std::fprintf(stderr, "CUDA affine-walk self-test: FAIL (sign-mode selection)\n");
+            return 1;
+        }
+        set_test_pattern(test.prefix, test.suffix, test.sign_free);
+        if (!affine_walk_case<kAttemptsPerThread>(kLanes, 1, error)
+                || !affine_walk_case<kInteractiveOptimizedAttemptsPerThread>(kLanes, 2, error)) {
+            std::fprintf(stderr, "CUDA affine-walk self-test: FAIL (prefix \"%s\" suffix \"%s\": %s)\n",
+                         test.prefix, test.suffix, error.c_str());
+            return 1;
+        }
     }
-    std::printf("CUDA affine-walk self-test: PASS (%d lanes x %d + %d keys, span %d)\n",
+    std::printf("CUDA affine-walk self-test: PASS (%d lanes x %d + %d keys, span %d, %zu filter cases)\n",
                 kLanes, kAttemptsPerThread, kInteractiveOptimizedAttemptsPerThread,
-                kAffineSpan);
+                kAffineSpan, sizeof(cases) / sizeof(cases[0]));
     return 0;
 }
 
@@ -1828,6 +1931,9 @@ int main(int argc, char **argv) {
     cuda_check(cudaGetDeviceProperties(&properties, selected_device), "cudaGetDeviceProperties");
     cuda_check(cudaSetDevice(selected_device), "cudaSetDevice");
     copy_rare_rules_to_device(rare_rules, use_generated_default);
+    const int sign_free = search_is_sign_free(prefix, suffix, contains, rare_rules) ? 1 : 0;
+    cuda_check(cudaMemcpyToSymbol(gpu_sign_free, &sign_free, sizeof(sign_free)),
+               "copy sign mode");
     cuda_check(cudaMemcpyToSymbol(gpu_prefix, prefix.c_str(), prefix.size() + 1), "copy prefix");
     cuda_check(cudaMemcpyToSymbol(gpu_suffix, suffix.c_str(), suffix.size() + 1), "copy suffix");
     cuda_check(cudaMemcpyToSymbol(gpu_contains, contains.c_str(), contains.size() + 1), "copy contains");

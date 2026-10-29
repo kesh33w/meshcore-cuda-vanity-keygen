@@ -53,3 +53,18 @@ reboot after each import.
 - Original identity restoration and export verification: **PASS**
 
 As before, no private keys are included and no LoRa packet was transmitted.
+
+## v1.11.0 on Heltec V4.3 (2026-10-28)
+
+The v1.11.0 engine computes only y and resolves the sign of x lazily. It was
+validated on the same Heltec V4.3 and firmware as above, using a key whose
+sign bit (bit 255) is set so the lazily resolved bit is exercised.
+
+- Public key:
+  `c0de113d2b7025e033324c00b2d2c28c3b7b9902efab82e0c59f9a4320456ff0`
+- Requested pattern: prefix `c0de11`, suffix `f0`
+- CUDA engine: `optimized` (v1.11.0)
+- Device-reported public key after import: **PASS**
+- Exact private-key export comparison: **PASS**
+- On-device signature verification: **PASS**
+- Original identity restoration and export verification: **PASS**

@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.10.0**. Generated identities have been validated
+The current release is **v1.11.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -102,12 +102,20 @@ without a full scalar multiplication per key. It keeps an affine "centre"
 point P and derives its neighbours P ± k·8B (k = 1…128) from a precomputed
 table. Each ± pair shares one pair of denominators, and Montgomery's
 batch-inversion trick shares a single field inversion across all 257 keys of
-a span. That works out to about eight field multiplications per key. Field
-arithmetic uses eight 32-bit limbs with PTX carry chains (`fe32.cuh`), about
-twice as fast on NVIDIA GPUs as the ref10 representation. Private keys are
-reconstructed only for retained matches. `--internal-test-affine-walk`
+a span. A MeshCore public key is the point's y coordinate plus one sign bit
+from x (bit 255, inside hex character 62), so the walk computes only y, at
+about 5.6 field multiplications per key. x is computed only for keys that
+could match. When no active check can read hex character 62 (a prefix search
+with the bookend and mirror rare-key rules switched off), every check runs
+once on y alone. Otherwise each key is checked with that bit as 0 and as 1,
+and x is computed only if either could match, so no match is ever missed.
+Field arithmetic uses eight 32-bit limbs with PTX carry chains (`fe32.cuh`),
+about twice as fast on NVIDIA GPUs as the ref10 representation. Private keys
+are reconstructed only for retained matches. `--internal-test-affine-walk`
 compares every key of the walk with an independent reference scalar
-multiplication and checks that each walk position is visited exactly once.
+multiplication, checks that each walk position is visited exactly once, and
+confirms the y-only filter admits every true match for prefix and suffix
+patterns that do and do not depend on bit 255.
 SHA-512 also
 supplies a separate Ed25519 nonce prefix for each lane. At most one identity is
 retained from a lane, so two saved identities never come from the same short
@@ -136,19 +144,20 @@ maximum-throughput launch profile.
 
 ### Measured performance
 
-On the development RTX 4070 Ti, the v1.10 optimized engine's
-maximum-throughput command-line profile processes about 2.57 billion keys per
-second, compared with about 970 million for the v1.9 engine (2.6×) and about
-29 million for the retained baseline. Approximate average search times at
-2.57G/s are:
+On the development RTX 4070 Ti, the v1.11 optimized engine's
+maximum-throughput command-line profile processes about 3.26 billion keys per
+second with the default rare-key rules, and about 3.79 billion for a prefix
+search with the bookend and mirror rules switched off. That compares with
+about 2.53 billion for v1.10, 970 million for v1.9, and 29 million for the
+retained baseline. Approximate average search times at 3.26G/s are:
 
 | Hex characters | Possibilities | Average time |
 | ---: | ---: | ---: |
 | 7 | 268 million | 0.1 seconds |
-| 8 | 4.3 billion | 1.7 seconds |
-| 9 | 68.7 billion | 27 seconds |
-| 10 | 1.1 trillion | 7.1 minutes |
-| 11 | 17.6 trillion | 1.9 hours |
+| 8 | 4.3 billion | 1.3 seconds |
+| 9 | 68.7 billion | 21 seconds |
+| 10 | 1.1 trillion | 5.6 minutes |
+| 11 | 17.6 trillion | 1.5 hours |
 
 These are probabilistic averages, not maximums. GPU model, cooling, power
 limits, and other workloads affect actual throughput. Sweeps of the table size
@@ -156,8 +165,8 @@ limits, and other workloads affect actual throughput. Sweeps of the table size
 per SM (4–16) settled on the shipped 128-register, 128-thread, 4-blocks-per-SM,
 4096-attempt, M = 128 configuration. Larger tables gained at most 3% while
 doubling per-thread local memory. The GUI's responsive profile measured
-2.54 billion keys per second (v1.9: 943 million) in an A/B/A test on the same
-GPU.
+3.22 billion keys per second with default rules and 3.74 billion with bookend
+and mirror off (v1.10: 2.54 billion; v1.9: 943 million) on the same GPU.
 
 ## Continuous rare-key collector
 
@@ -253,13 +262,13 @@ rare-key record. The GUI chooser revalidates every selected subset with the same
 safety limits, including rules that were initially disabled in a custom file.
 
 With all defaults selected, the approximate average discovery cadence at the
-measured 2.57G keys/s is:
+measured 3.26G keys/s is:
 
 | Minimum | Active categories | Average time between finds |
 | ---: | ---: | ---: |
-| 10 | 5 | 24 seconds |
-| 11 | 4 | 6.7 minutes |
-| 12 | 4 | 1.8 hours |
+| 10 | 5 | 19 seconds |
+| 11 | 4 | 5.3 minutes |
+| 12 | 4 | 1.4 hours |
 
 The fixed phrase accounts for the fifth category at 10. Bookend probability is
 calculated across every possible matching width from the selected minimum
@@ -293,7 +302,7 @@ Every discovery is retained, even when earlier keys matched the same category.
 File locking prevents concurrent searches from corrupting or interleaving
 records. Collection stops when the requested key is found or the search is
 cancelled; rare keys already written remain saved. At the measured rate and
-current criteria, continuous searching averages about 3,700 new records per
+current criteria, continuous searching averages about 4,700 new records per
 day. The GUI keeps its live count in memory, reads history backward from the
 file tail, and presents at most 500 rows per page from the newest 10,000 valid
 records. Upgrading does not rewrite or delete legacy
