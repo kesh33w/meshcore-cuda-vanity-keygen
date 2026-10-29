@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## 1.10.0 — 2026-10-28
+
+- Replace the optimized CUDA engine's 32-point projective walk with an affine
+  centre walk: each lane derives P ± k·8B from a precomputed 128-entry table,
+  ± pairs share their denominators, and one field inversion covers 257 keys.
+  Private keys are reconstructed only for retained matches.
+- Add `fe32.cuh`, GF(2^255−19) arithmetic in eight 32-bit limbs using PTX
+  carry chains, about 2× faster per multiplication than ref10's
+  representation.
+- Lower the default throughput launch to 4 blocks per SM, which suits the new
+  engine's local-memory footprint.
+- Throughput on an RTX 4070 Ti rises from about 970M to 2.57G keys/s on the
+  command line (2.6×) and from 943M to 2.54G keys/s in the GUI profile (2.7×).
+  The scalar walk (`s + 8j`, 4096 per lane), one-identity-per-lane retention,
+  probe protocol, and rare-key behavior are unchanged.
+- Add `--internal-test-affine-walk` (run by `make test-gpu` and
+  `RUN_CUDA_TESTS=1`), which checks every walk key against an independent
+  scalar multiplication and that each walk position is visited exactly once.
+
 ## 1.9.0 — 2026-09-12
 
 - Add a saved **Minimum matching hex characters** selector to the rare-key GUI,

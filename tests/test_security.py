@@ -37,6 +37,31 @@ class SecurityValidationTests(unittest.TestCase):
             "the CUDA isolation self-test must not print key material",
         )
 
+    @unittest.skipUnless(
+        os.environ.get("RUN_CUDA_TESTS") == "1", "CUDA affine-walk test is opt-in"
+    )
+    def test_gpu_affine_walk_matches_reference_scalar_multiplication(self):
+        executable = vanity.cuda_executable()
+        self.assertTrue(
+            vanity.cuda_available(),
+            "RUN_CUDA_TESTS=1 requires a built CUDA engine and a visible CUDA device",
+        )
+        completed = subprocess.run(
+            [str(executable), "--internal-test-affine-walk"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = completed.stdout + completed.stderr
+        self.assertIn("CUDA affine-walk self-test: PASS", output)
+        self.assertIsNone(
+            re.search(r"(?i)(?<![0-9a-f])[0-9a-f]{64,}(?![0-9a-f])", output),
+            "the CUDA affine-walk self-test must not print key material",
+        )
+
     def test_meshcore_shared_secret_matches_firmware_reference(self):
         peer_public = vanity.ECDH_TEST_PEER_PUBLIC
         self.assertEqual(

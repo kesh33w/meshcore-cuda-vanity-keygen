@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.9.0**. Generated identities have been validated
+The current release is **v1.10.0**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -97,11 +97,18 @@ python3 meshcore_vanity.py --backend cuda --device 1 --suffix 1337
 
 The default optimized engine begins each batch with a securely random seed and
 uses domain-separated SHA-512 to derive an independent expanded Ed25519 private
-key for every GPU lane. Each lane calculates one full public point and then
-walks forward with the much cheaper `scalar += 8` and `point += 8B` operations.
-It compresses 32 projective public points together using Montgomery's
-batch-inversion trick, sharing one expensive field inversion across the entire
-group. SHA-512 also
+key for every GPU lane. Each lane covers the scalars `s, s + 8, s + 16, …`
+without a full scalar multiplication per key. It keeps an affine "centre"
+point P and derives its neighbours P ± k·8B (k = 1…128) from a precomputed
+table. Each ± pair shares one pair of denominators, and Montgomery's
+batch-inversion trick shares a single field inversion across all 257 keys of
+a span. That works out to about eight field multiplications per key. Field
+arithmetic uses eight 32-bit limbs with PTX carry chains (`fe32.cuh`), about
+twice as fast on NVIDIA GPUs as the ref10 representation. Private keys are
+reconstructed only for retained matches. `--internal-test-affine-walk`
+compares every key of the walk with an independent reference scalar
+multiplication and checks that each walk position is visited exactly once.
+SHA-512 also
 supplies a separate Ed25519 nonce prefix for each lane. At most one identity is
 retained from a lane, so two saved identities never come from the same short
 `+8` walk. The older full-SHA-512/full-multiplication implementation
@@ -129,28 +136,28 @@ maximum-throughput launch profile.
 
 ### Measured performance
 
-On the development RTX 4070 Ti, the secured optimized engine's
-maximum-throughput command-line profile processes about 866–870 million keys
-per second, compared with about 29 million for the retained baseline:
-roughly a 30× speedup. Approximate average search times at 870M/s are:
+On the development RTX 4070 Ti, the v1.10 optimized engine's
+maximum-throughput command-line profile processes about 2.57 billion keys per
+second, compared with about 970 million for the v1.9 engine (2.6×) and about
+29 million for the retained baseline. Approximate average search times at
+2.57G/s are:
 
 | Hex characters | Possibilities | Average time |
 | ---: | ---: | ---: |
-| 7 | 268 million | 0.3 seconds |
-| 8 | 4.3 billion | 4.9 seconds |
-| 9 | 68.7 billion | 1.3 minutes |
-| 10 | 1.1 trillion | 21.1 minutes |
-| 11 | 17.6 trillion | 5.6 hours |
+| 7 | 268 million | 0.1 seconds |
+| 8 | 4.3 billion | 1.7 seconds |
+| 9 | 68.7 billion | 27 seconds |
+| 10 | 1.1 trillion | 7.1 minutes |
+| 11 | 17.6 trillion | 1.9 hours |
 
 These are probabilistic averages, not maximums. GPU model, cooling, power
-limits, and other workloads affect actual throughput. Controlled trials of
-alternate register limits, batch sizes, launch sizes, comparison packing,
-larger per-lane walks, and fast-math flags found no repeatable improvement over
-the shipped 128-register, 128-thread, 16-blocks-per-SM, 4096-attempt,
-32-point-batch command-line configuration. The GUI's responsive profile measured
-845 million keys per second versus 873 million for that maximum-throughput
-profile in an A/B/A test on the same GPU, with progress intervals reduced from
-about 575 ms to 74 ms.
+limits, and other workloads affect actual throughput. Sweeps of the table size
+(M = 16…500), register limits (96–255), threads per block (64–256), and blocks
+per SM (4–16) settled on the shipped 128-register, 128-thread, 4-blocks-per-SM,
+4096-attempt, M = 128 configuration. Larger tables gained at most 3% while
+doubling per-thread local memory. The GUI's responsive profile measured
+2.54 billion keys per second (v1.9: 943 million) in an A/B/A test on the same
+GPU.
 
 ## Continuous rare-key collector
 
@@ -246,13 +253,13 @@ rare-key record. The GUI chooser revalidates every selected subset with the same
 safety limits, including rules that were initially disabled in a custom file.
 
 With all defaults selected, the approximate average discovery cadence at the
-measured 870M keys/s is:
+measured 2.57G keys/s is:
 
 | Minimum | Active categories | Average time between finds |
 | ---: | ---: | ---: |
-| 10 | 5 | 70 seconds |
-| 11 | 4 | 19.7 minutes |
-| 12 | 4 | 5.3 hours |
+| 10 | 5 | 24 seconds |
+| 11 | 4 | 6.7 minutes |
+| 12 | 4 | 1.8 hours |
 
 The fixed phrase accounts for the fifth category at 10. Bookend probability is
 calculated across every possible matching width from the selected minimum
@@ -286,7 +293,7 @@ Every discovery is retained, even when earlier keys matched the same category.
 File locking prevents concurrent searches from corrupting or interleaving
 records. Collection stops when the requested key is found or the search is
 cancelled; rare keys already written remain saved. At the measured rate and
-current criteria, continuous searching averages about 1,250 new records per
+current criteria, continuous searching averages about 3,700 new records per
 day. The GUI keeps its live count in memory, reads history backward from the
 file tail, and presents at most 500 rows per page from the newest 10,000 valid
 records. Upgrading does not rewrite or delete legacy

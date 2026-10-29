@@ -271,7 +271,7 @@ class ProbeInterfaceTests(unittest.TestCase):
                             expected_interactive_attempts[engine],
                         )
                     else:
-                        self.assertEqual(payload["blocks_per_sm"], 16)
+                        self.assertEqual(payload["blocks_per_sm"], 4)
                         self.assertEqual(payload["attempts_per_thread"], 4096)
                     self.assertRegex(
                         payload["compute_capability"], r"^\d+\.\d+$",

@@ -19,6 +19,7 @@
 #include "vendor/cuda-ed25519/sha512.cu"
 #include "vendor/cuda-ed25519/fe.cu"
 #include "vendor/cuda-ed25519/ge.cu"
+#include "fe32.cuh"
 
 namespace {
 constexpr int kMaxPattern = 60;
@@ -37,6 +38,14 @@ constexpr int kAttemptsPerThread = MC_ATTEMPTS_PER_THREAD;
 constexpr int kInteractiveBlocksPerSm = 4;
 constexpr int kInteractiveOptimizedAttemptsPerThread = 2048;
 constexpr int kInteractiveBaselineAttemptsPerThread = 32;
+// The optimized engine walks each lane from an affine centre point P using a
+// table of k*8B for k = 1..M, producing P - k*8B .. P + k*8B (2M + 1 keys) per
+// shared field inversion.
+#ifndef MC_AFFINE_HALF_SPAN
+#define MC_AFFINE_HALF_SPAN 128
+#endif
+constexpr int kAffineHalfSpan = MC_AFFINE_HALF_SPAN;
+constexpr int kAffineSpan = 2 * kAffineHalfSpan + 1;
 #ifndef MC_MAX_REGISTERS
 #define MC_MAX_REGISTERS 0
 #endif
@@ -70,6 +79,8 @@ static_assert(kInteractiveOptimizedAttemptsPerThread > 0
               "interactive optimized attempts must be a positive multiple of 32");
 static_assert(kInteractiveBaselineAttemptsPerThread > 0,
               "interactive baseline attempts must be positive");
+static_assert(kAffineHalfSpan > 0 && kAffineHalfSpan <= 256,
+              "MC_AFFINE_HALF_SPAN must be between 1 and 256");
 
 __constant__ char gpu_prefix[kMaxPattern + 1];
 __constant__ char gpu_suffix[kMaxPattern + 1];
@@ -371,16 +382,11 @@ __device__ void increment_seed(unsigned char *seed, unsigned long long amount) {
     }
 }
 
-__device__ bool increment_scalar(unsigned char *scalar, unsigned long long amount) {
-    increment_seed(scalar, amount);
-    // Ed25519's expanded scalar must keep bit 255 clear.  Standard clamping
-    // leaves a tiny theoretical chance that the bounded +8 walk reaches that
-    // bit, so terminate that lane instead of wrapping or emitting a malformed
-    // expanded key.
-    return (scalar[31] & 128) == 0;
-}
-
-__device__ bool inspect_candidate(const unsigned char *private_key,
+// write_private(dst) stores the candidate's 64-byte expanded private key. It
+// is only invoked for a retained match, so walking engines can reconstruct
+// the key on demand instead of maintaining it for every candidate.
+template<typename PrivateKeyWriter>
+__device__ bool inspect_candidate(PrivateKeyWriter write_private,
                                   const unsigned char *public_key,
                                   DeviceResult *result,
                                   WatchBatch *watch_batch,
@@ -399,7 +405,7 @@ __device__ bool inspect_candidate(const unsigned char *private_key,
         if (atomicCAS(&result->found, 0, 1) == 0) {
             result->lane = lane;
             for (int i = 0; i < 32; ++i) result->public_key[i] = public_key[i];
-            for (int i = 0; i < 64; ++i) result->private_key[i] = private_key[i];
+            write_private(result->private_key);
             __threadfence_system();
         }
         return true;
@@ -417,7 +423,7 @@ __device__ bool inspect_candidate(const unsigned char *private_key,
             watch_batch->results[slot].rule = rule;
             watch_batch->results[slot].lane = lane;
             for (int i = 0; i < 32; ++i) watch_batch->results[slot].public_key[i] = public_key[i];
-            for (int i = 0; i < 64; ++i) watch_batch->results[slot].private_key[i] = private_key[i];
+            write_private(watch_batch->results[slot].private_key);
         }
     }
     return false;
@@ -444,37 +450,200 @@ __global__ void scan_kernel_baseline(const unsigned char *base_seed, DeviceResul
         private_key[31] |= 64;
         ge_scalarmult_base(&point, private_key);
         ge_p3_tobytes(public_key, &point);
-        if (inspect_candidate(private_key, public_key, result, watch_batch, lane,
+        const auto write_private = [&](unsigned char *destination) {
+            for (int i = 0; i < 64; ++i) destination[i] = private_key[i];
+        };
+        if (inspect_candidate(write_private, public_key, result, watch_batch, lane,
                               false, &lane_has_watch)) return;
         increment_seed(seed, 1);
     }
 }
 
-__device__ void encode_with_inverse(unsigned char *encoded, const ge_p3 *point,
-                                    const fe inverse) {
-    fe x;
-    fe y;
-    fe_mul(x, point->X, inverse);
-    fe_mul(y, point->Y, inverse);
-    fe_tobytes(encoded, y);
-    encoded[31] ^= fe_isnegative(x) << 7;
+// ------------------------------------------------------------ affine walk
+//
+// Each lane holds an affine centre P = s*B (s = lane scalar + 8c). For the
+// Duif-form table entry Q_k = k*8B = (y+x, y-x, 2dxy), mixed addition gives
+//   P + Q_k = ((A - B) / (2 + C), (A + B) / (2 - C))
+//   P - Q_k = ((A' - B') / (2 - C), (A' + B') / (2 + C))
+// with A = (y+x)(y_k+x_k), B = (y-x)(y_k-x_k), A' and B' using the swapped
+// table pair, and C = 2d x y x_k y_k. Both points share the denominators
+// 2 +/- C, whose product (2 + C)(2 - C) is batch-inverted across the whole
+// span together with the step to the next centre, Q_last = (2M + 1)*8B.
+
+struct AffinePrecomp {
+    fe32 yplusx;
+    fe32 yminusx;
+    fe32 xy2d;
+};
+
+// gpu_affine_table[k - 1] = k*8B for k = 1..M; gpu_affine_table[M] = span*8B.
+__constant__ AffinePrecomp gpu_affine_table[kAffineHalfSpan + 1];
+
+__device__ __forceinline__ void fe_to_fe32(fe32 &out, const fe in) {
+    unsigned char bytes[32];
+    fe_tobytes(bytes, in);
+    fe32_frombytes(out, bytes);
 }
 
-template<int BatchSize>
-__device__ void encode_batch(unsigned char encoded[BatchSize][32],
-                             const ge_p3 points[BatchSize]) {
-    fe prefixes[BatchSize];
-    fe running_inverse;
-    fe inverse;
-    fe_copy(prefixes[0], points[0].Z);
-    for (int i = 1; i < BatchSize; ++i) fe_mul(prefixes[i], prefixes[i - 1], points[i].Z);
-    fe_invert(running_inverse, prefixes[BatchSize - 1]);
-    for (int i = BatchSize - 1; i > 0; --i) {
-        fe_mul(inverse, running_inverse, prefixes[i - 1]);
-        encode_with_inverse(encoded[i], &points[i], inverse);
-        fe_mul(running_inverse, running_inverse, points[i].Z);
+__global__ void build_affine_table_kernel(AffinePrecomp *out) {
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k > kAffineHalfSpan) return;
+    const unsigned int multiple =
+        8U * (k < kAffineHalfSpan ? static_cast<unsigned int>(k + 1)
+                                  : static_cast<unsigned int>(kAffineSpan));
+    unsigned char scalar[32]{};
+    scalar[0] = static_cast<unsigned char>(multiple);
+    scalar[1] = static_cast<unsigned char>(multiple >> 8);
+    scalar[2] = static_cast<unsigned char>(multiple >> 16);
+    ge_p3 point;
+    ge_scalarmult_base(&point, scalar);
+    fe z_inverse, x, y, value;
+    fe_invert(z_inverse, point.Z);
+    fe_mul(x, point.X, z_inverse);
+    fe_mul(y, point.Y, z_inverse);
+    fe_add(value, y, x);
+    fe_to_fe32(out[k].yplusx, value);
+    fe_sub(value, y, x);
+    fe_to_fe32(out[k].yminusx, value);
+    fe_mul(value, x, y);
+    fe_mul(value, value, d2);
+    fe_to_fe32(out[k].xy2d, value);
+}
+
+// Public constants only; must run on the selected device before any
+// optimized scan.
+cudaError_t upload_affine_table() {
+    AffinePrecomp *device_table = nullptr;
+    cudaError_t status = cudaMalloc(&device_table, sizeof(gpu_affine_table));
+    if (status != cudaSuccess) return status;
+    build_affine_table_kernel<<<(kAffineHalfSpan + 64) / 64, 64>>>(device_table);
+    status = cudaGetLastError();
+    if (status == cudaSuccess) status = cudaDeviceSynchronize();
+    if (status == cudaSuccess)
+        status = cudaMemcpyToSymbol(gpu_affine_table, device_table,
+                                    sizeof(gpu_affine_table), 0,
+                                    cudaMemcpyDeviceToDevice);
+    cudaError_t released = cudaFree(device_table);
+    return status != cudaSuccess ? status : released;
+}
+
+__device__ __forceinline__ void encode_affine(unsigned char *encoded,
+                                              const fe32 &x, const fe32 &y) {
+    fe32_tobytes(encoded, y);
+    encoded[31] ^= fe32_isnegative(x) << 7;
+}
+
+// Visits public keys for scalars s + 8j, j = 0..AttemptCount-1 (in a
+// span-ordered, not ascending, sequence). visit(j, public_key) returns true to
+// stop the lane. stop_flag, when non-null, ends the lane at a centre boundary.
+template<int AttemptCount, typename Visitor>
+__device__ __forceinline__ void affine_walk(const unsigned char *lane_scalar,
+                                            const int *stop_flag, Visitor visit) {
+    constexpr int kCentres = (AttemptCount + kAffineSpan - 1) / kAffineSpan;
+    unsigned char scalar[32];
+    for (int i = 0; i < 32; ++i) scalar[i] = lane_scalar[i];
+    // Ed25519's expanded scalar must keep bit 255 clear. Standard clamping
+    // leaves a negligible chance that the bounded +8 walk reaches it; skip
+    // such a lane entirely rather than emitting a malformed expanded key.
+    {
+        unsigned char last[32];
+        for (int i = 0; i < 32; ++i) last[i] = scalar[i];
+        increment_seed(last, 8ULL * (static_cast<unsigned long long>(kCentres) * kAffineSpan - 1));
+        if (last[31] & 128) return;
     }
-    encode_with_inverse(encoded[0], &points[0], running_inverse);
+    increment_seed(scalar, 8ULL * kAffineHalfSpan);
+
+    fe32 x, y;
+    {
+        ge_p3 point;
+        fe z_inverse, affine_x, affine_y;
+        ge_scalarmult_base(&point, scalar);
+        fe_invert(z_inverse, point.Z);
+        fe_mul(affine_x, point.X, z_inverse);
+        fe_mul(affine_y, point.Y, z_inverse);
+        fe_to_fe32(x, affine_x);
+        fe_to_fe32(y, affine_y);
+    }
+    fe32 two;
+    fe32_set_small(two, 2);
+    fe32 prefix[kAffineHalfSpan + 1];
+    fe32 c_values[kAffineHalfSpan + 1];
+    unsigned char public_key[32];
+
+    for (int centre_index = 0; centre_index < kCentres; ++centre_index) {
+        if (stop_flag && *reinterpret_cast<const volatile int *>(stop_flag)) return;
+        const int centre = kAffineHalfSpan + centre_index * kAffineSpan;
+        fe32 ypx, ymx, xy, accumulator, product, plus_denominator, minus_denominator;
+        fe32_add(ypx, y, x);
+        fe32_sub(ymx, y, x);
+        fe32_mul(xy, x, y);
+
+        if (centre < AttemptCount) {
+            encode_affine(public_key, x, y);
+            if (visit(centre, public_key)) return;
+        }
+
+        // Forward: exclusive prefix products of E_k = (2 + C_k)(2 - C_k).
+        fe32_set_small(accumulator, 1);
+#pragma unroll 4
+        for (int k = 0; k <= kAffineHalfSpan; ++k) {
+            fe32_mul(c_values[k], gpu_affine_table[k].xy2d, xy);
+            fe32_add(plus_denominator, two, c_values[k]);
+            fe32_sub(minus_denominator, two, c_values[k]);
+            fe32_mul(product, plus_denominator, minus_denominator);
+            prefix[k] = accumulator;
+            fe32_mul(accumulator, accumulator, product);
+        }
+        fe32 inverse;
+        fe32_invert(inverse, accumulator);
+
+        // Backward. k == M is the step to the next centre, which needs both
+        // coordinates but is not itself a candidate of this span.
+        fe32 next_x, next_y;
+#pragma unroll 2
+        for (int k = kAffineHalfSpan; k >= 0; --k) {
+            fe32 inverse_e, inverse_plus, inverse_minus, a, b, numerator_x,
+                numerator_y, out_x, out_y;
+            fe32_add(plus_denominator, two, c_values[k]);
+            fe32_sub(minus_denominator, two, c_values[k]);
+            fe32_mul(inverse_e, inverse, prefix[k]);
+            fe32_mul(product, plus_denominator, minus_denominator);
+            fe32_mul(inverse, inverse, product);
+            fe32_mul(inverse_plus, minus_denominator, inverse_e);   // 1 / (2 + C)
+            fe32_mul(inverse_minus, plus_denominator, inverse_e);   // 1 / (2 - C)
+            const AffinePrecomp &q = gpu_affine_table[k];
+
+            fe32_mul(a, ypx, q.yplusx);
+            fe32_mul(b, ymx, q.yminusx);
+            fe32_sub(numerator_x, a, b);
+            fe32_add(numerator_y, a, b);
+            fe32_mul(out_x, numerator_x, inverse_plus);
+            fe32_mul(out_y, numerator_y, inverse_minus);
+            if (k == kAffineHalfSpan) {
+                next_x = out_x;
+                next_y = out_y;
+                continue;
+            }
+            const int step = k + 1;
+            if (centre + step < AttemptCount) {
+                encode_affine(public_key, out_x, out_y);
+                if (visit(centre + step, public_key)) return;
+            }
+
+            fe32_mul(a, ypx, q.yminusx);
+            fe32_mul(b, ymx, q.yplusx);
+            fe32_sub(numerator_x, a, b);
+            fe32_add(numerator_y, a, b);
+            fe32_mul(out_x, numerator_x, inverse_minus);
+            fe32_mul(out_y, numerator_y, inverse_plus);
+            if (centre - step < AttemptCount) {
+                encode_affine(public_key, out_x, out_y);
+                if (visit(centre - step, public_key)) return;
+            }
+        }
+        x = next_x;
+        y = next_y;
+    }
 }
 
 __global__ void derive_lane_private_keys(const unsigned char *batch_seed,
@@ -513,35 +682,50 @@ template<int AttemptCount>
 __global__ void scan_kernel_optimized(const unsigned char *lane_private_keys,
                                       unsigned long long lane_count,
                                       DeviceResult *result, WatchBatch *watch_batch) {
-    static_assert(AttemptCount > 0 && AttemptCount % 32 == 0,
-                  "optimized scan attempts must be a positive multiple of 32");
-    unsigned char private_key[64]{};
-    unsigned char public_keys[32][32];
-    ge_p3 points[32];
-    ge_p1p1 next;
+    static_assert(AttemptCount > 0, "optimized scan needs at least one attempt");
+    unsigned char private_key[64];
     bool lane_has_watch = false;
     const unsigned long long lane = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (lane >= lane_count) return;
     for (int i = 0; i < 64; ++i)
         private_key[i] =
             lane_private_keys[static_cast<unsigned long long>(i) * lane_count + lane];
-    ge_scalarmult_base(&points[0], private_key);
 
-    for (int attempt = 0; attempt < AttemptCount; attempt += 32) {
-        if (result->found) return;
-        for (int i = 1; i < 32; ++i) {
-            ge_madd(&next, &points[i - 1], &base[0][7]);
-            ge_p1p1_to_p3(&points[i], &next);
-        }
-        encode_batch<32>(public_keys, points);
-        for (int i = 0; i < 32; ++i) {
-            if (inspect_candidate(private_key, public_keys[i], result, watch_batch, lane,
-                                  true, &lane_has_watch)) return;
-            if (!increment_scalar(private_key, 8)) return;
-        }
-        ge_madd(&next, &points[31], &base[0][7]);
-        ge_p1p1_to_p3(&points[0], &next);
-    }
+    affine_walk<AttemptCount>(private_key, &result->found,
+                              [&](int index, const unsigned char *public_key) {
+        const auto write_private = [&](unsigned char *destination) {
+            for (int i = 0; i < 64; ++i) destination[i] = private_key[i];
+            increment_seed(destination, 8ULL * static_cast<unsigned int>(index));
+        };
+        return inspect_candidate(write_private, public_key, result, watch_batch,
+                                 lane, true, &lane_has_watch);
+    });
+}
+
+// Internal regression: every key of the affine walk must equal the reference
+// ge_scalarmult_base of the same scalar. Public test scalars only.
+template<int AttemptCount>
+__global__ void affine_walk_test_kernel(const unsigned char *scalars, int lanes,
+                                        unsigned int *mismatches,
+                                        unsigned int *visited) {
+    const int lane = blockIdx.x * blockDim.x + threadIdx.x;
+    if (lane >= lanes) return;
+    const unsigned char *base_scalar = scalars + static_cast<size_t>(lane) * 32;
+    affine_walk<AttemptCount>(base_scalar, nullptr,
+                              [&](int index, const unsigned char *public_key) {
+        unsigned char scalar[32];
+        unsigned char expected[32];
+        for (int i = 0; i < 32; ++i) scalar[i] = base_scalar[i];
+        increment_seed(scalar, 8ULL * static_cast<unsigned int>(index));
+        ge_p3 point;
+        ge_scalarmult_base(&point, scalar);
+        ge_p3_tobytes(expected, &point);
+        bool differs = false;
+        for (int i = 0; i < 32; ++i) differs |= expected[i] != public_key[i];
+        if (differs) atomicAdd(mismatches, 1U);
+        atomicAdd(&visited[static_cast<size_t>(lane) * AttemptCount + index], 1U);
+        return false;
+    });
 }
 
 struct LaunchProfile {
@@ -1174,6 +1358,8 @@ int run_readiness_probe(int selected_device, const std::string &engine,
     // This validates its real block geometry and register feasibility while
     // remaining bounded to one block of the selected profile.
     if (engine == "optimized") {
+        status = upload_affine_table();
+        if (status != cudaSuccess) return fail("probe build affine table", status);
         derive_lane_private_keys<<<1, kThreads>>>(
             device_input, device_lane_state, production_lane_count);
         status = cudaGetLastError();
@@ -1255,6 +1441,80 @@ int run_readiness_probe(int selected_device, const std::string &engine,
         engine.c_str(), kBuildFingerprint, kBuildArches, kThreads,
         profile.blocks_per_sm, profile.attempts_per_thread, kMaxRegisters);
     std::fflush(stdout);
+    return 0;
+}
+
+// Compares every key of the production affine walk against an independent
+// ge_scalarmult_base, and checks each index 0..AttemptCount-1 is visited
+// exactly once. Uses fixed public scalars; prints no key material.
+template<int AttemptCount>
+bool affine_walk_case(int lanes, unsigned int seed_byte, std::string &error) {
+    std::vector<unsigned char> scalars(static_cast<size_t>(lanes) * 32);
+    for (int lane = 0; lane < lanes; ++lane) {
+        unsigned char *scalar = scalars.data() + static_cast<size_t>(lane) * 32;
+        for (int i = 0; i < 32; ++i)
+            scalar[i] = static_cast<unsigned char>(seed_byte * 131U + lane * 29U + i * 7U);
+        scalar[0] &= 248;
+        scalar[31] &= 63;
+        scalar[31] |= 64;
+    }
+    // Carry-heavy lane: every low scalar byte saturated.
+    for (int i = 0; i < 31; ++i) scalars[i] = 0xff;
+    scalars[0] = 0xf8;
+    unsigned char *device_scalars = nullptr;
+    unsigned int *device_counters = nullptr;
+    const size_t visits = static_cast<size_t>(lanes) * AttemptCount;
+    cuda_check(cudaMalloc(&device_scalars, scalars.size()), "affine test cudaMalloc scalars");
+    cuda_check(cudaMalloc(&device_counters, (visits + 1) * sizeof(unsigned int)),
+               "affine test cudaMalloc counters");
+    cuda_check(cudaMemcpy(device_scalars, scalars.data(), scalars.size(),
+                          cudaMemcpyHostToDevice), "affine test copy scalars");
+    cuda_check(cudaMemset(device_counters, 0, (visits + 1) * sizeof(unsigned int)),
+               "affine test clear counters");
+    affine_walk_test_kernel<AttemptCount><<<(lanes + 63) / 64, 64>>>(
+        device_scalars, lanes, device_counters, device_counters + 1);
+    cuda_check(cudaGetLastError(), "affine test launch");
+    cuda_check(cudaDeviceSynchronize(), "affine test synchronize");
+    std::vector<unsigned int> counters(visits + 1);
+    cuda_check(cudaMemcpy(counters.data(), device_counters,
+                          counters.size() * sizeof(unsigned int), cudaMemcpyDeviceToHost),
+               "affine test copy counters");
+    cudaFree(device_scalars);
+    cudaFree(device_counters);
+    if (counters[0] != 0) {
+        error = std::to_string(counters[0]) + " keys differ from the reference";
+        return false;
+    }
+    for (size_t i = 0; i < visits; ++i) {
+        if (counters[i + 1] != 1) {
+            error = "walk index " + std::to_string(i % AttemptCount)
+                + " visited " + std::to_string(counters[i + 1]) + " times";
+            return false;
+        }
+    }
+    return true;
+}
+
+int run_affine_walk_self_test(int selected_device) {
+    int device_count = 0;
+    cuda_check(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount");
+    if (!device_count || selected_device >= device_count) {
+        std::fprintf(stderr, "CUDA affine-walk self-test: CUDA device %d is unavailable\n",
+                     selected_device);
+        return 2;
+    }
+    cuda_check(cudaSetDevice(selected_device), "cudaSetDevice");
+    cuda_check(upload_affine_table(), "build affine table");
+    constexpr int kLanes = 64;
+    std::string error;
+    if (!affine_walk_case<kAttemptsPerThread>(kLanes, 1, error)
+            || !affine_walk_case<kInteractiveOptimizedAttemptsPerThread>(kLanes, 2, error)) {
+        std::fprintf(stderr, "CUDA affine-walk self-test: FAIL (%s)\n", error.c_str());
+        return 1;
+    }
+    std::printf("CUDA affine-walk self-test: PASS (%d lanes x %d + %d keys, span %d)\n",
+                kLanes, kAttemptsPerThread, kInteractiveOptimizedAttemptsPerThread,
+                kAffineSpan);
     return 0;
 }
 
@@ -1359,6 +1619,7 @@ int main(int argc, char **argv) {
     bool collect_only = false;
     bool interactive = false;
     bool lane_isolation_self_test = false;
+    bool affine_walk_self_test = false;
     bool rare_parser_self_test = false;
     bool probe = false;
     bool option_error = false;
@@ -1413,6 +1674,11 @@ int main(int argc, char **argv) {
         if (option == "--interactive") {
             if (interactive) option_error = true;
             interactive = true;
+            continue;
+        }
+        if (option == "--internal-test-affine-walk") {
+            if (affine_walk_self_test) option_error = true;
+            affine_walk_self_test = true;
             continue;
         }
         if (option == "--internal-test-lane-isolation") {
@@ -1496,6 +1762,16 @@ int main(int argc, char **argv) {
         }
         return run_readiness_probe(selected_device, engine, interactive);
     }
+    if (affine_walk_self_test) {
+        if (option_error || lane_isolation_self_test || collect_only || interactive
+                || rare_parser_self_test || !classifier_values.empty() || rare_protocol_seen
+                || !prefix.empty() || !suffix.empty() || !contains.empty()
+                || engine_option_seen) {
+            usage(argv[0]);
+            return 2;
+        }
+        return run_affine_walk_self_test(selected_device);
+    }
     if (lane_isolation_self_test) {
         if (option_error || collect_only || interactive || rare_parser_self_test
                 || !classifier_values.empty() || rare_protocol_seen
@@ -1574,9 +1850,11 @@ int main(int argc, char **argv) {
     DeviceResult *device_result = nullptr;
     WatchBatch *device_watch = nullptr;
     cuda_check(cudaMalloc(&device_seed, 32), "cudaMalloc seed");
-    if (engine == "optimized")
+    if (engine == "optimized") {
         cuda_check(cudaMalloc(&device_lane_private_keys, lane_count * 64),
                    "cudaMalloc lane private keys");
+        cuda_check(upload_affine_table(), "build affine table");
+    }
     cuda_check(cudaMalloc(&device_result, sizeof(DeviceResult)), "cudaMalloc result");
     cuda_check(cudaMalloc(&device_watch, sizeof(WatchBatch)), "cudaMalloc watch results");
     unsigned long long attempts = 0;

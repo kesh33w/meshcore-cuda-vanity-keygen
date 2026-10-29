@@ -4,7 +4,7 @@ NVCCFLAGS ?= -O3
 CUDA_MAX_REGISTERS ?= 128
 CUDA_ATTEMPTS_PER_THREAD ?= 4096
 CUDA_THREADS ?= 128
-CUDA_BLOCKS_PER_SM ?= 16
+CUDA_BLOCKS_PER_SM ?= 4
 CUDA_MIN_MAJOR := 11
 CUDA_MIN_MINOR := 8
 
@@ -43,7 +43,7 @@ CUDA_GENERATED_DEPS := $(CUDA_RARE_HEADER) $(wildcard rare_rules_generated.h gen
 # The source/configuration hash is both a make prerequisite and a non-secret
 # build fingerprint reported by --probe. A changed tuning, compiler, arch, or
 # engine source therefore cannot accidentally reuse an old executable.
-CUDA_SOURCE_ID := $(shell sha256sum Makefile cuda_vanity.cu $(CUDA_VENDOR_DEPS) $(CUDA_RARE_INPUTS) 2>/dev/null | sha256sum | cut -c1-16)
+CUDA_SOURCE_ID := $(shell sha256sum Makefile cuda_vanity.cu fe32.cuh $(CUDA_VENDOR_DEPS) $(CUDA_RARE_INPUTS) 2>/dev/null | sha256sum | cut -c1-16)
 CUDA_BUILD_CONFIG := source=$(CUDA_SOURCE_ID)|nvcc=$(NVCC)|host=$(HOST_CXX)|flags=$(NVCCFLAGS)|arch-mode=$(CUDA_ARCH_MODE)|arch-flags=$(CUDA_ARCH_FLAGS)|registers=$(CUDA_MAX_REGISTERS)|attempts=$(CUDA_ATTEMPTS_PER_THREAD)|threads=$(CUDA_THREADS)|blocks-per-sm=$(CUDA_BLOCKS_PER_SM)
 CUDA_BUILD_ID := $(shell printf '%s' '$(CUDA_BUILD_CONFIG)' | sha256sum | cut -c1-16)
 CUDA_CONFIG_STAMP := .meshcore_cuda_vanity.build-$(CUDA_BUILD_ID)
@@ -54,7 +54,7 @@ CUDA_CONFIG_STAMP_GLOB := .meshcore_cuda_vanity.build-*
 
 all: meshcore_cuda_vanity
 
-meshcore_cuda_vanity: Makefile cuda_vanity.cu $(CUDA_VENDOR_DEPS) $(CUDA_GENERATED_DEPS) $(CUDA_CONFIG_STAMP) | check-nvcc
+meshcore_cuda_vanity: Makefile cuda_vanity.cu fe32.cuh $(CUDA_VENDOR_DEPS) $(CUDA_GENERATED_DEPS) $(CUDA_CONFIG_STAMP) | check-nvcc
 	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) -ccbin $(HOST_CXX) --maxrregcount=$(CUDA_MAX_REGISTERS) \
 		-DMC_ATTEMPTS_PER_THREAD=$(CUDA_ATTEMPTS_PER_THREAD) -DMC_THREADS=$(CUDA_THREADS) \
 		-DMC_BLOCKS_PER_SM=$(CUDA_BLOCKS_PER_SM) -DMC_MAX_REGISTERS=$(CUDA_MAX_REGISTERS) \
@@ -89,6 +89,7 @@ test-cpu:
 
 test-gpu: meshcore_cuda_vanity
 	./meshcore_cuda_vanity --internal-test-lane-isolation
+	./meshcore_cuda_vanity --internal-test-affine-walk
 	RUN_CUDA_TESTS=1 python3 -m unittest discover -s tests -v
 
 check:
