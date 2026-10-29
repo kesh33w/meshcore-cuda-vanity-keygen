@@ -32,3 +32,24 @@ firmware `v1.17.1-d929643`.
 No private keys are included in this document. No LoRa packet was transmitted
 during the test; it validated identity import, storage, derivation, and signing
 through the firmware's local companion interface.
+
+## v1.10.0 on Heltec V4.3 (2026-10-28)
+
+The v1.10.0 optimized engine (affine walk with `fe32` arithmetic) was
+re-validated on a Heltec V4.3 OLED (ESP32-S3, 16 MB flash, 2 MB PSRAM) freshly
+flashed with the official MeshCore USB companion firmware `v1.18.0-81dbae5`
+(`heltec_v4_companion_radio_usb-v1.18.0-81dbae5-merged.bin`, SHA-256
+`d5b0f7a152755b9bc57b1dae1ed3728aea01893468ae9be1ccfaa02d0e4baafc`). The
+procedure was the same as above, over the USB companion protocol, with a
+reboot after each import.
+
+- Public key:
+  `c0de110ee7a299d2d39fabd2497a02072b0851260a9951f4e0bd998d2722edcd`
+- Requested prefix: `c0de110`
+- CUDA engine: `optimized` (v1.10.0)
+- Device-reported public key after import: **PASS**
+- Exact private-key export comparison: **PASS**
+- On-device signature verification: **PASS**
+- Original identity restoration and export verification: **PASS**
+
+As before, no private keys are included and no LoRa packet was transmitted.
