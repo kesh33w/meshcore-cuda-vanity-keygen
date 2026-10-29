@@ -5,6 +5,9 @@ CUDA_MAX_REGISTERS ?= 128
 CUDA_ATTEMPTS_PER_THREAD ?= 4096
 CUDA_THREADS ?= 128
 CUDA_BLOCKS_PER_SM ?= 4
+# Optimized engine table size M (keys per inversion = 2M + 1). 256 needs about
+# 1.6 GB of VRAM on a 60-SM GPU; 128 needs about 0.9 GB and is ~6% slower.
+CUDA_AFFINE_HALF_SPAN ?= 256
 CUDA_MIN_MAJOR := 11
 CUDA_MIN_MINOR := 8
 
@@ -44,7 +47,7 @@ CUDA_GENERATED_DEPS := $(CUDA_RARE_HEADER) $(wildcard rare_rules_generated.h gen
 # build fingerprint reported by --probe. A changed tuning, compiler, arch, or
 # engine source therefore cannot accidentally reuse an old executable.
 CUDA_SOURCE_ID := $(shell sha256sum Makefile cuda_vanity.cu fe32.cuh $(CUDA_VENDOR_DEPS) $(CUDA_RARE_INPUTS) 2>/dev/null | sha256sum | cut -c1-16)
-CUDA_BUILD_CONFIG := source=$(CUDA_SOURCE_ID)|nvcc=$(NVCC)|host=$(HOST_CXX)|flags=$(NVCCFLAGS)|arch-mode=$(CUDA_ARCH_MODE)|arch-flags=$(CUDA_ARCH_FLAGS)|registers=$(CUDA_MAX_REGISTERS)|attempts=$(CUDA_ATTEMPTS_PER_THREAD)|threads=$(CUDA_THREADS)|blocks-per-sm=$(CUDA_BLOCKS_PER_SM)
+CUDA_BUILD_CONFIG := source=$(CUDA_SOURCE_ID)|nvcc=$(NVCC)|host=$(HOST_CXX)|flags=$(NVCCFLAGS)|arch-mode=$(CUDA_ARCH_MODE)|arch-flags=$(CUDA_ARCH_FLAGS)|registers=$(CUDA_MAX_REGISTERS)|attempts=$(CUDA_ATTEMPTS_PER_THREAD)|threads=$(CUDA_THREADS)|blocks-per-sm=$(CUDA_BLOCKS_PER_SM)|affine-half-span=$(CUDA_AFFINE_HALF_SPAN)
 CUDA_BUILD_ID := $(shell printf '%s' '$(CUDA_BUILD_CONFIG)' | sha256sum | cut -c1-16)
 CUDA_CONFIG_STAMP := .meshcore_cuda_vanity.build-$(CUDA_BUILD_ID)
 CUDA_CONFIG_STAMP_GLOB := .meshcore_cuda_vanity.build-*
@@ -58,6 +61,7 @@ meshcore_cuda_vanity: Makefile cuda_vanity.cu fe32.cuh $(CUDA_VENDOR_DEPS) $(CUD
 	$(NVCC) $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) -ccbin $(HOST_CXX) --maxrregcount=$(CUDA_MAX_REGISTERS) \
 		-DMC_ATTEMPTS_PER_THREAD=$(CUDA_ATTEMPTS_PER_THREAD) -DMC_THREADS=$(CUDA_THREADS) \
 		-DMC_BLOCKS_PER_SM=$(CUDA_BLOCKS_PER_SM) -DMC_MAX_REGISTERS=$(CUDA_MAX_REGISTERS) \
+		-DMC_AFFINE_HALF_SPAN=$(CUDA_AFFINE_HALF_SPAN) \
 		-DMC_BUILD_ARCHES=\"$(CUDA_ARCH_LIST)\" -DMC_BUILD_FINGERPRINT=\"$(CUDA_BUILD_ID)\" \
 		-MMD -MP -MF $(CUDA_DEPFILE) -MT $@ \
 		-Ivendor/cuda-ed25519 cuda_vanity.cu -o $@

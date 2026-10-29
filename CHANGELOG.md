@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## 1.11.1 — 2026-10-28
+
+- Raise the optimized engine's table size from 128 to 256 points per side
+  (513 keys per field inversion). With the cheaper y-only walk, the shared
+  inversion is a larger share of the cost, so this now gains about 6%:
+  3.45G keys/s with default rules and 3.99G with bookend and mirror off on an
+  RTX 4070 Ti. VRAM use rises from about 0.9 GB to 1.6 GB.
+- Expose the table size as `CUDA_AFFINE_HALF_SPAN` in the Makefile (part of
+  the build fingerprint), so smaller GPUs can build with 128.
+
 ## 1.11.0 — 2026-10-28
 
 - Compute only the y coordinate in the optimized engine's affine walk:

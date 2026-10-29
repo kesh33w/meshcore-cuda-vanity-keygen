@@ -4,7 +4,7 @@ Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
 It searches a public-key prefix, suffix, or substring and saves the matching
 128-hex-character private key required by MeshCore (`prv.key`).
 
-The current release is **v1.11.0**. Generated identities have been validated
+The current release is **v1.11.1**. Generated identities have been validated
 against MeshCore firmware vectors and on physical RAK4631 hardware.
 
 ## Install and run (Ubuntu)
@@ -99,9 +99,9 @@ The default optimized engine begins each batch with a securely random seed and
 uses domain-separated SHA-512 to derive an independent expanded Ed25519 private
 key for every GPU lane. Each lane covers the scalars `s, s + 8, s + 16, …`
 without a full scalar multiplication per key. It keeps an affine "centre"
-point P and derives its neighbours P ± k·8B (k = 1…128) from a precomputed
+point P and derives its neighbours P ± k·8B (k = 1…256) from a precomputed
 table. Each ± pair shares one pair of denominators, and Montgomery's
-batch-inversion trick shares a single field inversion across all 257 keys of
+batch-inversion trick shares a single field inversion across all 513 keys of
 a span. A MeshCore public key is the point's y coordinate plus one sign bit
 from x (bit 255, inside hex character 62), so the walk computes only y, at
 about 5.6 field multiplications per key. x is computed only for keys that
@@ -144,29 +144,30 @@ maximum-throughput launch profile.
 
 ### Measured performance
 
-On the development RTX 4070 Ti, the v1.11 optimized engine's
-maximum-throughput command-line profile processes about 3.26 billion keys per
-second with the default rare-key rules, and about 3.79 billion for a prefix
+On the development RTX 4070 Ti, the v1.11.1 optimized engine's
+maximum-throughput command-line profile processes about 3.45 billion keys per
+second with the default rare-key rules, and about 3.99 billion for a prefix
 search with the bookend and mirror rules switched off. That compares with
 about 2.53 billion for v1.10, 970 million for v1.9, and 29 million for the
-retained baseline. Approximate average search times at 3.26G/s are:
+retained baseline. Approximate average search times at 3.45G/s are:
 
 | Hex characters | Possibilities | Average time |
 | ---: | ---: | ---: |
 | 7 | 268 million | 0.1 seconds |
-| 8 | 4.3 billion | 1.3 seconds |
-| 9 | 68.7 billion | 21 seconds |
-| 10 | 1.1 trillion | 5.6 minutes |
-| 11 | 17.6 trillion | 1.5 hours |
+| 8 | 4.3 billion | 1.2 seconds |
+| 9 | 68.7 billion | 20 seconds |
+| 10 | 1.1 trillion | 5.3 minutes |
+| 11 | 17.6 trillion | 1.4 hours |
 
 These are probabilistic averages, not maximums. GPU model, cooling, power
 limits, and other workloads affect actual throughput. Sweeps of the table size
 (M = 16…500), register limits (96–255), threads per block (64–256), and blocks
-per SM (4–16) settled on the shipped 128-register, 128-thread, 4-blocks-per-SM,
-4096-attempt, M = 128 configuration. Larger tables gained at most 3% while
-doubling per-thread local memory. The GUI's responsive profile measured
-3.22 billion keys per second with default rules and 3.74 billion with bookend
-and mirror off (v1.10: 2.54 billion; v1.9: 943 million) on the same GPU.
+per SM (2–16) settled on the shipped 128-register, 128-thread, 4-blocks-per-SM,
+4096-attempt, M = 256 configuration. M = 256 uses about 1.6 GB of VRAM on this
+60-SM GPU. Build with `make CUDA_AFFINE_HALF_SPAN=128` to use about 0.9 GB at
+roughly 6% lower throughput. The GUI's responsive profile measured 3.31 billion
+keys per second with default rules (v1.10: 2.54 billion; v1.9: 943 million) on
+the same GPU.
 
 ## Continuous rare-key collector
 
@@ -262,13 +263,13 @@ rare-key record. The GUI chooser revalidates every selected subset with the same
 safety limits, including rules that were initially disabled in a custom file.
 
 With all defaults selected, the approximate average discovery cadence at the
-measured 3.26G keys/s is:
+measured 3.45G keys/s is:
 
 | Minimum | Active categories | Average time between finds |
 | ---: | ---: | ---: |
-| 10 | 5 | 19 seconds |
-| 11 | 4 | 5.3 minutes |
-| 12 | 4 | 1.4 hours |
+| 10 | 5 | 18 seconds |
+| 11 | 4 | 5.0 minutes |
+| 12 | 4 | 1.3 hours |
 
 The fixed phrase accounts for the fifth category at 10. Bookend probability is
 calculated across every possible matching width from the selected minimum
@@ -302,7 +303,7 @@ Every discovery is retained, even when earlier keys matched the same category.
 File locking prevents concurrent searches from corrupting or interleaving
 records. Collection stops when the requested key is found or the search is
 cancelled; rare keys already written remain saved. At the measured rate and
-current criteria, continuous searching averages about 4,700 new records per
+current criteria, continuous searching averages about 4,900 new records per
 day. The GUI keeps its live count in memory, reads history backward from the
 file tail, and presents at most 500 rows per page from the newest 10,000 valid
 records. Upgrading does not rewrite or delete legacy
