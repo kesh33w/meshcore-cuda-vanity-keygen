@@ -1041,7 +1041,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
                 interactive: bool = False,
                 process_update: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
                 ruleset: RareRuleset = DEFAULT_RARE_RULESET,
-                minimum_match_nibbles: Optional[int] = None) -> Result:
+                minimum_match_nibbles: Optional[int] = None,
+                rare_enabled: bool = True) -> Result:
     executable = cuda_executable()
     if not executable.is_file():
         raise RuntimeError("CUDA engine is not built; run 'make'")
@@ -1054,7 +1055,12 @@ def search_cuda(prefix: str, suffix: str, contains: str,
     command = [str(executable), "--device", str(device), "--engine", engine]
     if interactive:
         command.append("--interactive")
-    command.extend(ruleset.cuda_arguments())
+    if rare_enabled:
+        command.extend(ruleset.cuda_arguments())
+    elif collect_only:
+        raise ValueError("Collector mode requires rare-key saving")
+    else:
+        command.append("--no-rare")
     if collect_only:
         if any((prefix, suffix, contains)):
             raise ValueError("Collector mode cannot be combined with a vanity pattern")
@@ -1067,7 +1073,8 @@ def search_cuda(prefix: str, suffix: str, contains: str,
     if cancel and cancel.is_set():
         raise SearchCancelled("Search cancelled")
     watch_path = watch_path or DEFAULT_WATCH_PATH
-    initialize_watch_file(watch_path)
+    if rare_enabled:
+        initialize_watch_file(watch_path)
     if cancel and cancel.is_set():
         raise SearchCancelled("Search cancelled")
     process: Optional[subprocess.Popen[str]] = None
@@ -2104,6 +2111,14 @@ def run_gui(
     )
     rare_rule_button = ttk.Button(frame, text="Choose…", state="disabled")
     rare_rule_button.grid(row=7, column=2, padx=(7, 0))
+    # Off = pure vanity search: the CUDA engine gets zero rules, so it skips
+    # per-key classification and (prefix-only) x-coordinate sign recovery.
+    rare_saving = tk.BooleanVar(value=True)
+    rare_saving_checkbox = ttk.Checkbutton(
+        frame, text="Save rare keys while searching (slower)",
+        variable=rare_saving,
+    )
+    rare_saving_checkbox.grid(row=4, column=2, sticky="e")
 
     output_directory = tk.StringVar(value=str(DEFAULT_RESULTS_DIR))
     ttk.Label(frame, text="Results folder").grid(row=8, column=0, sticky="w", pady=3)
@@ -2468,6 +2483,7 @@ def run_gui(
         pending = bool(state["discovery_pending"])
         searching = bool(state["searching"])
         rare_rule_button.configure(state="disabled" if searching else "normal")
+        rare_saving_checkbox.configure(state="disabled" if searching else "normal")
         render_temperatures()
         if pending or searching:
             button.configure(state="disabled")
@@ -2654,6 +2670,8 @@ def run_gui(
         collecting = collector_mode.get()
         search_ruleset = active_ruleset
         search_minimum_nibbles = rare_minimum_nibbles
+        # The collector exists only to save rare keys, so it ignores the toggle.
+        search_rare_enabled = collecting or rare_saving.get()
         selected_device = selected_device_index()
         if selected_device is None:
             selected_device = 0
@@ -2720,7 +2738,10 @@ def run_gui(
             show("Continuous rare-key collection is active. It will run until you press Cancel.\nEvery verified discovery is saved immediately.")
         elif using_cuda:
             status.set("Starting CUDA search…")
-            show("CUDA search is active. Longer patterns may take minutes or hours.\nRare incidental keys are being saved while you wait.")
+            show("CUDA search is active. Longer patterns may take minutes or hours.\n"
+                 + ("Rare incidental keys are being saved while you wait."
+                    if search_rare_enabled
+                    else "Rare-key saving is off for maximum speed."))
         else:
             status.set("Starting CPU search…")
             show("CPU fallback search is active. Automatic rare-key collection requires CUDA.")
@@ -2794,7 +2815,8 @@ def run_gui(
                                          collect_only=collecting,
                                          process_update=process_progress,
                                          ruleset=search_ruleset,
-                                         minimum_match_nibbles=search_minimum_nibbles)
+                                         minimum_match_nibbles=search_minimum_nibbles,
+                                         rare_enabled=search_rare_enabled)
                 else:
                     result = search(**values, workers=worker_count, update=progress,
                                     cancel=cancel_event)
@@ -3391,6 +3413,8 @@ def main() -> int:
                         help="load an alternate rare-key rules JSON file")
     parser.add_argument("--collect-rare", action="store_true",
                         help="continuously collect rare keys with CUDA until interrupted")
+    parser.add_argument("--no-rare", action="store_true",
+                        help="skip incidental rare-key saving during a CUDA vanity search (faster)")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index (default: 0)")
     parser.add_argument("--cuda-engine", choices=("optimized", "baseline", "incremental"),
                         default="optimized", help="CUDA implementation (default: optimized)")
@@ -3435,6 +3459,8 @@ def main() -> int:
             raise ValueError("--workers must be at least 1")
         if args.device < 0:
             raise ValueError("--device must be zero or greater")
+        if args.collect_rare and args.no_rare:
+            raise ValueError("--no-rare cannot be combined with --collect-rare")
         if args.collect_rare and args.backend == "cpu":
             raise ValueError("--collect-rare requires the CUDA backend")
         if args.collect_rare and (args.output or args.show_private or args.force):
@@ -3506,7 +3532,7 @@ def main() -> int:
         try:
             result = search_cuda(prefix, suffix, contains, watch_path=args.watch_output,
                                  device=args.device, engine=args.cuda_engine,
-                                 ruleset=ruleset)
+                                 ruleset=ruleset, rare_enabled=not args.no_rare)
         except KeyboardInterrupt:
             print("\nSearch cancelled.")
             return 130
@@ -3550,7 +3576,7 @@ def main() -> int:
     print(f"Saved identity: {output_path}")
     if args.show_private:
         print(f"Private key: {result.private_key}")
-    if result.backend == "cuda":
+    if result.backend == "cuda" and not args.no_rare:
         print(f"Interesting matches: {args.watch_output}")
     return 0
 

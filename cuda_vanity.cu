@@ -1703,7 +1703,7 @@ int run_lane_isolation_self_test(int selected_device) {
 void usage(const char *program) {
     std::fprintf(stderr,
                  "Usage: %s [--engine optimized|baseline] [--device N] [--interactive] [--collect-only] [--prefix HEX] [--suffix HEX] [--contains HEX]\n"
-                 "          [--rare-rules-v2 FINGERPRINT [--rare-rule-v2 SPEC]...]\n"
+                 "          [--rare-rules-v2 FINGERPRINT [--rare-rule-v2 SPEC]... | --no-rare]\n"
                  "       %s --probe [--device N] [--engine optimized|baseline] [--interactive]\n",
                  program, program);
 }
@@ -1721,6 +1721,7 @@ int main(int argc, char **argv) {
     int selected_device = 0;
     bool collect_only = false;
     bool interactive = false;
+    bool no_rare = false;
     bool lane_isolation_self_test = false;
     bool affine_walk_self_test = false;
     bool rare_parser_self_test = false;
@@ -1777,6 +1778,11 @@ int main(int argc, char **argv) {
         if (option == "--interactive") {
             if (interactive) option_error = true;
             interactive = true;
+            continue;
+        }
+        if (option == "--no-rare") {
+            if (no_rare) option_error = true;
+            no_rare = true;
             continue;
         }
         if (option == "--internal-test-affine-walk") {
@@ -1840,7 +1846,15 @@ int main(int argc, char **argv) {
         else { usage(argv[0]); return 2; }
     }
 
-    if (rare_protocol_seen) {
+    if (no_rare) {
+        // Pure vanity search: zero rules makes interesting_rule() a no-op and
+        // lets prefix-only searches skip x-coordinate sign recovery.
+        if (rare_protocol_seen || collect_only)
+            return rare_protocol_error(
+                argv[0], "--no-rare excludes rare rules and --collect-only");
+        rare_fingerprint.clear();
+        rare_rules.clear();
+    } else if (rare_protocol_seen) {
         std::string error;
         if (!validate_rare_rule_set(rare_rules, error))
             return rare_protocol_error(argv[0], error);
@@ -1857,7 +1871,7 @@ int main(int argc, char **argv) {
     if (probe) {
         if (option_error || collect_only || lane_isolation_self_test
                 || rare_parser_self_test || !classifier_values.empty()
-                || rare_protocol_seen
+                || rare_protocol_seen || no_rare
                 || !prefix.empty() || !suffix.empty() || !contains.empty()
                 || incremental_engine_alias) {
             usage(argv[0]);
