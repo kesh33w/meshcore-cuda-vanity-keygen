@@ -1,407 +1,155 @@
-# MeshCore Vanity Key Generator
+# MeshCore vanity key generator
 
-Small, local-only generator for MeshCore-compatible Ed25519 vanity identities.
-It searches a public-key prefix, suffix, or substring and saves the matching
-128-hex-character private key required by MeshCore (`prv.key`).
+A local Ed25519 identity generator for MeshCore. Search for a public-key prefix,
+suffix, or substring from the command line or desktop GUI. NVIDIA CUDA
+accelerates the search. A CPU backend is also available.
 
-The current release is **v1.11.1**. Generated identities have been validated
-against MeshCore firmware vectors and on physical RAK4631 hardware.
+The current release is **v1.11.1**. The program saves the 64-byte expanded
+private key that MeshCore expects, encoded as 128 hexadecimal characters.
+It does not save a 32-byte seed in its place.
 
-## Install and run (Ubuntu)
+If you generated keys with optimized CUDA in **v1.5.1 or earlier**, run the
+[saved-key audit](docs/key-audit.md). Some identities from the same old batch
+can have related private scalars. Rotate every identity named in an
+`optimized_scalar_relationship` finding before sensitive use.
 
-For a normal desktop installation, clone the repository and run:
+## Install on Ubuntu
 
-```bash
+Clone this repository and run the installer:
+
+```sh
+git clone https://github.com/kesh33w/meshcore-cuda-vanity-keygen.git
+cd meshcore-cuda-vanity-keygen
 ./install.sh
 ```
 
-This installs missing Ubuntu dependencies, builds the CUDA engine, installs
-`meshcore-vanity-keygen` and `meshcore-key-audit` commands under
-`~/.local/bin`, and adds **MeshCore Vanity Key Generator** to the desktop
-application menu. It does not install or replace the NVIDIA display driver.
+The installer uses `sudo` for missing Ubuntu packages, builds the CUDA engine,
+and installs the commands under `~/.local/bin`. It also adds the desktop
+launcher. It does not replace the NVIDIA display driver.
 
-Launch it from the application menu or run:
+You need a working NVIDIA driver and CUDA toolkit 11.8 or newer.
+`nvidia-smi` must list the GPU. If Ubuntu's toolkit is too old, install a
+current NVIDIA toolkit and rerun `./install.sh --skip-packages`.
+The installer requires a CUDA build even though a source checkout can run
+CPU searches.
 
-```bash
+Start the GUI from the application menu or the terminal:
+
+```sh
 meshcore-vanity-keygen --gui
 ```
 
-The manual development setup remains:
+Check the installed program and GPU readiness without starting a search:
 
-```bash
-sudo apt update
-sudo apt install build-essential libsodium23 python3 python3-tk nvidia-cuda-toolkit
-make
-python3 meshcore_vanity.py --prefix cafe
-python3 meshcore_vanity.py --gui
-```
-
-You also need a working NVIDIA driver (`nvidia-smi` should list your GPU) and
-CUDA toolkit 11.8 or newer. Some older Ubuntu releases package an earlier
-`nvidia-cuda-toolkit`; in that case, install a current NVIDIA CUDA toolkit and
-rerun `./install.sh --skip-packages`. The build checks the compiler version and
-stops with a clear message before compilation when it is too old. No third-party
-Python packages are required. The program calls the system
-`libsodium` Ed25519 base-point operation through `ctypes`; `python3-tk` supplies
-the desktop GUI.
-
-The private key is the 64-byte expanded key that MeshCore expects, not a
-32-byte seed. CLI and GUI results are saved automatically. A source checkout
-uses its local `results/` folder; an installed copy uses
-`~/.local/share/meshcore-vanity-keygen/results/`. The GUI lets you select
-another folder.
-
-Private keys are hidden in the GUI and are not printed in the terminal by
-default. Use the explicit reveal/copy controls or add `--show-private` when you
-intend to expose one. Identity files are written atomically with owner-only
-permissions (`0600`), and existing files are never silently overwritten. Use
-`--force` with an explicit CLI output path to authorize replacement. Do not
-share private-key files. To import one, use your MeshCore client's key import /
-`prv.key` setting and then reboot the node.
-
-To see local readiness information without starting a search:
-
-```bash
+```sh
 meshcore-vanity-keygen --diagnostics
 ```
 
-Diagnostics now allocate the optimized engine's production-sized lane state and
-exercise one full configured block through the real optimized scan engine on
-every visible GPU, rather than treating a listed device and an existing binary
-as proof that CUDA can actually run. During background discovery, the GUI also
-checks the baseline engine on every visible GPU so switching engines remains
-instant. Probe results contain no key material.
+Diagnostics run a bounded kernel check on each visible GPU. They contain no
+key material.
 
-## GPU acceleration
+## Search for a key
 
-Build the CUDA engine with `make`. The Makefile detects every visible GPU
-compute capability, embeds native code for each one, retains PTX for the newest,
-and selects an available GNU C++ compiler. Override the architecture when
-cross-building:
-
-```bash
-make CUDA_ARCH=sm_89 HOST_CXX=/usr/bin/g++-13 CUDA_MAX_REGISTERS=128
+```sh
+meshcore-vanity-keygen --prefix cafe
+meshcore-vanity-keygen --backend cuda --device 1 --suffix 1337
+meshcore-vanity-keygen --backend cpu --prefix cafe
 ```
 
-Header dependencies and a source/configuration fingerprint prevent stale CUDA
-binaries when architecture or tuning values change—even when switching back to
-an earlier configuration.
+Use `--help` for the complete options. `--backend auto` selects CUDA on a
+ready NVIDIA system. Impossible patterns, including prefixes beginning with
+the MeshCore-rejected bytes `00` or `ff`, are rejected before the search.
 
-On an NVIDIA system, `--backend auto` selects CUDA automatically. Use
-`--backend cuda` or `--backend cpu` to force a backend, and `--device N` to
-select a GPU when more than one is installed:
+The GUI's Cancel button, closing the window, and Ctrl+C stop a running search.
+Time estimates are averages. They do not set a maximum wait.
 
-```bash
-python3 meshcore_vanity.py --backend cuda --device 1 --suffix 1337
-```
+For continuous collection of built-in rare patterns:
 
-The default optimized engine begins each batch with a securely random seed and
-uses domain-separated SHA-512 to derive an independent expanded Ed25519 private
-key for every GPU lane. Each lane covers the scalars `s, s + 8, s + 16, …`
-without a full scalar multiplication per key. It keeps an affine "centre"
-point P and derives its neighbours P ± k·8B (k = 1…256) from a precomputed
-table. Each ± pair shares one pair of denominators, and Montgomery's
-batch-inversion trick shares a single field inversion across all 513 keys of
-a span. A MeshCore public key is the point's y coordinate plus one sign bit
-from x (bit 255, inside hex character 62), so the walk computes only y, at
-about 5.6 field multiplications per key. x is computed only for keys that
-could match. When no active check can read hex character 62 (a prefix search
-with the bookend and mirror rare-key rules switched off), every check runs
-once on y alone. Otherwise each key is checked with that bit as 0 and as 1,
-and x is computed only if either could match, so no match is ever missed.
-Field arithmetic uses eight 32-bit limbs with PTX carry chains (`fe32.cuh`),
-about twice as fast on NVIDIA GPUs as the ref10 representation. Private keys
-are reconstructed only for retained matches. `--internal-test-affine-walk`
-compares every key of the walk with an independent reference scalar
-multiplication, checks that each walk position is visited exactly once, and
-confirms the y-only filter admits every true match for prefix and suffix
-patterns that do and do not depend on bit 255.
-SHA-512 also
-supplies a separate Ed25519 nonce prefix for each lane. At most one identity is
-retained from a lane, so two saved identities never come from the same short
-`+8` walk. The older full-SHA-512/full-multiplication implementation
-remains available for comparison with `--cuda-engine baseline` or from the GUI's
-CUDA engine selector. The former `incremental` CLI name remains an alias for
-`optimized`.
-
-Every retained GPU key is independently re-derived and pattern-checked on the
-CPU. It must also create a valid test signature and produce matching, nonzero
-shared secrets through MeshCore's Ed25519 key-exchange path before it is
-displayed or saved. Requested patterns that are impossible—including keys
-beginning with the MeshCore-rejected bytes `00` or `ff`—are rejected up front.
-The Cancel button, window close action, and `Ctrl+C` stop the CUDA process.
-The GUI displays mean-work and average-time estimates, updates them using the
-observed search rate, and shows GPU/self-test readiness before a search starts.
-It also shows the CPU package and selected GPU temperatures in degrees Celsius,
-both while idle and during a search. Sensor readings are best-effort monitoring,
-not thermal protection or fan/power control; unavailable readings appear as
-`—`. CPU sensors are read directly from Linux sysfs, while one bounded
-`nvidia-smi` query covers all NVIDIA GPUs. GPU discovery, real-kernel readiness
-checks, temperature sampling, history loading, and key searching all run
-outside Tk's event thread. GUI searches also use shorter CUDA batches to keep
-progress and cancellation responsive; direct command-line searches retain the
-maximum-throughput launch profile.
-
-### Measured performance
-
-On the development RTX 4070 Ti, the v1.11.1 optimized engine's
-maximum-throughput command-line profile processes about 3.45 billion keys per
-second with the default rare-key rules, and about 3.99 billion for a prefix
-search with the bookend and mirror rules switched off. That compares with
-about 2.53 billion for v1.10, 970 million for v1.9, and 29 million for the
-retained baseline. Approximate average search times at 3.45G/s are:
-
-| Hex characters | Possibilities | Average time |
-| ---: | ---: | ---: |
-| 7 | 268 million | 0.1 seconds |
-| 8 | 4.3 billion | 1.2 seconds |
-| 9 | 68.7 billion | 20 seconds |
-| 10 | 1.1 trillion | 5.3 minutes |
-| 11 | 17.6 trillion | 1.4 hours |
-
-These are probabilistic averages, not maximums. GPU model, cooling, power
-limits, and other workloads affect actual throughput. Sweeps of the table size
-(M = 16…500), register limits (96–255), threads per block (64–256), and blocks
-per SM (2–16) settled on the shipped 128-register, 128-thread, 4-blocks-per-SM,
-4096-attempt, M = 256 configuration. M = 256 uses about 1.6 GB of VRAM on this
-60-SM GPU. Build with `make CUDA_AFFINE_HALF_SPAN=128` to use about 0.9 GB at
-roughly 6% lower throughput. The GUI's responsive profile measured 3.31 billion
-keys per second with default rules (v1.10: 2.54 billion; v1.9: 943 million) on
-the same GPU.
-
-## Continuous rare-key collector
-
-Select **Continuous rare collector** in the GUI and click **Start rare
-collector** to collect built-in rare keys indefinitely without inventing an
-astronomically difficult vanity target. Pattern fields are disabled in this
-mode. Use **Rare keys to keep → Choose…** to select the categories collected.
-The live display reports candidates tested, runtime, keys per second,
-discoveries during the current session, and the best session rarity. Press
-**Cancel** whenever you want to stop; every completed discovery has already
-been verified and saved.
-
-The equivalent command-line mode is:
-
-```bash
+```sh
 meshcore-vanity-keygen --collect-rare
 ```
 
-Use `Ctrl+C` for a clean stop. `--watch-output PATH`, `--device N`, and
-`--cuda-engine optimized|baseline` remain available. Collector mode requires
-CUDA and cannot be combined with a vanity prefix, suffix, or substring.
-Progress statistics and rare-match names appear in the terminal, but key
-material does not. For an unattended collector, this command-line mode also
-retains the maximum-throughput CUDA launch profile.
+This mode needs CUDA. Use **Rare keys to keep** in the GUI to choose categories
+and a minimum match length. See [rare-key collection](docs/rare-keys.md) for
+the rule settings, saved history, and record format.
 
-## Automatic rare-key collection
+## Saved identities
 
-Every CUDA search checks each generated public key both for the requested
-pattern and for the selected rare-key rules. The second check is automatic; no
-extra option is required and it does not interrupt the requested search. In the
-GUI, **Rare keys to keep → Choose…** opens a checkbox for every configured
-category and a **Minimum matching hex characters** selector with choices 10,
-11, and 12. At least one eligible category must remain selected. The complete
-policy is frozen when a search starts and applies to new incidental discoveries
-as well as the continuous collector. It does not delete or hide anything
-already saved.
+A source checkout saves results in its own `results/` directory. The installed
+application uses `~/.local/share/meshcore-vanity-keygen/results/`. The GUI can
+select another folder.
 
-Built-in GUI choices and the minimum are remembered in the non-secret
-preferences file `~/.config/meshcore-vanity-keygen/settings.json`. Existing
-preference files are migrated with their original 10-character minimum. If the
-rule configuration changes or that file is unreadable, the app safely restores
-the configured defaults. Choices made while using a custom `--rare-rules` file
-last only for that GUI session, so they cannot silently rewrite the custom
-policy. When an incidental rare match appears, its public/private relationship,
-rare rule, and MeshCore validity are independently verified on the CPU and it is
-immediately appended to `results/rare-keys.jsonl`. The GUI shows a live count,
-the latest rule matched, and a public-key preview. Its **Rare keys…** browser can
-filter and sort the saved history by date, match, length, rarity, or public key.
-Private keys remain masked and are independently verified before reveal, copy,
-or owner-only export. Incidental collection is a CUDA feature; the slower CPU
-fallback only searches for the requested pattern.
+Private keys are masked in the GUI and omitted from terminal output by default.
+Use the reveal and copy controls, or `--show-private`, only when you intend to
+expose a key. The program writes identity files atomically with owner-only
+`0600` permissions. Existing files require an explicit `--force` override
+with the CLI output path.
 
-The built-in rules are deliberately much harder than four-character vanity
-patterns. Their default minimum is ten hexadecimal characters:
+Treat identity JSON and rare-key JSONL files as secrets. Keep them out of Git
+and back them up only to trusted storage. To use an identity, import its private
+key through the MeshCore client's key-import or `prv.key` setting, then reboot
+the node.
 
-- At least ten leading characters equal the same number of trailing characters
-  (`bookend-10`). The longest matching bookend is recorded.
-- At least ten leading characters equal the reverse of the final characters
-  (`mirror-10`).
-- At least ten starting characters are identical (`repeat-prefix-10`), such as
-  `aaaaaaaaaa`. Repeated `0` and `f` prefixes are excluded because MeshCore
-  rejects identities beginning with bytes `00` and `ff`.
-- The exact phrase `1337133713` appears at the beginning.
-- The first ten decimal digits of pi appear at the beginning:
-  `3141592653` (`prefix-pi-3141592653`).
+Audit saved files locally:
 
-Selecting 11 or 12 raises the structural, repeated-prefix, and pi rules to that
-minimum before work reaches the GPU. The fixed `1337133713` phrase is visibly
-inactive above 10 because adding arbitrary characters would not make that
-10-character phrase rarer. Its checkbox preference is retained, so it becomes
-active again if the minimum returns to 10. Rules in a custom file that already
-require more characters are never weakened.
-
-These defaults live in [`rare_rules.json`](rare_rules.json), which is the single
-source used by both Python verification and the generated fast CUDA classifier.
-To experiment without modifying the installed defaults, copy that file, edit
-the copy, and launch with `--rare-rules PATH` (this also works with `--gui`).
-Supported rule kinds are `bookend`, `mirror`, `repeat-prefix`,
-`literal-prefix`, and `sequence-prefix`. Rule order is significant: the first
-matching enabled rule supplies the numeric CUDA trigger, while CPU analysis
-still records every matching trait.
-
-New custom files use ruleset schema 2. Schema-1 files remain accepted and are
-migrated in memory to schema-2 semantics and fingerprints; the source file is
-not rewritten.
-
-Custom files are strictly validated before GPU work starts. They are limited to
-32 rules and 256 KiB, must use canonical lowercase hexadecimal values and valid
-MeshCore prefixes, and cannot configure an individual or combined hit rate high
-enough to overwhelm incidental-result handling. Each search freezes one parsed
-ruleset; its semantic ID and SHA-256 fingerprint are written into every new
-rare-key record. The GUI chooser revalidates every selected subset with the same
-safety limits, including rules that were initially disabled in a custom file.
-
-With all defaults selected, the approximate average discovery cadence at the
-measured 3.45G keys/s is:
-
-| Minimum | Active categories | Average time between finds |
-| ---: | ---: | ---: |
-| 10 | 5 | 18 seconds |
-| 11 | 4 | 5.0 minutes |
-| 12 | 4 | 1.3 hours |
-
-The fixed phrase accounts for the fifth category at 10. Bookend probability is
-calculated across every possible matching width from the selected minimum
-through 32. Random search times vary widely, and a run can be much shorter or
-longer than the average.
-
-Each JSONL record keeps the matching pair together:
-
-```json
-{"schema_version":5,"found_at":"2026-09-12T12:34:56Z","trigger":"repeat-prefix-10","reason":"repeat-prefix-13","match_length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322","matches":[{"reason":"repeat-prefix-13","kind":"repeat-prefix","length":13,"rarity_bits":48.193,"mean_attempts":"321685687669322"}],"public_key":"...","private_key":"...","backend":"cuda","engine":"optimized","ruleset_id":"meshcore-default","ruleset_fingerprint":"...","active_rule_ids":["bookend","mirror","repeat-prefix","prefix-1337133713","pi"],"minimum_match_nibbles":10}
-```
-
-The selected GPU minimum remains the collection threshold, but CPU analysis
-preserves stronger properties of a retained key. For example, a key beginning
-with 13 identical characters is labeled `repeat-prefix-13`, and a pi prefix
-continuing for 15 digits records all 15 rather than being flattened to ten.
-When one key has multiple interesting traits, the strongest becomes `reason`
-and every trait is retained under `matches`. Rarity is expressed as equivalent
-random-search bits, making unlike patterns sortable on one scale. Schema-5
-records retain the active rule IDs and minimum so the history browser can show
-the complete policy that was in force when each key was found. Older records
-remain fully readable and display unavailable policy details as not recorded.
-
-The file is created with owner-only permissions (`0600`) when the search starts;
-an empty file means no rare key has been found. A source checkout stores it
-under local `results/`; an installed copy uses its private application-data
-directory. Both remain independent of the shell's working directory. Use
-`--watch-output PATH` to choose another CLI location.
-
-Every discovery is retained, even when earlier keys matched the same category.
-File locking prevents concurrent searches from corrupting or interleaving
-records. Collection stops when the requested key is found or the search is
-cancelled; rare keys already written remain saved. At the measured rate and
-current criteria, continuous searching averages about 4,900 new records per
-day. The GUI keeps its live count in memory, reads history backward from the
-file tail, and presents at most 500 rows per page from the newest 10,000 valid
-records. Upgrading does not rewrite or delete legacy
-records; their basic rarity metadata is inferred when displayed. Legacy suffix
-records created by v1.0.x and records from later-removed phrase categories
-remain visible, but those patterns are no longer collected. Version-2 and newer
-records are larger than the original minimal records, so storage growth depends
-on how many traits each key matches.
-
-## Audit saved identities
-
-Release v1.5.1 and earlier used one bounded scalar walk across all optimized
-CUDA lanes in a batch. A risk exists when two or more retained identities came
-from the same batch: their private scalars have a small, detectable
-relationship. Disclosure of one related scalar can therefore allow recovery of
-another with a bounded search, even though the saved nonce prefixes differ.
-v1.5.2 isolates lanes and retains at most one identity from each bounded walk.
-
-After upgrading, audit existing identity JSON and rare-key JSONL files locally:
-
-```bash
+```sh
 meshcore-key-audit ~/.local/share/meshcore-vanity-keygen/results
 ```
 
-The auditor reads files without modifying them, refuses symbolic links, and
-reports only aggregate counts plus opaque file/line identifiers by default. It
-never includes public or private key contents in text or JSON output. After a
-finding, rerun locally with `--show-paths` to map opaque IDs to the records that
-should be reviewed and replaced; note that generated filenames may themselves
-contain a public-key prefix. Run `meshcore-key-audit --help` for JSON output and
-threshold options. A `CLEAN` result applies to the files scanned and the
-configured correlation span. The conservative default covers `2^40`
-candidates—far above the shipped pre-v1.5.2 launch span. Increase
-`--max-candidate-span` only when auditing keys made by a custom build whose
-launch span exceeded that bound.
+The auditor leaves the files unchanged and reports opaque file and line IDs
+without key contents. See [audit limits and result handling](docs/key-audit.md).
 
-The vendored CUDA Ed25519 implementation is GPL-3.0; see `LICENSE` and
-`THIRD_PARTY_NOTICES.md`.
+## Develop and test
 
-## Tests
+The Python code uses the standard library and system `libsodium` through
+`ctypes`. Tk provides the desktop GUI. No third-party Python packages are
+required.
 
-```bash
+For a source checkout on Ubuntu:
+
+```sh
+sudo apt update
+sudo apt install build-essential libsodium23 python3 python3-tk nvidia-cuda-toolkit
+make
 python3 meshcore_vanity.py --self-test
+make check
 make test
-make test-gpu
 ```
 
-The compatibility check and CPU suite derive the public key from the MeshCore
-firmware's known-good private-key test vector, verify a signature made with its
-expanded key, and exercise the firmware-compatible shared-secret path. The
-shared-secret test includes an independent Python implementation of the
-conversion and Montgomery ladder used by MeshCore at upstream commit
-`d92964352441e53b93e8667b802e04f6e072b39e`. The
-opt-in GPU suite exercises repeated incremental point addition, tests both CUDA
-engines, compares CUDA rare-rule classification with Python, exercises the
-real-kernel readiness probe, verifies generated identities, and confirms
-cancellation leaves no child process behind. It validates both responsive-GUI
-and maximum-throughput CUDA launch profiles. The CPU suite also checks strict
-rule parsing, generated-header freshness, build configuration changes, GUI
-rule selection and preference validation, callback-queue recovery, worker
-failure paths, bounded history loading, and pagination. Threshold tests cover
-all three GUI minimums, settings migration, fixed-rule eligibility, and
-non-nested longer bookends on both Python and CUDA.
-Temperature tests additionally cover CPU sensor selection, multi-GPU PCI
-mapping, stale and malformed readings, subprocess time/output limits, and
-monitor shutdown. The live GPU suite checks both versions of the key-free
-readiness contract used by the current front end and native engine.
+The toolkit still needs to meet the 11.8 minimum. Run `make test-gpu`
+separately on a CUDA machine. See the [test guide](docs/testing.md) for coverage
+and hardware requirements.
 
-For v1.0.0, a CUDA-generated `c0dec0…` identity was also imported into a
-RAK4631 running MeshCore v1.17.1. The device exported the exact private key,
-produced a signature verified against the generated public key, and was then
-restored to its original identity. A device is not required for normal use;
-this was an independent physical compatibility test. See
-[`HARDWARE_VALIDATION.md`](HARDWARE_VALIDATION.md) for the secret-free record.
+The [CUDA reference](docs/cuda.md) describes architecture selection, engine
+internals, VRAM use, and the recorded RTX 4070 Ti measurements. Those
+measurements describe that test machine and workload.
 
-## Security notes
+## Security and compatibility
 
-- Everything runs locally; generated keys are not sent over the network.
-- `results/`, the compiled binary, and Python caches are excluded from Git.
-- Treat both identity JSON and rare-key JSONL files as secrets despite their
-  restrictive file permissions. Back them up only to storage you trust.
-- Search is probabilistic. A difficulty estimate is an average, not a deadline.
-- The project has extensive compatibility checks but no independent professional
-  cryptographic audit; see `SECURITY.md` for reporting and assurance details.
+Every retained GPU result is checked on the CPU for its public/private-key
+relationship, requested pattern, signature, and MeshCore key exchange.
+The test suite includes MeshCore firmware test vectors. A v1.0.0 identity was
+also tested on physical RAK4631 hardware. See the
+[hardware record](HARDWARE_VALIDATION.md) for that test's scope.
 
-## Uninstall
+Key generation runs locally. Generated keys are not sent over the network.
+The project has not had an independent professional cryptographic audit.
+See [SECURITY.md](SECURITY.md) for the legacy-key issue, reporting instructions,
+and assurance limits.
 
-```bash
+## Remove the application
+
+```sh
 ./uninstall.sh
 ```
 
-The uninstaller removes the application and desktop launcher but deliberately
-preserves generated keys under `~/.local/share/meshcore-vanity-keygen/`.
-Review and delete that directory yourself only when its private keys are no
-longer needed.
+The uninstaller keeps generated keys in
+`~/.local/share/meshcore-vanity-keygen/`. Remove that directory yourself only
+when you no longer need those identities.
 
-## Publish your fork
+## License and history
 
-`./publish_to_github.sh` installs GitHub CLI when needed, opens browser login,
-checks that generated secrets are not tracked, and creates/pushes a public
-repository.
+The vendored CUDA Ed25519 implementation is GPL-3.0. Read
+[LICENSE](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md) for
+attribution and license terms. Release changes are in
+[CHANGELOG.md](CHANGELOG.md).
